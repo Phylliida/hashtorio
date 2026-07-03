@@ -1,0 +1,8 @@
+[package]
+name = "hashtorio"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cachable-by-construction factory game kernel: ultimately periodic counting maps and their algebra"
+
+[dependencies]
