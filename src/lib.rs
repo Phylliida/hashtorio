@@ -17,6 +17,7 @@ pub mod net;
 mod priority;
 pub mod recipe;
 pub mod report;
+pub mod stepper;
 pub mod world;
 
 pub use counting::Counting;

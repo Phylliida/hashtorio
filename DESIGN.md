@@ -161,8 +161,21 @@ degrades as they use more of it.
   *Scope honesty:* summaries remain exact per-(design, input flows) — the
   memo still caches them; a symbolic input-regime-parametric mode-automaton
   summary (one entry covering all input regimes) is future work (M5-era).
-- **M5**: tier-2 memoized stepping fallback; parametric mode-automaton
-  summaries for tier 1.
+- **M5** ✅: tier 2 lives (`stepper.rs`). Nets the summarizer honestly
+  refuses (breeders, growing pools) run exactly anyway, via **delta-state**
+  stepping: per-wire slack, per-node recent firing deltas, per-priority
+  token reserve — all *relative*, no absolute counts, so two instances of a
+  design in the same `StepState` advance identically on identical input
+  deltas. That soundly keys the `ChunkCache`:
+  `(design, state, input chunk) → (state, output chunk)`, shared across
+  instances and time even for never-periodic behavior. `World` is now
+  tiered: symbolic summary first, stepper fallback on refusal, both behind
+  one `output_count` API. Cross-validation test: stepper ≡ symbolic
+  evaluator tick-for-tick on summarizable nets (two independent
+  implementations of the semantics agreeing exactly).
+  *Deferred with honesty:* input-regime-parametric mode-automaton summaries
+  (one symbolic entry covering all input regimes) remain future work — the
+  regime geometry deserves a design pass of its own, not a rushed slice.
 - **M6**: world, rendering (semantics-free presentation layer).
 
 ## Implementation decisions
