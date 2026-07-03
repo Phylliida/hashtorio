@@ -3,12 +3,17 @@
 //! is *ultimately periodic*, so it has a finite canonical representation that
 //! doubles as a cache key.
 //!
-//! See DESIGN.md for the full design. This crate is M0 of the roadmap: the
-//! [`counting::Counting`] type and its op algebra, plus [`recipe::Recipe`]
-//! application for feedforward use.
+//! See DESIGN.md for the full design. Layers:
+//! - [`counting`]: the summary data structure and its op algebra (M0)
+//! - [`recipe`]: the kernel's one work primitive (M0)
+//! - [`net`]: typed wiring terms and the hash-consed blueprint library (M1)
+//! - [`flatten`]: module inlining (M1)
 
 pub mod counting;
+pub mod flatten;
+pub mod net;
 pub mod recipe;
 
 pub use counting::Counting;
+pub use net::{ItemType, Library, Net, NetBuilder, NetId};
 pub use recipe::Recipe;

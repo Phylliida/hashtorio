@@ -62,9 +62,30 @@ impl Counting {
         c.normalize()
     }
 
+    /// Like [`Counting::from_parts`] but returns `None` instead of panicking,
+    /// for callers whose parts are guesses (e.g. the fixed-point summarizer).
+    pub fn try_from_parts(
+        samples: Vec<u64>,
+        transient: usize,
+        period: u64,
+        slope: u64,
+    ) -> Option<Self> {
+        let c = Counting { samples, transient, period, slope };
+        if c.is_well_formed() {
+            Some(c.normalize())
+        } else {
+            None
+        }
+    }
+
     /// The constant-zero function (empty wire).
     pub fn zero() -> Self {
         Counting { samples: vec![0], transient: 0, period: 1, slope: 0 }
+    }
+
+    /// The constant function `N(t) = c` (e.g. an initial marking).
+    pub fn constant(c: u64) -> Self {
+        Counting { samples: vec![c], transient: 0, period: 1, slope: 0 }
     }
 
     /// One item per tick starting at t = 1: `N(t) = t`.
@@ -222,6 +243,13 @@ impl Counting {
             && self.samples.windows(2).all(|w| w[0] <= w[1])
             && self.samples[self.transient] + self.slope
                 >= *self.samples.last().unwrap()
+    }
+
+    fn is_well_formed(&self) -> bool {
+        self.period >= 1
+            && self.samples.len() == self.transient + self.period as usize
+            && self.samples.windows(2).all(|w| w[0] <= w[1])
+            && self.samples[self.transient] + self.slope >= *self.samples.last().unwrap()
     }
 
     fn check_well_formed(&self) {
