@@ -9,11 +9,14 @@
 //! - [`net`]: typed wiring terms and the hash-consed blueprint library (M1)
 //! - [`flatten`]: module inlining (M1)
 
+pub mod components;
 pub mod counting;
+pub mod eval;
 pub mod flatten;
 pub mod net;
 pub mod recipe;
 
 pub use counting::Counting;
+pub use eval::{EvalError, Evaluator};
 pub use net::{ItemType, Library, Net, NetBuilder, NetId};
 pub use recipe::Recipe;

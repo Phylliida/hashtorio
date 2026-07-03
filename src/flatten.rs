@@ -17,7 +17,12 @@ use crate::net::{Layout, Library, Net, NetError, NetId, Node, Source, Wire};
 
 /// Recursively inline every module: the result contains only recipe nodes.
 pub fn flatten(lib: &Library, id: NetId) -> Result<Net, NetError> {
-    let mut net = lib.get(id).clone();
+    flatten_net(lib, lib.get(id).clone())
+}
+
+/// Like [`flatten`] for a net not (or not yet) in the library. Any modules
+/// it references must be interned in `lib`.
+pub fn flatten_net(lib: &Library, mut net: Net) -> Result<Net, NetError> {
     while let Some(m) = net.nodes.iter().position(|n| matches!(n, Node::Module(_))) {
         let Node::Module(mid) = net.nodes[m] else { unreachable!() };
         let sub = flatten(lib, mid)?; // recipe-only by induction

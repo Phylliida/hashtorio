@@ -68,8 +68,15 @@ hash-consed terms in a DAG; caching is memoizing denotations of subterms.
 | Round-robin splitter | recipe `2·A → 1·A_left + 1·A_right` (counts split exactly) |
 | Buffer, capacity K | feedback wire of "space" tokens, marking K; delivery refunds a space token |
 | Clock, period d | self-loop recipe `tick → tick`, latency d, marking 1 |
-| Sensor (level ≥ K) | consume-and-refund recipe `K·A → K·A + pulse` |
+| Flow meter (tap) | recipe `A → A + pulse` — every passing item emits a pulse |
+| Reservoir gauge (level ≥ K) | consume-and-refund loop `K·A → K·A + pulse`, latency ≥ 1 |
 | Valve | join sensed pulses with the gated flow |
+
+Honest limitation found while deriving these (M2): the reservoir gauge
+*sequesters* its reservoir — single-sink wires mean the sensed items cannot
+also drain downstream. Metering a through-flow is the tap; level-sensing a
+*drainable* buffer needs tier-1 (priority) machinery. This is the Petri-net
+zero-test friction showing up exactly where the theory says it must.
 | Signals | ordinary token types that happen to be free to mint (resource economics, not new semantics) |
 
 ## The one thing that cannot be derived
@@ -115,15 +122,25 @@ degrades as they use more of it.
 
 ## Roadmap
 
-- **M0** (this): `Counting` — ultimately periodic counting maps in canonical
+- **M0** ✅: `Counting` — ultimately periodic counting maps in canonical
   form, with the op algebra (shift, add/merge, min/join, floor-scaling,
   recipe application) and canonical hashing. Tested against naive dense
   evaluation.
-- **M1**: term language — typed wiring DAG, hash-consing, evaluator for
-  feedforward nets.
-- **M2**: feedback — Kahn/(min,+) fixed points, markings, critical-circuit
-  steady states; derive buffer/clock/sensor and test them.
-- **M3**: module summaries + memo cache; conservation accounting.
+- **M1** ✅: term language — typed wiring DAG (`net.rs`), hash-consed library
+  (a Merkle DAG by construction), module flattening (`flatten.rs`).
+- **M2** ✅: feedback (`eval.rs`) — SCC decomposition; acyclic nodes evaluate
+  symbolically, module summaries memoized on `(NetId, input countings)`;
+  cyclic components solved by **guess-then-verify**: dense simulation
+  proposes an ultimately periodic candidate and exact M0 algebra verifies
+  the fixed-point equations. Cycles have latency ≥ 1, so the causal solution
+  is unique and any verified candidate is *the* behavior — soundness never
+  rests on the guessing heuristic. Cycles through module boundaries trigger
+  flattening. Divergence is refused honestly (`RateExplosion`,
+  `NoPeriodicSteadyState`, `ZeroLatencyCycle`). Derived components in
+  `components.rs`: clock, throughput throttle (the critical-circuit law
+  `rate = min(input, tokens/latency)` holds as a test), reservoir gauge.
+- **M3**: instance layer over the memo cache; conservation accounting;
+  module summary as player-visible spec.
 - **M4**: priority select; mode-automaton tier.
 - **M5**: tier-2 memoized stepping fallback.
 - **M6**: instances, world, rendering (semantics-free presentation layer).

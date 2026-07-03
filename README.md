@@ -13,10 +13,22 @@ decidability boundary).
 
 ## Status
 
-**M0** — `Counting` (ultimately periodic counting maps in canonical form) with
-the kernel op algebra (`add`/merge, `min`/join, `scale_floor`/gearing,
-`shift`/latency) and `Recipe` application for feedforward nets. Canonical
-normalization means semantic equality is structural equality is hash equality:
+**M0–M2** — the kernel algebra, the term language, and the evaluator with
+feedback:
+
+- `Counting`: ultimately periodic counting maps in canonical form, with the
+  kernel op algebra (`add`/merge, `min`/join, `scale_floor`/gearing,
+  `shift`/latency). Canonical normalization means semantic equality is
+  structural equality is hash equality.
+- `Net`/`Library`: typed wiring terms, hash-consed into a Merkle-DAG
+  blueprint library; item linearity is enforced structurally (merge is free,
+  copying doesn't exist).
+- `Evaluator`: module summaries memoized on `(design, input flows)` — the
+  HashLife move — and feedback loops solved by guess-then-verify: simulation
+  proposes an ultimately periodic steady state, exact algebra verifies the
+  fixed-point equations. The critical-circuit law (loop throughput =
+  tokens/latency) falls out as a passing test, and divergent nets (breeder
+  loops) are refused honestly rather than mis-summarized.
 
 ```rust
 use hashtorio::Counting;
