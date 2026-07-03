@@ -58,14 +58,40 @@ pub struct Evaluator<'l> {
     pub interior_evals: u64,
 }
 
+/// The result of one net evaluation, including per-node detail for tracing.
+struct NetRun {
+    outputs: Vec<Counting>,
+    /// Firing map per node (`None` for module nodes — their detail lives in
+    /// their own evaluations).
+    firings: Vec<Option<Counting>>,
+    /// Output-leg countings per node.
+    node_outs: Vec<Option<Vec<Counting>>>,
+}
+
 enum Flow {
-    Done(Vec<Counting>),
+    Done(NetRun),
     NeedsFlatten,
+}
+
+/// A fully-resolved evaluation of a recipe-only (flattened) net: everything
+/// the conservation audit needs.
+pub struct Trace {
+    pub net: Net,
+    pub inputs: Vec<Counting>,
+    pub outputs: Vec<Counting>,
+    /// Firing map per node.
+    pub firings: Vec<Counting>,
+    /// Output-leg countings per node.
+    pub node_outs: Vec<Vec<Counting>>,
 }
 
 impl<'l> Evaluator<'l> {
     pub fn new(lib: &'l Library) -> Self {
         Evaluator { lib, memo: HashMap::new(), horizon: 1 << 14, interior_evals: 0 }
+    }
+
+    pub fn lib(&self) -> &'l Library {
+        self.lib
     }
 
     /// Evaluate an interned net on the given input counting maps.
@@ -93,14 +119,42 @@ impl<'l> Evaluator<'l> {
         inputs: &[Counting],
     ) -> Result<Vec<Counting>, EvalError> {
         match self.eval_net(net, inputs)? {
-            Flow::Done(o) => Ok(o),
+            Flow::Done(run) => Ok(run.outputs),
             Flow::NeedsFlatten => {
                 let flat = flatten_net(self.lib, net.clone()).map_err(EvalError::Net)?;
                 match self.eval_net(&flat, inputs)? {
-                    Flow::Done(o) => Ok(o),
+                    Flow::Done(run) => Ok(run.outputs),
                     Flow::NeedsFlatten => unreachable!("flattened nets contain no modules"),
                 }
             }
+        }
+    }
+
+    /// Flatten a net and evaluate it with full per-node detail, for the
+    /// conservation audit and other inspectors.
+    pub fn trace_flattened(
+        &mut self,
+        id: NetId,
+        inputs: &[Counting],
+    ) -> Result<Trace, EvalError> {
+        let flat = crate::flatten::flatten(self.lib, id).map_err(EvalError::Net)?;
+        match self.eval_net(&flat, inputs)? {
+            Flow::Done(run) => Ok(Trace {
+                net: flat,
+                inputs: inputs.to_vec(),
+                outputs: run.outputs,
+                firings: run
+                    .firings
+                    .into_iter()
+                    .map(|f| f.expect("flattened nets have firings on every node"))
+                    .collect(),
+                node_outs: run
+                    .node_outs
+                    .into_iter()
+                    .map(|o| o.expect("all nodes evaluated"))
+                    .collect(),
+            }),
+            Flow::NeedsFlatten => unreachable!("flattened nets contain no modules"),
         }
     }
 
@@ -134,6 +188,7 @@ impl<'l> Evaluator<'l> {
         let comps = tarjan_sccs(nn, &adj);
         let order = scc_topo_order(&comps, &adj, nn);
         let mut node_outs: Vec<Option<Vec<Counting>>> = vec![None; nn];
+        let mut firings: Vec<Option<Counting>> = vec![None; nn];
 
         for &ci in &order {
             let comp = &comps[ci];
@@ -148,7 +203,14 @@ impl<'l> Evaluator<'l> {
                     })
                     .collect();
                 let outs = match node {
-                    Node::Recipe { recipe, .. } => recipe.apply(&ins),
+                    Node::Recipe { recipe, .. } => {
+                        let k = recipe.firings(&ins);
+                        let fired = k.shift(recipe.latency);
+                        let outs =
+                            recipe.produce.iter().map(|&p| fired.scale_floor(p, 1)).collect();
+                        firings[g] = Some(k);
+                        outs
+                    }
                     Node::Module(mid) => self.evaluate(*mid, &ins)?,
                 };
                 node_outs[g] = Some(outs);
@@ -159,14 +221,14 @@ impl<'l> Evaluator<'l> {
                 {
                     return Ok(Flow::NeedsFlatten);
                 }
-                solve_scc(net, &layout, comp, inputs, &mut node_outs, self.horizon)?;
+                solve_scc(net, &layout, comp, inputs, &mut node_outs, &mut firings, self.horizon)?;
             }
         }
 
-        let outs = (0..net.outputs.len())
+        let outputs = (0..net.outputs.len())
             .map(|o| wire_counting(net, layout.output_wire(o), inputs, &node_outs))
             .collect();
-        Ok(Flow::Done(outs))
+        Ok(Flow::Done(NetRun { outputs, firings, node_outs }))
     }
 }
 
@@ -216,6 +278,7 @@ fn solve_scc(
     comp: &[usize],
     inputs: &[Counting],
     node_outs: &mut [Option<Vec<Counting>>],
+    firings: &mut [Option<Counting>],
     horizon: u64,
 ) -> Result<(), EvalError> {
     let local: HashMap<usize, usize> =
@@ -283,6 +346,7 @@ fn solve_scc(
                 let fired = cands[li].shift(sn.latency);
                 node_outs[g] =
                     Some(sn.produce.iter().map(|&p| fired.scale_floor(p, 1)).collect());
+                firings[g] = Some(cands[li].clone());
             }
             return Ok(());
         }

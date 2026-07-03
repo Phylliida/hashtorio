@@ -106,6 +106,19 @@ impl Counting {
         }
     }
 
+    /// First tick with a nonzero count, or `None` if always zero.
+    pub fn first_nonzero(&self) -> Option<u64> {
+        if let Some(i) = self.samples.iter().position(|&v| v > 0) {
+            return Some(i as u64);
+        }
+        // Window all zero: the tail first rises one period past the seam.
+        if self.slope > 0 {
+            Some(self.transient as u64 + self.period)
+        } else {
+            None
+        }
+    }
+
     /// Long-run rate as a reduced rational `(items, ticks)`.
     pub fn rate(&self) -> (u64, u64) {
         let g = gcd(self.slope, self.period);
