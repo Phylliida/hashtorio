@@ -197,6 +197,21 @@ impl Counting {
         Counting { samples, transient: t, period: p, slope }.normalize()
     }
 
+    /// Pointwise difference `self - other`, defined only when the result is
+    /// itself a monotone staircase (e.g. a pass-through split: total minus
+    /// granted). Returns `None` otherwise. Exact: subtraction commutes with
+    /// the shared period, no floors involved.
+    pub(crate) fn monotone_sub(&self, other: &Counting) -> Option<Counting> {
+        let p = lcm(self.period, other.period);
+        let t = self.transient.max(other.transient);
+        let slope = mul(self.slope, p / self.period)
+            .checked_sub(mul(other.slope, p / other.period))?;
+        let samples = (0..t as u64 + p)
+            .map(|i| self.eval(i).checked_sub(other.eval(i)))
+            .collect::<Option<Vec<u64>>>()?;
+        Counting::try_from_parts(samples, t, p, slope)
+    }
+
     /// Latency: `N'(t) = N(t - d)` (and 0 before `d`).
     pub fn shift(&self, d: u64) -> Counting {
         if d == 0 {

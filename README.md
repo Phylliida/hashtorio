@@ -13,8 +13,8 @@ decidability boundary).
 
 ## Status
 
-**M0–M2** — the kernel algebra, the term language, and the evaluator with
-feedback:
+**M0–M4** — kernel algebra, term language, evaluator with feedback,
+conservation audit + instance layer, and the tier-1 priority primitive:
 
 - `Counting`: ultimately periodic counting maps in canonical form, with the
   kernel op algebra (`add`/merge, `min`/join, `scale_floor`/gearing,
@@ -29,6 +29,15 @@ feedback:
   fixed-point equations. The critical-circuit law (loop throughput =
   tokens/latency) falls out as a passing test, and divergent nets (breeder
   loops) are refused honestly rather than mis-summarized.
+- `report`/`world`: the summary as player-visible spec (exact rates, first
+  arrivals); a conservation audit that proves no wire is ever over-consumed
+  and closes the per-type books as exact rationals; and the instance layer —
+  20,000 staggered instances of two designs cost two interior evaluations.
+- `Priority` (tier 1): the consciously-admitted *else* — items take a token
+  and go left while tokens last, else right. Evaluated exactly via closure
+  certificates; buys overflow splitters and drainable demand-stores with
+  live level gauges, at the price the theory demands (non-monotone, bigger
+  cache keys). Tests assert the non-monotonicity on purpose.
 
 ```rust
 use hashtorio::Counting;
