@@ -15,8 +15,12 @@ pub mod eval;
 pub mod flatten;
 pub mod net;
 pub mod recipe;
+pub mod report;
+pub mod world;
 
 pub use counting::Counting;
 pub use eval::{EvalError, Evaluator};
 pub use net::{ItemType, Library, Net, NetBuilder, NetId};
 pub use recipe::Recipe;
+pub use report::{Audit, Summary};
+pub use world::World;
