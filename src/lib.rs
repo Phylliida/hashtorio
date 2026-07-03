@@ -16,6 +16,7 @@ pub mod flatten;
 pub mod net;
 mod priority;
 pub mod recipe;
+pub mod render;
 pub mod report;
 pub mod stepper;
 pub mod world;
