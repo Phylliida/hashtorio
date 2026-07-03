@@ -176,7 +176,19 @@ degrades as they use more of it.
   *Deferred with honesty:* input-regime-parametric mode-automaton summaries
   (one symbolic entry covering all input regimes) remain future work — the
   regime geometry deserves a design pass of its own, not a rushed slice.
-- **M6**: world, rendering (semantics-free presentation layer).
+- **M6** ✅: `render.rs` + the `hashtorio` binary. The renderer owns no
+  state: every visual quantity — wire occupancy (supply − consumed),
+  machine activity (firing deltas), delivered totals — is an O(1) `eval` of
+  the counting maps, so random access in time is free and the presentation
+  layer *cannot* desynchronize from the engine. `cargo run` opens a
+  playground factory (gear line → overflow gate → demand store with live
+  level gauge) with its published spec and conservation audit, and a REPL:
+  step, `run N` (animated), `warp T` — warping to tick 1,000,000 is instant
+  and exact, which is the whole thesis in one command.
+
+**Beyond M6 (future):** input-regime-parametric summaries (deferred from
+M5); spatial world + blueprint editing UI; module sealing/opening flow
+(power-down-to-open); recipe/item content and progression; WASM build.
 
 ## Implementation decisions
 
