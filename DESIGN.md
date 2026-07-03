@@ -139,11 +139,31 @@ degrades as they use more of it.
   `NoPeriodicSteadyState`, `ZeroLatencyCycle`). Derived components in
   `components.rs`: clock, throughput throttle (the critical-circuit law
   `rate = min(input, tokens/latency)` holds as a test), reservoir gauge.
-- **M3**: instance layer over the memo cache; conservation accounting;
-  module summary as player-visible spec.
-- **M4**: priority select; mode-automaton tier.
-- **M5**: tier-2 memoized stepping fallback.
-- **M6**: instances, world, rendering (semantics-free presentation layer).
+- **M3** ✅: `report.rs` — Summary (exact port rates + first arrivals: the
+  cache entry as player-visible contract) and the conservation Audit
+  (per-type ledger; no-conjuring checked pointwise-forever via `min`; books
+  close as exact rationals). `world.rs` — the instance layer: instances are
+  (design, start tick, local inputs); time-invariance means staggered
+  instances share memo entries (20k instances, 2 interior evals, as a test).
+- **M4** ✅: `Node::Priority` — the else, admitted deliberately. Inputs
+  `[item, token]`, outputs `[granted, fallback]`: arriving items take a
+  token and go left while tokens last, else go right, same tick.
+  `priority.rs` derives its behavior on ultimately periodic inputs with a
+  **closure certificate**: either an exact reserve-state repeat at equal
+  input phase (deterministic recurrence ⇒ periodic forever) or a
+  token-surplus argument (full grants with headroom over a full period +
+  token rate ≥ item rate ⇒ full grants forever). Guess-then-verify extends
+  unchanged: priority nodes verify by re-derivation from candidate inputs.
+  Derived tier-1 components: overflow splitter, and the **demand store** —
+  the drainable buffer with a live level gauge that M2's honest limitation
+  note said was impossible in the kernel. Non-monotonicity is asserted in
+  tests (more tokens ⇒ less overflow; more demand ⇒ fewer level pulses).
+  *Scope honesty:* summaries remain exact per-(design, input flows) — the
+  memo still caches them; a symbolic input-regime-parametric mode-automaton
+  summary (one entry covering all input regimes) is future work (M5-era).
+- **M5**: tier-2 memoized stepping fallback; parametric mode-automaton
+  summaries for tier 1.
+- **M6**: world, rendering (semantics-free presentation layer).
 
 ## Implementation decisions
 

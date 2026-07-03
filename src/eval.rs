@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use crate::counting::{gcd, Counting};
 use crate::flatten::flatten_net;
 use crate::net::{Layout, Library, Net, NetError, NetId, Node, Source};
+use crate::priority::priority_apply;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvalError {
@@ -212,6 +213,12 @@ impl<'l> Evaluator<'l> {
                         outs
                     }
                     Node::Module(mid) => self.evaluate(*mid, &ins)?,
+                    Node::Priority { .. } => {
+                        let (granted, fallback) =
+                            priority_apply_growing(&ins[0], &ins[1], self.horizon)?;
+                        firings[g] = Some(granted.clone());
+                        vec![granted, fallback]
+                    }
                 };
                 node_outs[g] = Some(outs);
             } else {
@@ -257,19 +264,47 @@ fn wire_counting(
 // Feedback: guess-then-verify fixed points
 // ---------------------------------------------------------------------------
 
+/// A contribution to a wire from inside the component.
+enum Feed {
+    /// Recipe output leg: `amt * k_src(t - lat)`.
+    Recipe { src: usize, amt: u64, lat: u64 },
+    /// Priority output leg (same-tick): 0 = granted, 1 = fallback.
+    Prio { src: usize, leg: u8 },
+}
+
+impl Feed {
+    fn same_tick(&self) -> Option<usize> {
+        match *self {
+            Feed::Recipe { src, lat: 0, .. } => Some(src),
+            Feed::Recipe { .. } => None,
+            Feed::Prio { src, .. } => Some(src),
+        }
+    }
+}
+
 /// One input leg of a node inside a cyclic component.
 struct LegIn {
     /// Marking + all contributions from outside the component (exact).
     known: Counting,
-    /// Contributions from inside: (local source node, amount/firing, latency).
-    feeds: Vec<(usize, u64, u64)>,
+    feeds: Vec<Feed>,
     consume: u64,
 }
 
+enum SKind {
+    Recipe { latency: u64, produce: Vec<u64> },
+    /// legs[0] = items, legs[1] = tokens.
+    Priority,
+}
+
 struct SccNode {
-    latency: u64,
-    produce: Vec<u64>,
+    kind: SKind,
     legs: Vec<LegIn>,
+}
+
+/// Per-node dense simulation state.
+enum Series {
+    R(Vec<u64>),
+    P { used: Vec<u64>, i_in: Vec<u64> },
 }
 
 fn solve_scc(
@@ -285,41 +320,60 @@ fn solve_scc(
         comp.iter().enumerate().map(|(li, &g)| (g, li)).collect();
 
     // Gather the component's equations.
-    let mut snodes: Vec<SccNode> = Vec::with_capacity(comp.len());
-    for &g in comp {
-        let Node::Recipe { recipe, .. } = &net.nodes[g] else {
-            unreachable!("cyclic components with modules are flattened first")
-        };
-        let mut legs = Vec::with_capacity(recipe.consume.len());
-        for (leg_i, &c) in recipe.consume.iter().enumerate() {
-            let wire = &net.wires[layout.node_input_wire(g, leg_i)];
-            let mut known = Counting::constant(wire.marking);
-            let mut feeds = Vec::new();
-            for src in &wire.sources {
-                match src {
-                    Source::Input(i) => known = known.add(&inputs[*i as usize]),
-                    Source::NodeOut { node: a, leg } => {
-                        if let Some(&la) = local.get(&(*a as usize)) {
-                            let Node::Recipe { recipe: ra, .. } = &net.nodes[*a as usize]
-                            else {
-                                unreachable!()
-                            };
-                            feeds.push((la, ra.produce[*leg as usize], ra.latency));
-                        } else {
-                            known = known
-                                .add(&node_outs[*a as usize].as_ref().expect("topo order")
-                                    [*leg as usize]);
+    let build_leg = |g: usize, leg_i: usize, consume: u64| -> LegIn {
+        let wire = &net.wires[layout.node_input_wire(g, leg_i)];
+        let mut known = Counting::constant(wire.marking);
+        let mut feeds = Vec::new();
+        for src in &wire.sources {
+            match src {
+                Source::Input(i) => known = known.add(&inputs[*i as usize]),
+                Source::NodeOut { node: a, leg } => {
+                    if let Some(&la) = local.get(&(*a as usize)) {
+                        match &net.nodes[*a as usize] {
+                            Node::Recipe { recipe: ra, .. } => feeds.push(Feed::Recipe {
+                                src: la,
+                                amt: ra.produce[*leg as usize],
+                                lat: ra.latency,
+                            }),
+                            Node::Priority { .. } => {
+                                feeds.push(Feed::Prio { src: la, leg: *leg as u8 })
+                            }
+                            Node::Module(_) => {
+                                unreachable!("cyclic components with modules are flattened")
+                            }
                         }
+                    } else {
+                        known = known.add(
+                            &node_outs[*a as usize].as_ref().expect("topo order")
+                                [*leg as usize],
+                        );
                     }
                 }
             }
-            legs.push(LegIn { known, feeds, consume: c });
         }
-        snodes.push(SccNode {
-            latency: recipe.latency,
-            produce: recipe.produce.clone(),
-            legs,
-        });
+        LegIn { known, feeds, consume }
+    };
+    let mut snodes: Vec<SccNode> = Vec::with_capacity(comp.len());
+    for &g in comp {
+        match &net.nodes[g] {
+            Node::Recipe { recipe, .. } => snodes.push(SccNode {
+                kind: SKind::Recipe {
+                    latency: recipe.latency,
+                    produce: recipe.produce.clone(),
+                },
+                legs: recipe
+                    .consume
+                    .iter()
+                    .enumerate()
+                    .map(|(l, &c)| build_leg(g, l, c))
+                    .collect(),
+            }),
+            Node::Priority { .. } => snodes.push(SccNode {
+                kind: SKind::Priority,
+                legs: vec![build_leg(g, 0, 1), build_leg(g, 1, 1)],
+            }),
+            Node::Module(_) => unreachable!("cyclic components with modules are flattened"),
+        }
     }
 
     // Within one tick, values propagate along zero-latency producers; that
@@ -340,12 +394,11 @@ fn solve_scc(
 
     let mut t_sim = (4 * (tmin as u64 + l) + 64).clamp(16, horizon);
     loop {
-        if let Some(cands) = attempt(&snodes, &intra_order, t_sim, tmin, l)? {
+        if let Some((cands, outs)) =
+            attempt(&snodes, &intra_order, t_sim, tmin, l, horizon)?
+        {
             for (li, &g) in comp.iter().enumerate() {
-                let sn = &snodes[li];
-                let fired = cands[li].shift(sn.latency);
-                node_outs[g] =
-                    Some(sn.produce.iter().map(|&p| fired.scale_floor(p, 1)).collect());
+                node_outs[g] = Some(outs[li].clone());
                 firings[g] = Some(cands[li].clone());
             }
             return Ok(());
@@ -357,7 +410,7 @@ fn solve_scc(
     }
 }
 
-/// Topological order of component nodes along zero-latency feed edges, or
+/// Topological order of component nodes along same-tick feed edges, or
 /// `None` if they cycle.
 fn zero_latency_topo(snodes: &[SccNode]) -> Option<Vec<usize>> {
     let m = snodes.len();
@@ -365,9 +418,9 @@ fn zero_latency_topo(snodes: &[SccNode]) -> Option<Vec<usize>> {
     let mut indeg = vec![0usize; m];
     for (li, sn) in snodes.iter().enumerate() {
         for leg in &sn.legs {
-            for &(la, _, lat) in &leg.feeds {
-                if lat == 0 {
-                    edges[la].push(li);
+            for feed in &leg.feeds {
+                if let Some(src) = feed.same_tick() {
+                    edges[src].push(li);
                     indeg[li] += 1;
                 }
             }
@@ -387,50 +440,113 @@ fn zero_latency_topo(snodes: &[SccNode]) -> Option<Vec<usize>> {
     (order.len() == m).then_some(order)
 }
 
+fn sim_contrib(series: &Series, feed: &Feed, t: usize) -> Result<u64, EvalError> {
+    Ok(match (feed, series) {
+        (&Feed::Recipe { amt, lat, .. }, Series::R(k)) => {
+            if t as u64 >= lat {
+                amt.checked_mul(k[t - lat as usize]).ok_or(EvalError::RateExplosion)?
+            } else {
+                0
+            }
+        }
+        (&Feed::Prio { leg, .. }, Series::P { used, i_in }) => {
+            // Same-tick: the source is earlier in intra order.
+            if leg == 0 {
+                used[t]
+            } else {
+                i_in[t] - used[t]
+            }
+        }
+        _ => unreachable!("feed kind matches series kind"),
+    })
+}
+
 /// Simulate `t_sim` ticks densely, look for a repeating delta pattern, and
 /// verify any candidate symbolically. `Ok(None)` = no verified candidate at
 /// this horizon.
+#[allow(clippy::type_complexity)]
 fn attempt(
     snodes: &[SccNode],
     intra_order: &[usize],
     t_sim: u64,
     tmin: usize,
     l: u64,
-) -> Result<Option<Vec<Counting>>, EvalError> {
+    horizon: u64,
+) -> Result<Option<(Vec<Counting>, Vec<Vec<Counting>>)>, EvalError> {
     let m = snodes.len();
     let t_sim = t_sim as usize;
 
-    // Dense simulation of firing counts.
-    let mut k: Vec<Vec<u64>> = vec![Vec::with_capacity(t_sim); m];
+    // Dense simulation.
+    let mut series: Vec<Series> = snodes
+        .iter()
+        .map(|sn| match sn.kind {
+            SKind::Recipe { .. } => Series::R(Vec::with_capacity(t_sim)),
+            SKind::Priority => Series::P {
+                used: Vec::with_capacity(t_sim),
+                i_in: Vec::with_capacity(t_sim),
+            },
+        })
+        .collect();
     for t in 0..t_sim {
         for &li in intra_order {
             let sn = &snodes[li];
+            let mut leg_vals = [0u64; 2];
             let mut kk = u64::MAX;
-            for leg in &sn.legs {
+            for (leg_idx, leg) in sn.legs.iter().enumerate() {
                 let mut v = leg.known.eval(t as u64);
-                for &(la, amt, lat) in &leg.feeds {
-                    if t as u64 >= lat {
-                        // For lat == 0 the source is earlier in intra_order,
-                        // so k[la][t] is already computed.
-                        let kv = k[la][t - lat as usize];
-                        v = v
-                            .checked_add(amt.checked_mul(kv).ok_or(EvalError::RateExplosion)?)
-                            .ok_or(EvalError::RateExplosion)?;
-                    }
+                for feed in &leg.feeds {
+                    let src = match *feed {
+                        Feed::Recipe { src, .. } | Feed::Prio { src, .. } => src,
+                    };
+                    v = v
+                        .checked_add(sim_contrib(&series[src], feed, t)?)
+                        .ok_or(EvalError::RateExplosion)?;
+                }
+                if leg_idx < 2 {
+                    leg_vals[leg_idx] = v;
                 }
                 kk = kk.min(v / leg.consume);
             }
-            if kk > EXPLOSION_CAP {
-                return Err(EvalError::RateExplosion);
+            match (&sn.kind, &mut series[li]) {
+                (SKind::Recipe { .. }, Series::R(k)) => {
+                    if kk > EXPLOSION_CAP {
+                        return Err(EvalError::RateExplosion);
+                    }
+                    k.push(kk);
+                }
+                (SKind::Priority, Series::P { used, i_in }) => {
+                    let (i, d) = (leg_vals[0], leg_vals[1]);
+                    if i > EXPLOSION_CAP {
+                        return Err(EvalError::RateExplosion);
+                    }
+                    let i_prev = i_in.last().copied().unwrap_or(0);
+                    let u_prev = used.last().copied().unwrap_or(0);
+                    let du = (i - i_prev).min(d - u_prev);
+                    used.push(u_prev + du);
+                    i_in.push(i);
+                }
+                _ => unreachable!(),
             }
-            k[li].push(kk);
         }
     }
 
-    // Look for a period: smallest multiple of `l` whose per-tick firing
-    // deltas repeat over a verified suffix at least one period long.
+    // All observable state streams must repeat for a candidate period.
+    let streams: Vec<&Vec<u64>> = series
+        .iter()
+        .flat_map(|s| match s {
+            Series::R(k) => vec![k],
+            Series::P { used, i_in } => vec![used, i_in],
+        })
+        .collect();
+    let primary = |li: usize| -> &Vec<u64> {
+        match &series[li] {
+            Series::R(k) => k,
+            Series::P { used, .. } => used,
+        }
+    };
+
     let t0_floor = tmin.max(1);
-    let dk = |li: usize, t: usize| k[li][t] - k[li][t - 1];
+    let ds = |s: &Vec<u64>, t: usize| s[t] - s[t - 1];
     let mut pm = 1u64;
     loop {
         let p = pm * l;
@@ -440,20 +556,22 @@ fn attempt(
         }
         // Longest suffix [lo, t_sim - p) on which deltas repeat with lag p.
         let mut lo = t_sim - pu;
-        while lo > t0_floor && (0..m).all(|li| dk(li, lo - 1 + pu) == dk(li, lo - 1)) {
+        while lo > t0_floor
+            && streams.iter().all(|s| ds(s, lo - 1 + pu) == ds(s, lo - 1))
+        {
             lo -= 1;
         }
         if t_sim - pu - lo >= pu {
             let t0 = lo;
             let cands: Option<Vec<Counting>> = (0..m)
                 .map(|li| {
-                    let slope = k[li][t0 + pu] - k[li][t0];
-                    Counting::try_from_parts(k[li][..t0 + pu].to_vec(), t0, p, slope)
+                    let s = primary(li);
+                    Counting::try_from_parts(s[..t0 + pu].to_vec(), t0, p, s[t0 + pu] - s[t0])
                 })
                 .collect();
             if let Some(cands) = cands {
-                if verify(snodes, &cands) {
-                    return Ok(Some(cands));
+                if let Some(outs) = verify(snodes, &cands, intra_order, horizon) {
+                    return Ok(Some((cands, outs)));
                 }
             }
         }
@@ -461,29 +579,116 @@ fn attempt(
     }
 }
 
-/// Check the fixed-point equations symbolically: for every component node,
-/// the candidate firing map must equal the firings computed from the wire
-/// countings that the candidates themselves induce. Exact M0 algebra —
-/// soundness of the whole feedback solver lives here.
-fn verify(snodes: &[SccNode], cands: &[Counting]) -> bool {
-    for (li, sn) in snodes.iter().enumerate() {
-        let mut firings: Option<Counting> = None;
-        for leg in &sn.legs {
-            let mut wire = leg.known.clone();
-            for &(la, amt, lat) in &leg.feeds {
-                wire = wire.add(&cands[la].shift(lat).scale_floor(amt, 1));
-            }
-            let f = wire.scale_floor(1, leg.consume);
-            firings = Some(match firings {
-                None => f,
-                Some(acc) => acc.min(&f),
-            });
-        }
-        if firings.expect("recipes have >= 1 input leg") != cands[li] {
-            return false;
+/// Symbolic contribution of a feed, given candidates and (for priority
+/// sources) already-derived fallbacks.
+fn sym_contrib(feed: &Feed, cands: &[Counting], fallbacks: &[Option<Counting>]) -> Counting {
+    match *feed {
+        Feed::Recipe { src, amt, lat } => cands[src].shift(lat).scale_floor(amt, 1),
+        Feed::Prio { src, leg: 0 } => cands[src].clone(),
+        Feed::Prio { src, .. } => {
+            fallbacks[src].as_ref().expect("intra order").clone()
         }
     }
-    true
+}
+
+/// Check the fixed-point equations symbolically: every node's candidate
+/// must equal what the candidates themselves induce through its equation.
+/// Exact M0 algebra — soundness of the whole feedback solver lives here.
+/// On success returns each node's output-leg countings.
+fn verify(
+    snodes: &[SccNode],
+    cands: &[Counting],
+    intra_order: &[usize],
+    horizon: u64,
+) -> Option<Vec<Vec<Counting>>> {
+    let m = snodes.len();
+    let mut fallbacks: Vec<Option<Counting>> = vec![None; m];
+
+    // Pass 1, in same-tick topological order: derive each priority node's
+    // input countings from the candidates, re-derive its behavior with a
+    // certificate, and demand it match the candidate.
+    for &li in intra_order {
+        if !matches!(snodes[li].kind, SKind::Priority) {
+            continue;
+        }
+        let leg_val = |leg: &LegIn, fallbacks: &Vec<Option<Counting>>| {
+            let mut v = leg.known.clone();
+            for feed in &leg.feeds {
+                v = v.add(&sym_contrib(feed, cands, fallbacks));
+            }
+            v
+        };
+        let i_cand = leg_val(&snodes[li].legs[0], &fallbacks);
+        let d_cand = leg_val(&snodes[li].legs[1], &fallbacks);
+        // Grow the derivation window from small: closures are almost always
+        // found near the candidate's own period, and a wrong candidate
+        // should fail cheaply.
+        let mut w = 512u64.min(horizon);
+        let (granted, fallback) = loop {
+            if let Some(r) = priority_apply(&i_cand, &d_cand, w) {
+                break r;
+            }
+            if w >= horizon {
+                return None;
+            }
+            w = (w * 2).min(horizon);
+        };
+        if granted != cands[li] {
+            return None;
+        }
+        fallbacks[li] = Some(fallback);
+    }
+
+    // Pass 2: recipes.
+    let mut outs: Vec<Vec<Counting>> = Vec::with_capacity(m);
+    for (li, sn) in snodes.iter().enumerate() {
+        match &sn.kind {
+            SKind::Recipe { latency, produce } => {
+                let mut firings: Option<Counting> = None;
+                for leg in &sn.legs {
+                    let mut wire = leg.known.clone();
+                    for feed in &leg.feeds {
+                        wire = wire.add(&sym_contrib(feed, cands, &fallbacks));
+                    }
+                    let f = wire.scale_floor(1, leg.consume);
+                    firings = Some(match firings {
+                        None => f,
+                        Some(acc) => acc.min(&f),
+                    });
+                }
+                if firings.expect("recipes have >= 1 input leg") != cands[li] {
+                    return None;
+                }
+                let fired = cands[li].shift(*latency);
+                outs.push(produce.iter().map(|&p| fired.scale_floor(p, 1)).collect());
+            }
+            SKind::Priority => {
+                outs.push(vec![
+                    cands[li].clone(),
+                    fallbacks[li].clone().expect("pass 1 covered all priorities"),
+                ]);
+            }
+        }
+    }
+    Some(outs)
+}
+
+/// Acyclic priority node: derive with a growing window up to the horizon.
+fn priority_apply_growing(
+    items: &Counting,
+    tokens: &Counting,
+    horizon: u64,
+) -> Result<(Counting, Counting), EvalError> {
+    let mut w = 512u64.min(horizon);
+    loop {
+        if let Some(r) = priority_apply(items, tokens, w) {
+            return Ok(r);
+        }
+        if w >= horizon {
+            return Err(EvalError::NoPeriodicSteadyState { horizon });
+        }
+        w = (w * 2).min(horizon);
+    }
 }
 
 fn lcm_capped(a: u64, b: u64, cap: u64) -> u64 {

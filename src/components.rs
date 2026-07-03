@@ -83,6 +83,72 @@ pub fn gauge(
     lib.intern(b.build()).expect("gauge net is valid")
 }
 
+/// Overflow splitter (tier 1): the primary output receives up to `num`
+/// items per `den` ticks (grant tokens minted by an internal clock); the
+/// rest spills to the overflow output, same tick. Factorio's priority
+/// splitter, derived from one Priority node and one recipe loop.
+pub fn overflow(
+    lib: &mut Library,
+    item: ItemType,
+    token: ItemType,
+    num: u64,
+    den: u64,
+) -> NetId {
+    assert!(den >= 1);
+    let mut b = NetBuilder::new();
+    let input = b.input(item);
+    // Grant minter: token -> token + num grants, every den ticks.
+    let minter = b.recipe(
+        Recipe::new(vec![1], vec![1, num], den),
+        &[token],
+        &[token, token],
+    );
+    b.connect(minter.output(0), minter.input(0));
+    b.marking(minter.input(0), 1);
+    let p = b.priority(item, token);
+    b.connect(input, p.input(0));
+    b.connect(minter.output(1), p.input(1));
+    let primary = b.output(item);
+    let spill = b.output(item);
+    b.connect(p.output(0), primary);
+    b.connect(p.output(1), spill);
+    lib.intern(b.build()).expect("overflow net is valid")
+}
+
+/// Demand-driven store (tier 1): the drainable buffer the monotone kernel
+/// provably cannot express. Items pool in a recirculating loop; each demand
+/// token releases one item downstream; a tap on the circulation emits one
+/// pulse per item per round trip, so the pulse rate reads the *current*
+/// level of a buffer that can actually drain.
+pub fn demand_store(
+    lib: &mut Library,
+    item: ItemType,
+    demand: ItemType,
+    pulse: ItemType,
+    initial: u64,
+) -> NetId {
+    let mut b = NetBuilder::new();
+    let refill = b.input(item);
+    let want = b.input(demand);
+    // Tap: every circulating item re-emits itself plus a census pulse.
+    let tap = b.recipe(
+        Recipe::new(vec![1], vec![1, 1], 1),
+        &[item],
+        &[item, pulse],
+    );
+    let p = b.priority(item, demand);
+    b.connect(refill, tap.input(0));
+    b.marking(tap.input(0), initial);
+    b.connect(tap.output(0), p.input(0));
+    b.connect(want, p.input(1));
+    b.connect(p.output(1), tap.input(0)); // undemanded items recirculate
+    let out = b.output(item);
+    let level = b.output(pulse);
+    b.connect(p.output(0), out);
+    b.connect(tap.output(1), level);
+    lib.intern(b.build()).expect("demand_store net is valid")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +275,81 @@ mod tests {
         let id = lib.intern(b.build()).unwrap();
         let mut ev = Evaluator::new(&lib);
         assert_eq!(ev.evaluate(id, &[]), Err(EvalError::RateExplosion));
+    }
+
+    #[test]
+    fn overflow_splits_by_priority() {
+        let mut lib = Library::new();
+        let id = overflow(&mut lib, ITEM, TOKEN, 2, 3);
+        let mut ev = Evaluator::new(&lib);
+        let outs = ev.evaluate(id, &[Counting::unit_rate()]).unwrap();
+        assert_eq!(outs[0].rate(), (2, 3)); // primary: token-limited
+        assert_eq!(outs[1].rate(), (1, 3)); // spill: the rest
+        // Conservation through the gate: primary + spill == input.
+        assert_eq!(outs[0].add(&outs[1]), Counting::unit_rate());
+    }
+
+    #[test]
+    fn more_tokens_means_less_overflow() {
+        // The else, observably: increasing one INPUT (grant tokens)
+        // DECREASES an output (spill). Non-monotone — the monotone kernel
+        // provably cannot do this; Priority is exactly the power added.
+        let mut lib = Library::new();
+        let scarce = overflow(&mut lib, ITEM, TOKEN, 1, 3);
+        let plenty = overflow(&mut lib, ITEM, TOKEN, 1, 1);
+        let mut ev = Evaluator::new(&lib);
+        let spill_scarce =
+            ev.evaluate(scarce, &[Counting::unit_rate()]).unwrap()[1].rate();
+        let spill_plenty =
+            ev.evaluate(plenty, &[Counting::unit_rate()]).unwrap()[1].rate();
+        assert_eq!(spill_scarce, (2, 3));
+        assert_eq!(spill_plenty, (0, 1));
+    }
+
+    #[test]
+    fn demand_store_drains_and_dies() {
+        // 4 preloaded items, no refill, constant demand: exactly 4 items
+        // ever leave, then the store is empty and its level gauge reads 0.
+        let mut lib = Library::new();
+        let id = demand_store(&mut lib, ITEM, TOKEN, PULSE, 4);
+        let mut ev = Evaluator::new(&lib);
+        let outs = ev
+            .evaluate(id, &[Counting::zero(), Counting::unit_rate()])
+            .unwrap();
+        let (granted, level) = (&outs[0], &outs[1]);
+        assert_eq!(granted.rate(), (0, 1));
+        assert_eq!(granted.eval(1000), 4); // total ever delivered
+        assert_eq!(level.rate(), (0, 1)); // gauge reads empty
+    }
+
+    #[test]
+    fn demand_store_is_a_drainable_level_gauge() {
+        // The component M2 could not have: a level meter on a buffer that
+        // can actually drain. Idle store of 4: gauge reads 4 per round trip.
+        // Under demand the same store empties and the gauge falls to 0 —
+        // again non-monotone (more demand, fewer pulses).
+        let mut lib = Library::new();
+        let id = demand_store(&mut lib, ITEM, TOKEN, PULSE, 4);
+        let mut ev = Evaluator::new(&lib);
+        let idle = ev
+            .evaluate(id, &[Counting::zero(), Counting::zero()])
+            .unwrap();
+        assert_eq!(idle[1].rate(), (4, 1)); // level 4, read every tick
+        let drained = ev
+            .evaluate(id, &[Counting::zero(), Counting::unit_rate()])
+            .unwrap();
+        assert_eq!(drained[1].rate(), (0, 1));
+    }
+
+    #[test]
+    fn demand_store_passes_refill_through() {
+        // Refill at 1/2, demand at 1: long-run delivery is refill-limited.
+        let mut lib = Library::new();
+        let id = demand_store(&mut lib, ITEM, TOKEN, PULSE, 4);
+        let mut ev = Evaluator::new(&lib);
+        let refill = Counting::unit_rate().scale_floor(1, 2);
+        let outs = ev.evaluate(id, &[refill, Counting::unit_rate()]).unwrap();
+        assert_eq!(outs[0].rate(), (1, 2));
     }
 
     #[test]

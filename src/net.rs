@@ -43,6 +43,14 @@ pub enum Node {
         out_types: Vec<ItemType>,
     },
     Module(NetId),
+    /// The tier-1 primitive — the *else*. Inputs `[item, token]`, outputs
+    /// `[granted, fallback]` (both of the item type). Each tick, arriving
+    /// items take a token and leave via `granted` while tokens last; the
+    /// rest leave via `fallback`, same tick. Non-monotone by design: more
+    /// tokens means less fallback. This is inhibitor-arc power — everything
+    /// the monotone kernel provably cannot express (priority, overflow,
+    /// zero-tests) and the reason tier-1 summaries cache less sharply.
+    Priority { item: ItemType, token: ItemType },
 }
 
 /// A producer endpoint: a net input port or a node output leg.
@@ -132,6 +140,7 @@ impl Library {
         match node {
             Node::Recipe { in_types, .. } => in_types.clone(),
             Node::Module(id) => self.get(*id).inputs.clone(),
+            Node::Priority { item, token } => vec![*item, *token],
         }
     }
 
@@ -139,6 +148,7 @@ impl Library {
         match node {
             Node::Recipe { out_types, .. } => out_types.clone(),
             Node::Module(id) => self.get(*id).outputs.clone(),
+            Node::Priority { item, .. } => vec![*item, *item],
         }
     }
 
@@ -295,6 +305,14 @@ impl NetBuilder {
     pub fn module(&mut self, lib: &Library, id: NetId) -> NodeHandle {
         self.node_in_counts.push(lib.get(id).inputs.len());
         self.nodes.push(Node::Module(id));
+        NodeHandle(self.nodes.len() as u32 - 1)
+    }
+
+    /// The tier-1 else-gate: inputs `[item, token]`, outputs
+    /// `[granted, fallback]`.
+    pub fn priority(&mut self, item: ItemType, token: ItemType) -> NodeHandle {
+        self.node_in_counts.push(2);
+        self.nodes.push(Node::Priority { item, token });
         NodeHandle(self.nodes.len() as u32 - 1)
     }
 

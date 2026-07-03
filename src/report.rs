@@ -79,10 +79,6 @@ fn radd(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
     )
 }
 
-fn rscale(a: (u64, u64), k: u64) -> (u64, u64) {
-    rreduce(a.0 as u128 * k as u128, a.1 as u128)
-}
-
 /// `a - b`, requiring `a >= b` (conservation guarantees it; violation is an
 /// engine bug).
 fn rsub(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
@@ -172,9 +168,7 @@ fn audit_trace(ev: &Evaluator<'_>, trace: &Trace) -> Audit {
     // Minted / discarded / consumed, per node.
     let mut wire_backlog_ok = true;
     for (n, node) in net.nodes.iter().enumerate() {
-        let Node::Recipe { recipe, in_types, out_types } = node else {
-            unreachable!("audit runs on flattened nets")
-        };
+        let out_types = ev.lib().node_out_types(node);
         for (j, &ty) in out_types.iter().enumerate() {
             let rate = trace.node_outs[n][j].rate();
             let src = Source::NodeOut { node: n as u32, leg: j as u32 };
@@ -184,15 +178,28 @@ fn audit_trace(ev: &Evaluator<'_>, trace: &Trace) -> Audit {
                 e.discarded = radd(e.discarded, rate);
             }
         }
+        // Per input leg: consumption map, for the ledger and the
+        // no-conjuring check against the wire's supply.
+        let in_types = ev.lib().node_in_types(node);
+        let consumed_maps: Vec<Counting> = match node {
+            Node::Recipe { recipe, .. } => recipe
+                .consume
+                .iter()
+                .map(|&c| trace.firings[n].scale_floor(c, 1))
+                .collect(),
+            Node::Priority { .. } => vec![
+                // Items pass through entirely: granted + fallback.
+                trace.node_outs[n][0].add(&trace.node_outs[n][1]),
+                // Tokens consumed = granted (one per granted item).
+                trace.firings[n].clone(),
+            ],
+            Node::Module(_) => unreachable!("audit runs on flattened nets"),
+        };
         for (l, &ty) in in_types.iter().enumerate() {
-            let consumed_rate = rscale(trace.firings[n].rate(), recipe.consume[l]);
             let e = entry(&mut acc, ty);
-            e.consumed = radd(e.consumed, consumed_rate);
-            // No conjuring: cumulative consumption <= cumulative supply on
-            // this wire, checked pointwise-forever with exact algebra.
-            let consumed_map = trace.firings[n].scale_floor(recipe.consume[l], 1);
+            e.consumed = radd(e.consumed, consumed_maps[l].rate());
             let supply = wire_supply(net, &layout, n, l, trace);
-            if consumed_map.min(&supply) != consumed_map {
+            if consumed_maps[l].min(&supply) != consumed_maps[l] {
                 wire_backlog_ok = false;
             }
         }

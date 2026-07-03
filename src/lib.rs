@@ -14,6 +14,7 @@ pub mod counting;
 pub mod eval;
 pub mod flatten;
 pub mod net;
+mod priority;
 pub mod recipe;
 pub mod report;
 pub mod world;
