@@ -1,0 +1,346 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>hashtorio</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  body { background:#14171c; color:#cdd6e0; font:14px/1.45 system-ui, sans-serif;
+         display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+  header { display:flex; gap:10px; align-items:center; padding:10px 14px;
+           background:#1b1f27; border-bottom:1px solid #2a303b; flex-wrap:wrap; }
+  header .title { font-weight:700; color:#f4b942; letter-spacing:.5px; margin-right:8px; }
+  button, select, input { background:#252b36; color:#cdd6e0; border:1px solid #39414f;
+           border-radius:6px; padding:5px 10px; font:inherit; }
+  button:hover { background:#2f3745; cursor:pointer; }
+  #tick { font-variant-numeric: tabular-nums; min-width:110px; color:#8fd3ff; }
+  #warp { width:130px; }
+  input[type=range] { width:220px; padding:0; }
+  main { display:flex; flex:1; min-height:0; }
+  canvas { flex:1; display:block; }
+  aside { width:320px; overflow-y:auto; background:#191d24; border-left:1px solid #2a303b;
+          padding:14px; }
+  aside h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px;
+             color:#7d8a99; margin:14px 0 6px; }
+  aside h2:first-child { margin-top:0; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px;
+          font-variant-numeric:tabular-nums; }
+  td, th { padding:3px 6px; text-align:right; border-bottom:1px solid #242a34; }
+  td:first-child, th:first-child { text-align:left; }
+  th { color:#7d8a99; font-weight:600; }
+  .hint { color:#5d6875; font-size:12px; margin-top:10px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">hashtorio</span>
+  <button id="play">&#10074;&#10074; pause</button>
+  <select id="speed">
+    <option value="2">2 t/s</option>
+    <option value="10" selected>10 t/s</option>
+    <option value="30">30 t/s</option>
+    <option value="120">120 t/s</option>
+  </select>
+  <span id="tick">tick 0</span>
+  <input type="range" id="scrub" min="0" max="2000" value="0">
+  <input id="warp" placeholder="warp to tick&hellip;">
+  <button id="go">warp</button>
+  <button id="mega">warp 1,000,000</button>
+</header>
+<main>
+  <canvas id="cv"></canvas>
+  <aside>
+    <h2>published spec</h2><table id="spec"></table>
+    <h2>conservation audit (rates)</h2><table id="audit"></table>
+    <div class="hint">Every frame — including tick 1,000,000 — is an O(1)
+    read of exact counting maps. Nothing is ever simulated to draw.</div>
+  </aside>
+</main>
+<script>
+'use strict';
+const COLORS = { iron:'#9aa5b1', gear:'#f4b942', tok:'#566072', tok2:'#566072',
+                 grant:'#7bd88f', demand:'#e05e78', pulse:'#69d2e7' };
+const color = ty => COLORS[ty] || '#c0a0e0';
+
+const S = { t:0, playing:true, tps:10, scene:null, frames:new Map(), fetching:new Set(),
+            pos:{}, last:performance.now() };
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+
+function resize() {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+
+// ---- layout: layered by relaxed depth over forward edges ----------------
+function layout() {
+  const sc = S.scene, n = sc.nodes.length;
+  const depth = new Array(n).fill(1);
+  for (let pass = 0; pass < n + 2; pass++) {
+    for (const e of sc.edges) {
+      if (e.from[0] === 'node' && e.to[0] === 'node' && e.from[1] !== e.to[1]) {
+        const want = depth[e.from[1]] + 1;
+        if (want > depth[e.to[1]] && want <= n) depth[e.to[1]] = want;
+      }
+    }
+  }
+  const maxd = Math.max(1, ...depth);
+  const W = cv.getBoundingClientRect().width, H = cv.getBoundingClientRect().height;
+  const colX = d => 70 + (d / (maxd + 1)) * (W - 320);
+  const cols = {};
+  depth.forEach((d, i) => { (cols[d] = cols[d] || []).push(i); });
+  S.pos = { node:[], input:[], output:[] };
+  for (const d in cols) {
+    const list = cols[d];
+    list.forEach((i, j) => {
+      S.pos.node[i] = { x: colX(+d), y: H * (j + 1) / (list.length + 1), w: 150, h: 56 };
+    });
+  }
+  sc.inputs.forEach((_, i) => {
+    S.pos.input[i] = { x: 24, y: H * (i + 1) / (sc.inputs.length + 1) };
+  });
+  sc.outputs.forEach((_, o) => {
+    S.pos.output[o] = { x: W - 150, y: H * (o + 1) / (sc.outputs.length + 1) };
+  });
+}
+
+function endpoints(e) {
+  let a, b;
+  if (e.from[0] === 'in') { const p = S.pos.input[e.from[1]]; a = { x: p.x + 14, y: p.y }; }
+  else { const p = S.pos.node[e.from[1]]; a = { x: p.x + p.w, y: p.y + 14 + 10 * e.from[2] }; }
+  if (e.to[0] === 'out') { const p = S.pos.output[e.to[1]]; b = { x: p.x, y: p.y }; }
+  else { const p = S.pos.node[e.to[1]]; b = { x: p.x, y: p.y + 14 + 12 * e.to[2] }; }
+  return [a, b];
+}
+
+function edgePath(e) {
+  const [a, b] = endpoints(e);
+  const self = e.from[0] === 'node' && e.to[0] === 'node' && e.from[1] === e.to[1];
+  if (self) {
+    // small loop above the node
+    return { kind:'loop', a, b, cx: a.x - 40, cy: a.y - 46, dx: b.x - 22, dy: b.y - 46 };
+  }
+  const back = b.x < a.x + 20;
+  const bend = back ? 90 + Math.abs(a.y - b.y) * 0.25 : Math.max(40, (b.x - a.x) * 0.4);
+  const sag = back ? 70 : 0;
+  return { kind:'cubic', a, b, c1:{x:a.x+bend, y:a.y+sag}, c2:{x:b.x-bend, y:b.y+sag} };
+}
+
+function pointAt(p, s) {
+  const bez = (p0,p1,p2,p3,u) => {
+    const v = 1-u;
+    return v*v*v*p0 + 3*v*v*u*p1 + 3*v*u*u*p2 + u*u*u*p3;
+  };
+  if (p.kind === 'loop')
+    return { x: bez(p.a.x, p.cx, p.dx, p.b.x, s), y: bez(p.a.y, p.cy, p.dy, p.b.y, s) };
+  return { x: bez(p.a.x, p.c1.x, p.c2.x, p.b.x, s), y: bez(p.a.y, p.c1.y, p.c2.y, p.b.y, s) };
+}
+
+// ---- frames --------------------------------------------------------------
+async function ensure(t) {
+  t = Math.max(0, Math.floor(t));
+  for (let k = t; k < t + 8; k++) {
+    if (!S.frames.has(k)) {
+      const from = k, key = 'b' + from;
+      if (S.fetching.has(key)) return;
+      S.fetching.add(key);
+      try {
+        const r = await (await fetch(`/api/frames?from=${from}&n=64`)).json();
+        r.frames.forEach((f, i) => S.frames.set(r.from + i, f));
+        if (S.frames.size > 4096) {
+          const keep = new Set();
+          for (let j = Math.floor(S.t) - 64; j < Math.floor(S.t) + 256; j++) keep.add(j);
+          for (const kk of S.frames.keys()) if (!keep.has(kk)) S.frames.delete(kk);
+        }
+      } finally { S.fetching.delete(key); }
+      return;
+    }
+  }
+}
+
+// ---- drawing --------------------------------------------------------------
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y); ctx.arcTo(x+w, y, x+w, y+h, r); ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r); ctx.arcTo(x, y, x+w, y, r); ctx.closePath();
+}
+
+function draw() {
+  const W = cv.getBoundingClientRect().width, H = cv.getBoundingClientRect().height;
+  ctx.clearRect(0, 0, W, H);
+  const sc = S.scene; if (!sc) return;
+  const T = Math.floor(S.t), phase = S.t - T;
+  const cur = S.frames.get(T), nxt = S.frames.get(T + 1);
+
+  // edges
+  sc.edges.forEach((e, i) => {
+    const p = edgePath(e);
+    ctx.strokeStyle = color(e.ty) + '44';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(p.a.x, p.a.y);
+    if (p.kind === 'loop') ctx.bezierCurveTo(p.cx, p.cy, p.dx, p.dy, p.b.x, p.b.y);
+    else ctx.bezierCurveTo(p.c1.x, p.c1.y, p.c2.x, p.c2.y, p.b.x, p.b.y);
+    ctx.stroke();
+    // items in motion during this tick
+    if (nxt) {
+      const flow = nxt.flow[i];
+      if (flow > 0) {
+        const dots = Math.min(flow, 6);
+        ctx.fillStyle = color(e.ty);
+        for (let j = 0; j < dots; j++) {
+          const s = phase - j * 0.07;
+          if (s < 0 || s > 1) continue;
+          const q = pointAt(p, s);
+          ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, 7); ctx.fill();
+        }
+        if (flow > 6) {
+          const q = pointAt(p, Math.min(Math.max(phase, 0.05), 0.95));
+          ctx.fillStyle = '#fff';
+          ctx.font = 'bold 11px system-ui';
+          ctx.fillText('×' + flow, q.x + 6, q.y - 6);
+        }
+      }
+    }
+  });
+
+  // input sources
+  sc.inputs.forEach((label, i) => {
+    const p = S.pos.input[i];
+    ctx.fillStyle = '#39414f';
+    ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, 7); ctx.fill();
+    ctx.strokeStyle = color('iron'); ctx.stroke();
+    ctx.fillStyle = '#9aa5b1'; ctx.font = '11px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText(label, p.x + 6, p.y + 30);
+    ctx.textAlign = 'left';
+  });
+
+  // nodes
+  sc.nodes.forEach((node, n) => {
+    const p = S.pos.node[n];
+    const fired = nxt ? nxt.fired[n] : 0;
+    roundRect(p.x, p.y, p.w, p.h, 9);
+    ctx.fillStyle = node.kind === 'priority' ? '#2b2433' : '#232a35';
+    ctx.fill();
+    ctx.lineWidth = fired > 0 ? 2.5 : 1;
+    ctx.strokeStyle = fired > 0
+      ? `rgba(244,185,66,${0.35 + 0.65 * Math.sin(Math.PI * phase)})`
+      : '#39414f';
+    ctx.stroke();
+    ctx.fillStyle = '#e6edf3'; ctx.font = '12px system-ui';
+    ctx.fillText(node.label, p.x + 9, p.y + 16);
+    ctx.fillStyle = node.kind === 'priority' ? '#c792ea' : '#7d8a99';
+    ctx.font = '10px system-ui';
+    ctx.fillText(node.kind === 'priority' ? 'else-gate' : 'recipe', p.x + 9, p.y + 28);
+    if (fired > 0) {
+      ctx.fillStyle = '#f4b942';
+      ctx.textAlign = 'right';
+      ctx.fillText('⚙×' + fired, p.x + p.w - 8, p.y + 16);
+      ctx.textAlign = 'left';
+    }
+    // per-leg queue occupancy
+    if (cur) node.legs.forEach((ty, l) => {
+      const occ = cur.occ[n][l];
+      const y = p.y + 36 + l * 9;
+      ctx.fillStyle = color(ty) + '33';
+      ctx.fillRect(p.x + 9, y, 90, 6);
+      ctx.fillStyle = color(ty);
+      ctx.fillRect(p.x + 9, y, Math.min(occ, 30) * 3, 6);
+      ctx.font = '9.5px system-ui';
+      ctx.fillStyle = '#9aa5b1';
+      ctx.fillText(`${ty} ${occ}`, p.x + 104, y + 6);
+    });
+  });
+
+  // outputs
+  sc.outputs.forEach((label, o) => {
+    const p = S.pos.output[o];
+    roundRect(p.x, p.y - 22, 140, 44, 9);
+    ctx.fillStyle = '#20262f'; ctx.fill();
+    ctx.strokeStyle = '#39414f'; ctx.stroke();
+    ctx.fillStyle = '#7d8a99'; ctx.font = '11px system-ui';
+    ctx.fillText(label, p.x + 10, p.y - 7);
+    if (cur) {
+      const [total, delta] = cur.outs[o];
+      ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 14px system-ui';
+      ctx.fillText(total.toLocaleString(), p.x + 10, p.y + 12);
+      if (delta > 0) {
+        ctx.fillStyle = '#7bd88f'; ctx.font = '11px system-ui';
+        ctx.textAlign = 'right';
+        ctx.fillText('+' + delta, p.x + 132, p.y + 12);
+        ctx.textAlign = 'left';
+      }
+    }
+  });
+
+  if (!cur) {
+    ctx.fillStyle = '#7d8a99'; ctx.font = '13px system-ui';
+    ctx.fillText('fetching frames…', W / 2 - 50, H / 2);
+  }
+}
+
+// ---- main loop ------------------------------------------------------------
+function loop(now) {
+  const dt = Math.min(0.1, (now - S.last) / 1000);
+  S.last = now;
+  if (S.playing) S.t += dt * S.tps;
+  ensure(S.t);
+  draw();
+  document.getElementById('tick').textContent = 'tick ' + Math.floor(S.t).toLocaleString();
+  const scrub = document.getElementById('scrub');
+  if (document.activeElement !== scrub && S.t <= +scrub.max) scrub.value = Math.floor(S.t);
+  requestAnimationFrame(loop);
+}
+
+// ---- panel ----------------------------------------------------------------
+function fillPanel() {
+  const sc = S.scene;
+  const rate = r => r[1] === 1 ? `${r[0]}/tick` : `${r[0]}/${r[1]} per tick`;
+  document.getElementById('spec').innerHTML =
+    '<tr><th>port</th><th>rate</th><th>first</th></tr>' +
+    sc.spec.map(p =>
+      `<tr><td>${p.name}</td><td>${rate(p.rate)}</td>` +
+      `<td>${p.first === null ? 'never' : 't=' + p.first}</td></tr>`).join('');
+  document.getElementById('audit').innerHTML =
+    '<tr><th>type</th><th>in</th><th>minted</th><th>out</th><th>accum</th></tr>' +
+    sc.audit.map(r =>
+      `<tr><td>${r.ty}</td><td>${frac(r.injected)}</td><td>${frac(r.minted)}</td>` +
+      `<td>${frac(r.delivered)}</td><td>${frac(r.accumulating)}</td></tr>`).join('');
+  function frac(x) { return x[0] === 0 ? '0' : (x[1] === 1 ? x[0] : x[0] + '/' + x[1]); }
+}
+
+// ---- controls ---------------------------------------------------------------
+function warpTo(v) {
+  const t = Math.max(0, Math.min(1e12, Math.floor(v)));
+  if (Number.isFinite(t)) { S.t = t; ensure(t); }
+}
+document.getElementById('play').onclick = e => {
+  S.playing = !S.playing;
+  e.target.innerHTML = S.playing ? '&#10074;&#10074; pause' : '&#9654; play';
+};
+document.getElementById('speed').onchange = e => { S.tps = +e.target.value; };
+document.getElementById('go').onclick = () =>
+  warpTo(+document.getElementById('warp').value.replace(/[,_ ]/g, ''));
+document.getElementById('warp').onkeydown = e => {
+  if (e.key === 'Enter') document.getElementById('go').click();
+};
+document.getElementById('mega').onclick = () => warpTo(1000000);
+document.getElementById('scrub').oninput = e => warpTo(+e.target.value);
+
+// ---- boot -------------------------------------------------------------------
+(async function init() {
+  S.scene = await (await fetch('/api/scene')).json();
+  resize();
+  layout();
+  fillPanel();
+  await ensure(0);
+  requestAnimationFrame(loop);
+  window.addEventListener('resize', layout);
+})();
+</script>
+</body>
+</html>

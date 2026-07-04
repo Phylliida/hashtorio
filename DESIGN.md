@@ -186,9 +186,23 @@ degrades as they use more of it.
   step, `run N` (animated), `warp T` — warping to tick 1,000,000 is instant
   and exact, which is the whole thesis in one command.
 
+- **M6.5** ✅: the browser GUI (`cargo run --bin gui`). A zero-dependency
+  `std::net` HTTP server (hand-rolled JSON, ~no parsing: GET only) feeding
+  a single-page vanilla-JS canvas app (`gui/index.html`, embedded via
+  `include_str!`). The engine remains the sole owner of truth: the browser
+  fetches the scene topology once and then batches of per-tick frames —
+  each an O(1) read — and animates items along edges, queue bars, firing
+  flashes, and output counters between ticks. Auto layered layout handles
+  self-loops and the store's recirculation back-edge. Scrubber + warp box +
+  a dedicated "warp 1,000,000" button. Frontend logic is validated
+  headlessly in CI-fashion (node harness over real server JSON) since the
+  repo has no browser test rig.
+
 **Beyond M6 (future):** input-regime-parametric summaries (deferred from
-M5); spatial world + blueprint editing UI; module sealing/opening flow
-(power-down-to-open); recipe/item content and progression; WASM build.
+M5); blueprint *editing* in the GUI (place nodes, draw wires, seal
+modules) — the current GUI is a viewer; module sealing/opening flow
+(power-down-to-open); recipe/item content and progression; WASM build
+(the kernel is std-only, so this is mostly build plumbing).
 
 ## Implementation decisions
 

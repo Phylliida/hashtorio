@@ -51,13 +51,18 @@ assert_eq!(belt.scale_floor(2, 1).scale_floor(1, 2), belt);
 ```
 
 ```
-cargo test    # 46 tests, exact semantics cross-validated two ways
-cargo run     # the playground: watch, step, and warp a live factory
+cargo test           # 47 tests, exact semantics cross-validated two ways
+cargo run            # terminal playground: step, run, warp a live factory
+cargo run --bin gui  # browser GUI at http://127.0.0.1:8470 (canvas, animated)
 ```
 
-In the playground, try `warp 1000000` — the frame at tick one million
-renders instantly and exactly, because rendering is an O(1) read of the
-counting maps, never a simulation. That one command is the thesis.
+The GUI is a zero-dependency std::net HTTP server feeding a single-page
+vanilla-JS canvas app: animated item flows, live queue bars, firing
+machines, the published spec and conservation audit alongside — plus a
+play/pause/speed bar, a scrubber, and a **warp** box. Try the
+`warp 1,000,000` button: the frame at tick one million renders instantly
+and exactly, because every frame — drawn or warped to — is an O(1) read of
+the counting maps, never a simulation. That one button is the thesis.
 
 Next up (M1/M2): the typed wiring term language with hash-consing, then
 feedback via Kahn/(min,+) fixed points — at which point buffers, clocks, and
