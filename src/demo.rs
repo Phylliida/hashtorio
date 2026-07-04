@@ -1,13 +1,16 @@
-//! The playground factory, expressed as a [`Draft`] — the same model the
-//! GUI editor produces, so "load the demo into the editor" is trivial.
+//! The playground factory, v3: it builds *structures*, not numbers.
 //!
-//! A full iron belt feeds a gear assembler; an overflow gate sends 1/3 of
-//! the gears into a demand-driven store (drained at 1/2 by a demand clock,
-//! so it keeps up) and spills the rest; the store's tap doubles as its
-//! level gauge.
+//! Iron and copper cells are welded into a bar, split, one arm rotated,
+//! and the two welded again into an L-shaped four-cell piece — which is
+//! exactly the **welder's own chassis**: the demo factory manufactures the
+//! machine that built it. Finished chassis pass through a sealed demand
+//! store (module) on their way out.
 
-use crate::draft::{Draft, DraftFrom, DraftInput, DraftNode, DraftOutput, DraftTo};
+use crate::draft::{
+    BuildOp, Draft, DraftFrom, DraftInput, DraftNode, DraftOutput, DraftTo,
+};
 use crate::net::ItemType;
+use crate::structure::{chassis, StructLib};
 
 pub const IRON: ItemType = ItemType(0);
 pub const COPPER: ItemType = ItemType(1);
@@ -18,75 +21,76 @@ pub const GRANT: ItemType = ItemType(5);
 pub const DEMAND: ItemType = ItemType(6);
 pub const PULSE: ItemType = ItemType(7);
 
-/// The fixed item palette shared by demo, editor, and GUI.
+/// The fixed *primitive* palette (single cells). Constructed structures
+/// get their ids from the [`StructLib`] as play invents them.
 pub fn palette() -> Vec<(ItemType, String)> {
-    [
-        (IRON, "iron"),
-        (COPPER, "copper"),
-        (GEAR, "gear"),
-        (PLATE, "plate"),
-        (TOK, "tok"),
-        (GRANT, "grant"),
-        (DEMAND, "demand"),
-        (PULSE, "pulse"),
-    ]
-    .into_iter()
-    .map(|(t, n)| (t, n.to_string()))
-    .collect()
+    crate::structure::MATERIALS
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (ItemType(i as u32), n.to_string()))
+        .collect()
 }
 
-/// The demand store as a sealed module: its recirculation loop is fully
-/// contained, so from outside it is just (gears in, demand in) ->
-/// (gears out, level pulses). The abstraction boundary made visible.
-pub fn store_module() -> Draft {
+/// The first manufacturing goal: the welder's own chassis.
+pub fn target(structs: &mut StructLib) -> ItemType {
+    chassis(structs, "weld")
+}
+
+/// The demand store as a sealed module, generic over the stored item type.
+pub fn store_module(item: ItemType) -> Draft {
     let mut d = Draft { types: palette(), ..Default::default() };
-    d.inputs.push(DraftInput { ty: GEAR, label: "gears in".into(), rate: (1, 1) });
+    d.inputs.push(DraftInput { ty: item, label: "items in".into(), rate: (1, 1) });
     d.inputs.push(DraftInput { ty: DEMAND, label: "demand".into(), rate: (1, 1) });
     d.nodes.push(DraftNode::Recipe {
         label: "tap".into(),
-        consume: vec![(GEAR, 1)],
-        produce: vec![(GEAR, 1), (PULSE, 1)],
+        consume: vec![(item, 1)],
+        produce: vec![(item, 1), (PULSE, 1)],
         latency: 1,
     });
     d.nodes.push(DraftNode::Priority {
         label: "gate".into(),
-        item: GEAR,
+        item,
         token: DEMAND,
     });
-    d.outputs.push(DraftOutput { ty: GEAR, label: "out".into() });
+    d.outputs.push(DraftOutput { ty: item, label: "out".into() });
     d.outputs.push(DraftOutput { ty: PULSE, label: "level".into() });
     use DraftFrom as F;
     use DraftTo as T;
     d.wires = vec![
-        (F::Input(0), T::Node(0, 0)),   // arriving gears join the pool
-        (F::Node(1, 1), T::Node(0, 0)), // undemanded gears recirculate
+        (F::Input(0), T::Node(0, 0)),   // arriving items join the pool
+        (F::Node(1, 1), T::Node(0, 0)), // undemanded items recirculate
         (F::Node(0, 0), T::Node(1, 0)), // tap -> gate
         (F::Input(1), T::Node(1, 1)),   // demand tokens
-        (F::Node(1, 0), T::Output(0)),  // granted gears leave
+        (F::Node(1, 0), T::Output(0)),  // granted items leave
         (F::Node(0, 1), T::Output(1)),  // census pulses
     ];
     d
 }
 
-pub fn draft() -> Draft {
+pub fn draft(structs: &mut StructLib) -> Draft {
+    let goal = target(structs);
     let mut d = Draft { types: palette(), ..Default::default() };
     d.inputs.push(DraftInput { ty: IRON, label: "iron mine".into(), rate: (1, 1) });
-    d.nodes.push(DraftNode::Recipe {
-        label: "gear assembler".into(),
-        consume: vec![(IRON, 2)],
-        produce: vec![(GEAR, 1)],
-        latency: 3,
+    d.inputs.push(DraftInput { ty: COPPER, label: "copper mine".into(), rate: (1, 1) });
+    d.nodes.push(DraftNode::Builder {
+        label: "welder A".into(),
+        op: BuildOp::Weld { dx: 1, dy: 0 },
+        latency: 2,
     });
-    d.nodes.push(DraftNode::Recipe {
-        label: "grant clock (1/3)".into(),
-        consume: vec![(TOK, 1)],
-        produce: vec![(TOK, 1), (GRANT, 1)],
-        latency: 3,
+    d.nodes.push(DraftNode::Builder {
+        label: "splitter".into(),
+        op: BuildOp::Split,
+        latency: 1,
     });
-    d.nodes.push(DraftNode::Priority {
-        label: "overflow gate".into(),
-        item: GEAR,
-        token: GRANT,
+    d.nodes.push(DraftNode::Builder {
+        label: "rotator".into(),
+        op: BuildOp::Rot,
+        latency: 1,
+    });
+    d.nodes.push(DraftNode::Builder {
+        label: "welder B".into(),
+        op: BuildOp::Weld { dx: 0, dy: 2 },
+        latency: 2,
     });
     d.nodes.push(DraftNode::Recipe {
         label: "demand clock (1/2)".into(),
@@ -95,28 +99,28 @@ pub fn draft() -> Draft {
         latency: 2,
     });
     d.nodes.push(DraftNode::Module {
-        label: "demand store".into(),
-        draft: Box::new(store_module()),
+        label: "chassis store".into(),
+        draft: Box::new(store_module(goal)),
     });
-    d.outputs.push(DraftOutput { ty: GEAR, label: "delivered".into() });
-    d.outputs.push(DraftOutput { ty: GEAR, label: "spilled".into() });
-    d.outputs.push(DraftOutput { ty: PULSE, label: "level pulses".into() });
+    d.outputs.push(DraftOutput { ty: goal, label: "welders built".into() });
+    d.outputs.push(DraftOutput { ty: PULSE, label: "store level".into() });
 
     use DraftFrom as F;
     use DraftTo as T;
     d.wires = vec![
-        (F::Input(0), T::Node(0, 0)),   // iron -> assembler
-        (F::Node(0, 0), T::Node(2, 0)), // gears -> overflow gate
-        (F::Node(1, 0), T::Node(1, 0)), // grant clock loop
-        (F::Node(1, 1), T::Node(2, 1)), // grants -> gate tokens
-        (F::Node(2, 0), T::Node(4, 0)), // granted gears -> store module
-        (F::Node(3, 0), T::Node(3, 0)), // demand clock loop
-        (F::Node(3, 1), T::Node(4, 1)), // demand -> store module
-        (F::Node(4, 0), T::Output(0)),  // delivered
-        (F::Node(2, 1), T::Output(1)),  // spilled
-        (F::Node(4, 1), T::Output(2)),  // level pulses
+        (F::Input(0), T::Node(0, 0)),   // iron -> welder A
+        (F::Input(1), T::Node(0, 1)),   // copper -> welder A
+        (F::Node(0, 0), T::Node(1, 0)), // bar -> splitter
+        (F::Node(1, 0), T::Node(2, 0)), // one arm -> rotator
+        (F::Node(2, 0), T::Node(3, 0)), // vertical bar -> welder B
+        (F::Node(1, 1), T::Node(3, 1)), // straight arm -> welder B
+        (F::Node(4, 0), T::Node(4, 0)), // demand clock loop
+        (F::Node(3, 0), T::Node(5, 0)), // chassis -> store
+        (F::Node(4, 1), T::Node(5, 1)), // demand -> store
+        (F::Node(5, 0), T::Output(0)),  // welders out
+        (F::Node(5, 1), T::Output(1)),  // level pulses
     ];
-    d.markings = vec![(T::Node(1, 0), 1), (T::Node(3, 0), 1)];
+    d.markings = vec![(T::Node(4, 0), 1)];
     d
 }
 
@@ -127,33 +131,37 @@ mod tests {
     use crate::net::Library;
 
     #[test]
-    fn sealed_demo_matches_the_flat_rates() {
-        // The store is now a module; sealing must not change semantics.
+    fn the_factory_manufactures_its_own_welder() {
         let mut lib = Library::new();
-        let (id, flows) = draft().build(&mut lib).unwrap();
+        let mut structs = StructLib::new();
+        let d = draft(&mut structs);
+        let (id, flows, node_types) = d.build(&mut lib, &mut structs).unwrap();
+
+        // Inference found the chassis: welder B's output IS the target.
+        let goal = target(&mut structs);
+        assert_eq!(node_types[3].1, vec![goal], "welder B builds the welder chassis");
+        assert_eq!(structs.cells(goal).len(), 4);
+        assert_eq!(structs.name(goal), "weld chassis");
+
+        // Rates: mines 1/1 -> bar 1/1 -> split halves -> chassis 1/2,
+        // demand 1/2: delivered at 1/2.
         let mut ev = Evaluator::new(&lib);
         let s = ev.summarize(id, &flows).unwrap();
-        assert_eq!(s.outputs[0].rate, (1, 3)); // delivered
-        assert_eq!(s.outputs[1].rate, (1, 6)); // spilled
-        assert_eq!(s.outputs[2].rate, (1, 3)); // level pulses
-        // Parent-level detail treats the module as one opaque node.
-        let d = ev.evaluate_detailed(id, &flows).unwrap();
-        assert_eq!(d.node_outs.len(), 5);
-        assert!(d.firings[4].is_none(), "module firings are interior");
-        assert_eq!(d.node_outs[4][0].rate(), (1, 3));
+        assert_eq!(s.outputs[0].rate, (1, 2)); // welders built
+        assert_eq!(s.outputs[0].ty, goal);
     }
 
     #[test]
     fn identical_modules_intern_once() {
-        let mut d = draft();
-        // A second, identical store module (unwired: just present).
+        let mut lib = Library::new();
+        let mut structs = StructLib::new();
+        let mut d = draft(&mut structs);
+        let goal = target(&mut structs);
         d.nodes.push(DraftNode::Module {
             label: "spare store".into(),
-            draft: Box::new(store_module()),
+            draft: Box::new(store_module(goal)),
         });
-        let mut lib = Library::new();
-        d.build(&mut lib).unwrap();
-        // Library holds exactly: the store module net + the parent net.
+        d.build(&mut lib, &mut structs).unwrap();
         assert_eq!(lib.len(), 2, "identical sub-drafts dedup to one NetId");
     }
 }

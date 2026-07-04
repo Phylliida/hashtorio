@@ -74,6 +74,10 @@
     <button id="a-src">+ source</button>
     <button id="a-mach">+ machine</button>
     <button id="a-gate">+ gate</button>
+    <button id="a-weld">+ weld</button>
+    <button id="a-rot">+ rot</button>
+    <button id="a-split">+ split</button>
+    <button id="a-belt">+ belt</button>
     <button id="a-out">+ output</button>
     <span class="sep"></span>
     <button id="a-seal">&#9723; seal</button>
@@ -87,6 +91,10 @@
 <main>
   <canvas id="cv"></canvas>
   <aside>
+    <h2>manufacturing goal</h2>
+    <canvas id="goalcv" width="120" height="70"
+            style="background:#14171c;border-radius:6px"></canvas>
+    <div id="goaltext" style="font-size:12.5px;margin-top:4px"></div>
     <h2>published spec</h2><table id="spec"></table>
     <h2>conservation audit (rates)</h2><table id="audit"></table>
     <div class="hint" id="hint">Every frame — including tick 1,000,000 — is an
@@ -101,16 +109,33 @@
 // ---------------------------------------------------------------------------
 // types & colors
 // ---------------------------------------------------------------------------
-const TYPE_COLORS = { iron:'#9aa5b1', copper:'#e08a5a', gear:'#f4b942',
-  plate:'#b8c4d0', tok:'#566072', grant:'#7bd88f', demand:'#e05e78',
-  pulse:'#69d2e7' };
-let TYPES = [];
-const tyName = id => (TYPES.find(t => t.id === id) || { name: '?' }).name;
-const tyColor = id => TYPE_COLORS[tyName(id)] || '#c792ea';
+const MAT_COLORS = ['#9aa5b1','#e08a5a','#f4b942','#b8c4d0','#566072',
+                    '#7bd88f','#e05e78','#69d2e7'];
+const ANY_TY = 4294967295; // a builder port before inference
+let TYPES = []; // [{id, name, cells:[[x,y,material],...]}]
+const tyInfo = id => TYPES.find(t => t.id === id);
+const tyName = id => id === ANY_TY ? 'any' : (tyInfo(id) || { name: '?' }).name;
+const tyCells = id => (tyInfo(id) || { cells: null }).cells;
+const tyColor = id => {
+  if (id === ANY_TY) return '#7d8a99';
+  const t = tyInfo(id);
+  return t ? (MAT_COLORS[t.cells[0][2]] || '#c792ea') : '#c792ea';
+};
 const tyByName = name => {
   const t = TYPES.find(t => t.name === name);
   return t ? t.id : null;
 };
+// Draw a structure's cells centered at (cx, cy), `cell` pixels per cell.
+function drawThumb(cells, cx, cy, cell) {
+  let maxx = 0, maxy = 0;
+  for (const [x, y] of cells) { maxx = Math.max(maxx, x); maxy = Math.max(maxy, y); }
+  const w = (maxx + 1) * cell, h = (maxy + 1) * cell;
+  for (const [x, y, m] of cells) {
+    ctx.fillStyle = MAT_COLORS[m] || '#c792ea';
+    ctx.fillRect(cx - w / 2 + x * cell, cy + h / 2 - (y + 1) * cell,
+                 cell - 0.5, cell - 0.5);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // state
@@ -138,12 +163,17 @@ window.addEventListener('resize', resize);
 const NODE_W = 150;
 const legsIn = n => n.kind === 'recipe' ? n.consume.map(c => c[0])
   : n.kind === 'priority' ? [n.item, n.token]
-  : n.draft.inputs.map(i => i.ty);
+  : n.kind === 'module' ? n.draft.inputs.map(i => i.ty)
+  : n.kind === 'weld' ? [ANY_TY, ANY_TY]
+  : [ANY_TY]; // rot, split, belt
 const legsOut = n => n.kind === 'recipe' ? n.produce.map(c => c[0])
   : n.kind === 'priority' ? [n.item, n.item]
-  : n.draft.outputs.map(o => o.ty);
-const kindTag = n => n.kind === 'priority' ? 'else-gate'
-  : n.kind === 'module' ? 'sealed module' : 'recipe';
+  : n.kind === 'module' ? n.draft.outputs.map(o => o.ty)
+  : n.kind === 'split' ? [ANY_TY, ANY_TY]
+  : [ANY_TY];
+const kindTag = n => ({ priority:'else-gate', module:'sealed module',
+  recipe:'recipe', weld:'welder', rot:'rotator', split:'splitter',
+  belt:'belt' })[n.kind] || n.kind;
 const nodeH = n =>
   36 + Math.max(legsIn(n).length, legsOut(n).length, 1) * 14 + 4;
 const inPortPos = (p, leg) => ({ x: p.x, y: p.y + 42 + leg * 14 });
@@ -272,12 +302,17 @@ function draw() {
       const flow = nxt.flow[i];
       if (flow > 0) {
         const dots = Math.min(flow, 6);
-        ctx.fillStyle = tyColor(e.ty);
+        const cells = tyCells(e.ty);
         for (let j = 0; j < dots; j++) {
           const s = phase - j * 0.07;
           if (s < 0 || s > 1) continue;
           const q = pointAt(p, s);
-          ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, 7); ctx.fill();
+          if (cells && cells.length > 1) {
+            drawThumb(cells, q.x, q.y, 3);
+          } else {
+            ctx.fillStyle = tyColor(e.ty);
+            ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, 7); ctx.fill();
+          }
         }
         if (flow > 6) {
           const q = pointAt(p, Math.min(Math.max(phase, 0.05), 0.95));
@@ -321,9 +356,10 @@ function draw() {
       : node.kind === 'module' ? '#8fd3ff' : '#7d8a99';
     ctx.font = '10px system-ui';
     ctx.fillText(kindTag(node), p.x + 9, p.y + 27);
+    if (node.chassis) drawThumb(node.chassis, p.x + p.w - 16, p.y + 16, 3.5);
     if (fired > 0) {
       ctx.fillStyle = '#f4b942'; ctx.textAlign = 'right';
-      ctx.fillText('⚙×' + fired, p.x + p.w - 8, p.y + 15);
+      ctx.fillText('⚙×' + fired, p.x + p.w - 30, p.y + 15);
       ctx.textAlign = 'left';
     }
     if (cur) node.legs.forEach((ty, l) => {
@@ -350,13 +386,15 @@ function draw() {
     ctx.strokeStyle = '#39414f'; ctx.lineWidth = 1; ctx.stroke();
     ctx.fillStyle = '#7d8a99'; ctx.font = '11px system-ui';
     ctx.fillText(out.label, p.x + 10, p.y - 7);
+    const ocells = tyCells(out.ty);
+    if (ocells && ocells.length > 1) drawThumb(ocells, p.x + 120, p.y + 4, 4);
     if (cur) {
       const [total, delta] = cur.outs[o];
       ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 14px system-ui';
       ctx.fillText(total.toLocaleString(), p.x + 10, p.y + 12);
       if (delta > 0) {
         ctx.fillStyle = '#7bd88f'; ctx.font = '11px system-ui'; ctx.textAlign = 'right';
-        ctx.fillText('+' + delta, p.x + 132, p.y + 12);
+        ctx.fillText('+' + delta, p.x + 100, p.y + 12);
         ctx.textAlign = 'left';
       }
     }
@@ -416,9 +454,10 @@ function draftAddNode(def) {
 }
 function draftAddWire(from, to) {
   if (E.draft.wires.some(w => eq(w.from, from)))
-    throw Error("that output already feeds a wire — items can't be copied; use a splitter recipe");
-  if (fromType(from) !== sinkType(to))
-    throw Error(`type mismatch: ${tyName(fromType(from))} → ${tyName(sinkType(to))}`);
+    throw Error("that output already feeds a wire — items can't be copied; use a splitter");
+  const ft = fromType(from), st = sinkType(to);
+  if (ft !== ANY_TY && st !== ANY_TY && ft !== st)
+    throw Error(`type mismatch: ${tyName(ft)} → ${tyName(st)}`);
   E.draft.wires.push({ from, to }); saveDraft();
 }
 function draftSetMarking(to, n) {
@@ -465,6 +504,10 @@ function convertNode(n) {
              produce:n.produce.map(x => x.slice()), latency:n.latency };
   if (n.kind === 'priority')
     return { kind:'priority', label:n.label, item:n.item, token:n.token };
+  if (n.kind === 'weld')
+    return { kind:'weld', label:n.label, dx:n.dx, dy:n.dy, latency:n.latency };
+  if (n.kind === 'rot' || n.kind === 'split' || n.kind === 'belt')
+    return { kind:n.kind, label:n.label, latency:n.latency };
   return { kind:'module', label:n.label, draft: convertSub(n.draft) };
 }
 function convertSub(d) {
@@ -904,6 +947,24 @@ function fillPanel() {
     sc.audit.map(r =>
       `<tr><td>${r.ty}</td><td>${frac(r.injected)}</td><td>${frac(r.minted)}</td>` +
       `<td>${frac(r.delivered)}</td><td>${frac(r.accumulating)}</td></tr>`).join('');
+  if (sc.goal) {
+    const g = sc.goal;
+    document.getElementById('goaltext').innerHTML = g.met
+      ? `<b style="color:#7bd88f">MET</b> — ${g.name} at ${g.rate[0]}/${g.rate[1]} per tick`
+      : `manufacture: <b>${g.name}</b>`;
+    const gcv = document.getElementById('goalcv');
+    const gx = gcv.getContext('2d');
+    gx.clearRect(0, 0, 120, 70);
+    let maxx = 0, maxy = 0;
+    for (const [x, y] of g.cells) { maxx = Math.max(maxx, x); maxy = Math.max(maxy, y); }
+    const cell = Math.min(24, 100 / (maxx + 1), 56 / (maxy + 1));
+    for (const [x, y, m] of g.cells) {
+      gx.fillStyle = MAT_COLORS[m] || '#c792ea';
+      gx.fillRect(60 - (maxx + 1) * cell / 2 + x * cell,
+                  35 + (maxy + 1) * cell / 2 - (y + 1) * cell,
+                  cell - 1, cell - 1);
+    }
+  }
 }
 
 function loop(now) {
@@ -989,6 +1050,28 @@ document.getElementById('a-out').onclick = () => {
   const ty = tyByName(v.trim());
   if (ty === null) { toast('unknown item type', true); return; }
   draftAddOutput(ty);
+};
+function parseWeld(text) {
+  const m = text.trim().match(/^(-?\d+)\s*,\s*(-?\d+)(\s*@\s*(\d+))?$/);
+  if (!m) throw Error('write e.g. "1,0 @2" (attach to the right) or "0,2" (above)');
+  const dx = parseInt(m[1]), dy = parseInt(m[2]);
+  return { kind:'weld', dx, dy, latency: m[4] ? parseInt(m[4]) : 2,
+           label:`weld ${dx},${dy}` };
+}
+document.getElementById('a-weld').onclick = () => {
+  const v = prompt('weld — attach offset dx,dy @latency:', '1,0 @2');
+  if (v === null) return;
+  try { draftAddNode(parseWeld(v)); } catch (err) { toast(err.message, true); }
+};
+document.getElementById('a-rot').onclick = () =>
+  draftAddNode({ kind:'rot', latency:1, label:'rotate 90°' });
+document.getElementById('a-split').onclick = () =>
+  draftAddNode({ kind:'split', latency:1, label:'splitter' });
+document.getElementById('a-belt').onclick = () => {
+  const v = prompt('belt latency (its length in ticks):', '3');
+  if (v === null) return;
+  const lat = parseInt(v) || 1;
+  draftAddNode({ kind:'belt', latency:lat, label:`belt @${lat}` });
 };
 document.getElementById('a-demo').onclick = () => { sceneToDraft(); toast('current factory loaded into the editor'); };
 document.getElementById('a-clear').onclick = () => {

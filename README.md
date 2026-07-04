@@ -77,9 +77,17 @@ into a module whose boundary wires become typed ports, machines containing
 machines, as deep as you like. A sealed module runs off its memoized
 summary (identical modules share one cache entry, automatically) and draws
 as an opaque box with port flows: the interior isn't hidden by the
-renderer, it's absent from the data. Unseal to splice it back. The demo
-ships with its demand store sealed — warp it to a million, it costs the
-same.
+renderer, it's absent from the data. Unseal to splice it back.
+
+And it **builds structures, not numbers**: item types are 2D shapes
+(hash-consed cell-sets — structure lives in the type, so the caching
+economics survive untouched). Weld and rotate parts with polymorphic
+builder machines whose concrete types are inferred from your wiring — the
+factory graph *is* the expression tree of the artifact it assembles.
+Welds that don't fit refuse with the parts named. Machine-types are
+structures too: every machine has a chassis, and the first manufacturing
+goal is the welder's own chassis. The shipped demo meets it — a factory
+that manufactures the machine that built it, at exactly 1/2 per tick.
 
 Next up (M1/M2): the typed wiring term language with hash-consing, then
 feedback via Kahn/(min,+) fixed points — at which point buffers, clocks, and

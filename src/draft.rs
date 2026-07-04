@@ -11,6 +11,7 @@
 use crate::counting::Counting;
 use crate::net::{ItemType, Library, NetBuilder, NetError, NetId};
 use crate::recipe::Recipe;
+use crate::structure::{StructLib, ANY};
 
 #[derive(Debug, Clone)]
 pub struct DraftInput {
@@ -47,6 +48,42 @@ pub enum DraftNode {
         label: String,
         draft: Box<Draft>,
     },
+    /// A polymorphic constructor machine: its concrete types are inferred
+    /// from what you wire into it. The wiring graph is the expression tree
+    /// of the artifact it builds.
+    Builder {
+        label: String,
+        op: BuildOp,
+        latency: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildOp {
+    /// `1·x + 1·y -> 1·weld(x, y @ (dx,dy))` — refuses if parts collide.
+    Weld { dx: i32, dy: i32 },
+    /// `1·x -> 1·rot(x)` — quarter-turn.
+    Rot,
+    /// `2·x -> 1·x + 1·x` — round-robin splitter for any type.
+    Split,
+    /// `1·x -> 1·x` — a belt: pure latency for any type.
+    Belt,
+}
+
+impl BuildOp {
+    pub fn in_arity(&self) -> usize {
+        match self {
+            BuildOp::Weld { .. } => 2,
+            _ => 1,
+        }
+    }
+
+    pub fn out_arity(&self) -> usize {
+        match self {
+            BuildOp::Split => 2,
+            _ => 1,
+        }
+    }
 }
 
 impl DraftNode {
@@ -54,23 +91,28 @@ impl DraftNode {
         match self {
             DraftNode::Recipe { label, .. }
             | DraftNode::Priority { label, .. }
-            | DraftNode::Module { label, .. } => label,
+            | DraftNode::Module { label, .. }
+            | DraftNode::Builder { label, .. } => label,
         }
     }
 
+    /// Input leg types; [`ANY`] on builder legs until inference resolves.
     pub fn in_types(&self) -> Vec<ItemType> {
         match self {
             DraftNode::Recipe { consume, .. } => consume.iter().map(|&(t, _)| t).collect(),
             DraftNode::Priority { item, token, .. } => vec![*item, *token],
             DraftNode::Module { draft, .. } => draft.inputs.iter().map(|i| i.ty).collect(),
+            DraftNode::Builder { op, .. } => vec![ANY; op.in_arity()],
         }
     }
 
+    /// Output leg types; [`ANY`] on builder legs until inference resolves.
     pub fn out_types(&self) -> Vec<ItemType> {
         match self {
             DraftNode::Recipe { produce, .. } => produce.iter().map(|&(t, _)| t).collect(),
             DraftNode::Priority { item, .. } => vec![*item, *item],
             DraftNode::Module { draft, .. } => draft.outputs.iter().map(|o| o.ty).collect(),
+            DraftNode::Builder { op, .. } => vec![ANY; op.out_arity()],
         }
     }
 }
@@ -162,17 +204,121 @@ impl Draft {
         Ok(())
     }
 
-    /// Compile: build, intern, and return the net plus its input flows.
-    pub fn build(&self, lib: &mut Library) -> Result<(NetId, Vec<Counting>), String> {
+    /// Forward type inference: resolve each builder's concrete leg types
+    /// from what feeds it. The wiring graph is the artifact's expression
+    /// tree; this walks it.
+    #[allow(clippy::type_complexity)]
+    fn infer(
+        &self,
+        structs: &mut StructLib,
+    ) -> Result<Vec<(Vec<ItemType>, Vec<ItemType>)>, String> {
+        let mut resolved: Vec<Option<(Vec<ItemType>, Vec<ItemType>)>> = self
+            .nodes
+            .iter()
+            .map(|node| match node {
+                DraftNode::Builder { .. } => None,
+                other => Some((other.in_types(), other.out_types())),
+            })
+            .collect();
+        loop {
+            let mut progress = false;
+            let mut all_done = true;
+            for n in 0..self.nodes.len() {
+                if resolved[n].is_some() {
+                    continue;
+                }
+                let DraftNode::Builder { label, op, .. } = &self.nodes[n] else {
+                    unreachable!()
+                };
+                let mut leg_tys: Vec<Option<ItemType>> = vec![None; op.in_arity()];
+                let mut wired = vec![false; op.in_arity()];
+                let mut blocked = false;
+                for (from, to) in &self.wires {
+                    let DraftTo::Node(tn, leg) = *to else { continue };
+                    if tn != n {
+                        continue;
+                    }
+                    wired[leg] = true;
+                    let src_ty = match *from {
+                        DraftFrom::Input(i) => Some(self.inputs[i].ty),
+                        DraftFrom::Node(a, aleg) => {
+                            resolved[a].as_ref().map(|(_, outs)| outs[aleg])
+                        }
+                    };
+                    match (src_ty, leg_tys[leg]) {
+                        (None, _) => blocked = true, // upstream not resolved yet
+                        (Some(t), None) => leg_tys[leg] = Some(t),
+                        (Some(t), Some(seen)) if t != seen => {
+                            return Err(format!(
+                                "two different structures merge into '{label}' on one \
+                                 port — keep each wire to a single shape"
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(unwired) = wired.iter().position(|w| !w) {
+                    return Err(format!(
+                        "wire input {unwired} of builder '{label}' — its type comes \
+                         from what you feed it"
+                    ));
+                }
+                if blocked {
+                    all_done = false;
+                    continue;
+                }
+                let ins: Vec<ItemType> =
+                    leg_tys.into_iter().map(|t| t.expect("all legs wired")).collect();
+                let outs = match op {
+                    BuildOp::Weld { dx, dy } => vec![structs
+                        .weld(ins[0], ins[1], *dx, *dy)
+                        .map_err(|e| format!("'{label}': {e}"))?],
+                    BuildOp::Rot => {
+                        vec![structs.rot(ins[0]).map_err(|e| format!("'{label}': {e}"))?]
+                    }
+                    BuildOp::Split => vec![ins[0], ins[0]],
+                    BuildOp::Belt => vec![ins[0]],
+                };
+                resolved[n] = Some((ins, outs));
+                progress = true;
+            }
+            if all_done {
+                return Ok(resolved.into_iter().map(|r| r.expect("all done")).collect());
+            }
+            if !progress {
+                let stuck = self
+                    .nodes
+                    .iter()
+                    .zip(&resolved)
+                    .find(|(_, r)| r.is_none())
+                    .map(|(n, _)| n.label())
+                    .unwrap_or("?");
+                return Err(format!(
+                    "builder '{stuck}' is stuck in a type loop — a structure \
+                     cannot be built out of itself; break the cycle"
+                ));
+            }
+        }
+    }
+
+    /// Compile: infer builder types, build, intern; returns the net, its
+    /// input flows, and every node's concrete (in, out) leg types.
+    #[allow(clippy::type_complexity)]
+    pub fn build(
+        &self,
+        lib: &mut Library,
+        structs: &mut StructLib,
+    ) -> Result<(NetId, Vec<Counting>, Vec<(Vec<ItemType>, Vec<ItemType>)>), String> {
         self.check()?;
-        // Phase one: intern every sealed sub-factory (recursively). Two
-        // identical modules come back as the same NetId.
+        let node_types = self.infer(structs)?;
+        // Intern every sealed sub-factory (recursively). Two identical
+        // modules come back as the same NetId.
         let mut module_ids: Vec<Option<NetId>> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             module_ids.push(match node {
                 DraftNode::Module { label, draft } => Some(
                     draft
-                        .build(lib)
+                        .build(lib, structs)
                         .map_err(|e| format!("in module '{label}': {e}"))?
                         .0,
                 ),
@@ -200,6 +346,17 @@ impl Draft {
                 DraftNode::Priority { item, token, .. } => b.priority(*item, *token),
                 DraftNode::Module { .. } => {
                     b.module(lib, module_ids[n].expect("phase one filled this"))
+                }
+                DraftNode::Builder { op, latency, .. } => {
+                    let (in_tys, out_tys) = &node_types[n];
+                    let recipe = match op {
+                        BuildOp::Weld { .. } => Recipe::new(vec![1, 1], vec![1], *latency),
+                        BuildOp::Rot | BuildOp::Belt => {
+                            Recipe::new(vec![1], vec![1], *latency)
+                        }
+                        BuildOp::Split => Recipe::new(vec![2], vec![1, 1], *latency),
+                    };
+                    b.recipe(recipe, in_tys, out_tys)
                 }
             });
         }
@@ -236,7 +393,7 @@ impl Draft {
                 }
             })
             .collect();
-        Ok((id, flows))
+        Ok((id, flows, node_types))
     }
 }
 
@@ -289,7 +446,8 @@ mod tests {
         d.wires.push((DraftFrom::Node(0, 0), DraftTo::Output(0)));
 
         let mut lib = Library::new();
-        let (id, flows) = d.build(&mut lib).unwrap();
+        let mut structs = crate::structure::StructLib::new();
+        let (id, flows, _) = d.build(&mut lib, &mut structs).unwrap();
         let mut ev = Evaluator::new(&lib);
         let s = ev.summarize(id, &flows).unwrap();
         assert_eq!(s.outputs[0].rate, (1, 2));
@@ -309,7 +467,7 @@ mod tests {
         d.wires.push((DraftFrom::Input(0), DraftTo::Output(0)));
         d.wires.push((DraftFrom::Input(0), DraftTo::Output(1)));
         let mut lib = Library::new();
-        let err = d.build(&mut lib).unwrap_err();
+        let err = d.build(&mut lib, &mut crate::structure::StructLib::new()).unwrap_err();
         assert!(err.contains("can't be copied"), "{err}");
 
         // Dangling wire after a (simulated) deletion.
@@ -319,7 +477,9 @@ mod tests {
         };
         d2.inputs.push(DraftInput { ty: iron(), label: "mine".into(), rate: (1, 1) });
         d2.wires.push((DraftFrom::Input(0), DraftTo::Node(7, 0)));
-        let err = d2.build(&mut Library::new()).unwrap_err();
+        let err = d2
+            .build(&mut Library::new(), &mut crate::structure::StructLib::new())
+            .unwrap_err();
         assert!(err.contains("no longer exists"), "{err}");
     }
 }

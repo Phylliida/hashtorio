@@ -235,11 +235,36 @@ degrades as they use more of it.
   with its demand store sealed, and a regression test pins that sealing
   preserved every rate.
 
-**Beyond M8 (future):** enter-a-module editing (edit interiors in place
-instead of unseal/reseal); input-regime-parametric summaries (deferred
-from M5); module opening flow during *play* (power-down-to-open);
-recipe/item content and progression; WASM build (the kernel is std-only,
-so this is mostly build plumbing).
+- **M9** ✅: structures instead of numbers — the game is situated in
+  (product-)space. The move that preserves every cache guarantee:
+  **structure lives in the type, not the item.** `structure.rs` interns 2D
+  cell-sets (materials on a grid, origin-anchored, hash-consed exactly like
+  nets); an `ItemType` now indexes this library, the eight historic types
+  becoming single-cell primitives. Equality is *extensional* — any assembly
+  route to the same shape yields the same id, cache entries, goal credit.
+  Constructors: `weld` (union at an offset; refuses if cells collide) and
+  `rot`. Polymorphic **builder** machines (weld/rot/split/belt) get their
+  concrete types by forward inference at compile — the wiring graph is the
+  expression tree of the artifact it builds — then compile to ordinary
+  recipes, so the counting kernel is UNCHANGED: rates and shapes are
+  orthogonal by construction (which is also why type-parametric modules
+  are free even though rate-parametric summaries were deferred). New
+  friendly refusals: parts collide; two shapes merged on one port; a
+  builder in a type loop ("a structure cannot be built out of itself").
+  **Machine-types are structures too**: every machine kind has an interned
+  chassis, drawn as its icon, and the first manufacturing goal is the
+  welder's own chassis — the demo factory welds iron+copper into a bar,
+  splits, rotates one arm, welds the L, and thereby manufactures the
+  machine that built it (goal MET at 1/2 per tick, regression-pinned).
+  GUI renders shapes everywhere: items on wires, output ports, the goal
+  panel.
+
+**Beyond M9 (future):** self-hosting economy (machine placement costs
+manufactured chassis — needs a persistence/progression layer);
+enter-a-module editing; input-regime-parametric summaries (deferred from
+M5); factory-space (machines on a grid, belts as geometry, distance =
+latency); richer constructor algebra (materials transmutation rules,
+3D cells); WASM build.
 
 ## Implementation decisions
 
