@@ -13,16 +13,19 @@ use hashtorio::render::Scene;
 
 fn main() {
     let mut lib = Library::new();
-    let d = demo::build(&mut lib);
-    let (id, inputs) = (d.id, d.inputs.clone());
+    let draft = demo::draft();
+    let (id, inputs) = draft.build(&mut lib).expect("demo draft compiles");
 
     let mut ev = Evaluator::new(&lib);
     let summary = ev.summarize(id, &inputs).expect("demo summarizes");
     let audit = ev.audit(id, &inputs).expect("demo audits");
     let trace = ev.trace_flattened(id, &inputs).expect("demo traces");
 
-    let type_names = d.type_names.clone();
-    let scene = Scene::new(&lib, trace, d.node_labels, d.out_labels, &type_names);
+    let type_names: Vec<(hashtorio::net::ItemType, &str)> =
+        draft.types.iter().map(|(t, n)| (*t, n.as_str())).collect();
+    let node_labels = draft.nodes.iter().map(|n| n.label().to_string()).collect();
+    let out_labels = draft.outputs.iter().map(|o| o.label.clone()).collect();
+    let scene = Scene::new(&lib, trace, node_labels, out_labels, &type_names);
 
     println!("hashtorio playground — a factory as a theorem\n");
     println!("published spec (exact, from the cache entry):");

@@ -64,6 +64,14 @@ play/pause/speed bar, a scrubber, and a **warp** box. Try the
 and exactly, because every frame — drawn or warped to — is an O(1) read of
 the counting maps, never a simulation. That one button is the thesis.
 
+And it edits: hit **✎ edit** for a parts palette (sources, machines via a
+recipe mini-language like `2 iron -> 1 gear @3`, else-gates, outputs),
+draw wires port to port, preload markings, drag things around, then
+**⚙ compile** — your design comes back as a spec, an audit, and a running
+animation, or as an honest refusal that teaches the rules ("items can't
+be copied", "add latency somewhere in that loop"). Load the current
+factory into the editor to remix it; drafts survive reloads.
+
 Next up (M1/M2): the typed wiring term language with hash-consing, then
 feedback via Kahn/(min,+) fixed points — at which point buffers, clocks, and
 sensors emerge as derived components.
