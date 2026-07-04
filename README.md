@@ -13,8 +13,10 @@ decidability boundary).
 
 ## Status
 
-**M0–M4** — kernel algebra, term language, evaluator with feedback,
-conservation audit + instance layer, and the tier-1 priority primitive:
+**M0–M11** — the full stack: kernel algebra, term language, evaluator with
+feedback, conservation audit + instance layer, the tier-1 priority
+primitive, tier-2 stepping, a browser GUI with editing and module sealing,
+structural item types, factory-space, and a self-hosting economy:
 
 - `Counting`: ultimately periodic counting maps in canonical form, with the
   kernel op algebra (`add`/merge, `min`/join, `scale_floor`/gearing,
@@ -51,7 +53,7 @@ assert_eq!(belt.scale_floor(2, 1).scale_floor(1, 2), belt);
 ```
 
 ```
-cargo test           # 47 tests, exact semantics cross-validated two ways
+cargo test           # exact semantics cross-validated two ways
 cargo run            # terminal playground: step, run, warp a live factory
 cargo run --bin gui  # browser GUI at http://127.0.0.1:8470 (canvas, animated)
 ```
@@ -79,6 +81,16 @@ summary (identical modules share one cache entry, automatically) and draws
 as an opaque box with port flows: the interior isn't hidden by the
 renderer, it's absent from the data. Unseal to splice it back.
 
+And it lives in **space**: machines sit on a grid wearing their chassis as
+footprints (placement collision is the same check as welding), and wires
+carry items across real distance — latency IS geometry, so moving machines
+apart genuinely slows the line, and every feedback loop has physical
+extent. And it has an **economy**: a machine is a chassis structure you
+own; blueprints cost the machines they place; watching and warping are
+free but **harvesting** commits tick budget and banks the line's output —
+exactly, as an O(1) eval difference. Manufacture welder chassis to own
+more welders: the factory that builds factories is the game loop itself.
+
 And it **builds structures, not numbers**: item types are 2D shapes
 (hash-consed cell-sets — structure lives in the type, so the caching
 economics survive untouched). Weld and rotate parts with polymorphic
@@ -89,6 +101,5 @@ structures too: every machine has a chassis, and the first manufacturing
 goal is the welder's own chassis. The shipped demo meets it — a factory
 that manufactures the machine that built it, at exactly 1/2 per tick.
 
-Next up (M1/M2): the typed wiring term language with hash-consing, then
-feedback via Kahn/(min,+) fixed points — at which point buffers, clocks, and
-sensors emerge as derived components.
+The roadmap and every design decision (including the honest limitations)
+live in [DESIGN.md](DESIGN.md).

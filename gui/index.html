@@ -91,6 +91,17 @@
 <main>
   <canvas id="cv"></canvas>
   <aside>
+    <h2>economy</h2>
+    <div id="budget" style="font-size:13px"></div>
+    <div style="margin:7px 0; display:flex; gap:6px">
+      <input id="hticks" value="500" style="width:76px">
+      <button id="harvest">&#9935; harvest</button>
+    </div>
+    <table id="inv"></table>
+    <div class="hint" style="margin-top:4px">Watching and warping are free —
+    they simulate the blueprint. <b>Harvest</b> commits tick budget and banks
+    the output structures. Machines <i>are</i> chassis you own; recompiling
+    resets the line (work in progress is lost).</div>
     <h2>manufacturing goal</h2>
     <canvas id="goalcv" width="120" height="70"
             style="background:#14171c;border-radius:6px"></canvas>
@@ -742,6 +753,34 @@ function parseGate(text) {
 }
 
 // ---- compile ---------------------------------------------------------------
+function applyState(st) {
+  S.state = st;
+  document.getElementById('budget').innerHTML =
+    `tick budget: <b>${st.budget.toLocaleString()}</b> · line clock: ${st.clock.toLocaleString()}`;
+  document.getElementById('inv').innerHTML =
+    '<tr><th>structure</th><th>owned</th></tr>' +
+    st.inventory.map(it =>
+      `<tr><td><span style="display:inline-block;width:9px;height:9px;border-radius:2px;
+        background:${MAT_COLORS[it.cells[0][2]] || '#c792ea'};margin-right:6px"></span>` +
+      `${it.name}</td><td>${it.count.toLocaleString()}</td></tr>`).join('');
+}
+async function fetchState() {
+  applyState(await (await fetch('/api/state')).json());
+}
+document.getElementById('harvest').onclick = async () => {
+  const ticks = parseInt(document.getElementById('hticks').value.replace(/[,_ ]/g, '')) || 0;
+  const r = await (await fetch('/api/harvest', {
+    method:'POST', headers:{ 'Content-Type':'application/json' },
+    body: JSON.stringify({ ticks }),
+  })).json();
+  if (!r.ok) { toast(r.error, true); return; }
+  applyState(r.state);
+  const summary = r.gains.length
+    ? r.gains.map(g => `+${g.count.toLocaleString()} ${g.name}`).join(', ')
+    : 'nothing came off the line';
+  toast(`harvested ${ticks.toLocaleString()} ticks: ${summary}`);
+};
+
 async function compileDraft() {
   const payload = Object.assign({}, E.draft, { pos: {
     inputs: E.pos.inputs.map(toGrid),
@@ -754,8 +793,9 @@ async function compileDraft() {
   })).json();
   if (r.ok) {
     applyScene(r.scene, JSON.parse(JSON.stringify(E.pos)));
+    if (r.state) applyState(r.state);
     setMode('run');
-    toast('compiled — spec and audit updated');
+    toast(r.grant ? r.grant : 'compiled — line rebuilt from tick 0');
   } else {
     toast(r.error, true);
   }
@@ -1159,6 +1199,7 @@ document.getElementById('a-compile').onclick = () => compileDraft();
   const scene = await (await fetch('/api/scene')).json();
   resize();
   applyScene(scene, null);
+  fetchState();
   loadDraft();
   window.addEventListener('resize', layout);
   requestAnimationFrame(loop);
