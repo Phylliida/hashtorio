@@ -12,6 +12,7 @@
 pub mod components;
 pub mod counting;
 pub mod demo;
+pub mod draft;
 pub mod eval;
 pub mod flatten;
 pub mod net;

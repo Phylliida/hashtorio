@@ -198,11 +198,29 @@ degrades as they use more of it.
   headlessly in CI-fashion (node harness over real server JSON) since the
   repo has no browser test rig.
 
-**Beyond M6 (future):** input-regime-parametric summaries (deferred from
-M5); blueprint *editing* in the GUI (place nodes, draw wires, seal
-modules) — the current GUI is a viewer; module sealing/opening flow
-(power-down-to-open); recipe/item content and progression; WASM build
-(the kernel is std-only, so this is mostly build plumbing).
+- **M7** ✅: editing. `draft.rs` is the editable blueprint model —
+  deliberately dumber than a `Net` (flat lists in construction order, so
+  editor positions map 1:1 onto compiled indices), compiled through
+  `Draft::build` with *friendly* refusals: the compile button talks to a
+  player, and the errors are the game teaching its own rules ("items can't
+  be copied — split with a recipe", "add latency somewhere in that loop").
+  The GUI gains an edit mode: parts palette (sources, machines via a recipe
+  mini-language `2 iron -> 1 gear @3`, else-gates, outputs), port-to-port
+  wire drawing with client-side linearity/type checks, markings (preloads),
+  node dragging, deletion with index remapping, localStorage drafts, and
+  `POST /api/compile` (server got a ~200-line std-only JSON parser). On
+  success the new factory becomes the live scene — spec, audit, animation;
+  on refusal the current factory survives. The demo itself is now a
+  `Draft`, so "load current into editor" is exact. End-to-end validated
+  headlessly: node drives the real editor functions (simulated port
+  clicks) against the live server.
+
+**Beyond M7 (future):** input-regime-parametric summaries (deferred from
+M5); module sealing in the editor (select a subgraph → module with ports —
+the recursion primitive reaching the player's hands); module
+sealing/opening flow (power-down-to-open); recipe/item content and
+progression; WASM build (the kernel is std-only, so this is mostly build
+plumbing).
 
 ## Implementation decisions
 
