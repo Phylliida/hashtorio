@@ -286,11 +286,27 @@ degrades as they use more of it.
   place bigger factories → manufacture more chassis. Von Neumann's
   constructor, with a conservation audit.
 
-**Beyond M11 (future):** enter-a-module editing; input-regime-parametric
-summaries (deferred from M5); belt/wire costs (roads are currently free);
-marking costs; persistence to disk (economy is in-memory per server run);
-richer constructor algebra (transmutation rules, 3D cells); goal ladders
-and progression; WASM build.
+- **M12** ✅: persistence, full costs, and enter-a-module editing.
+  *Persistence:* the economy (inventory, budget, line clock, goal flag),
+  the structure library (replayed on load so ids stay stable), and the
+  current factory draft save to `hashtorio_save.json` (atomic tmp+rename)
+  after every state change; corrupt saves move aside to `.bad` and the
+  game starts fresh. *Costs:* wires cost one belt segment per tick of
+  latency (a belt chassis is two cells long; BELT_SPEED is two cells per
+  tick — the arithmetic is physical); markings are consumables — real
+  items placed on the line, deducted at every compile, so retooling
+  spends the preloads again; machines and belts remain reusable capital
+  (need ≤ own). *Enter-a-module:* double-click a module in the editor to
+  edit its interior in place — each nesting level carries its own grid
+  positions (pocket dimensions with geometry), a breadcrumb shows the
+  path, and editing a module's ports edits its parent's interface (parent
+  wires to a deleted port are removed, higher legs shift down).
+  Amusingly, the E2E initially "failed" because persistence worked too
+  well: a test server restored a previous test's edited save.
+
+**Beyond M12 (future):** input-regime-parametric summaries (deferred from
+M5); richer constructor algebra (transmutation rules, 3D cells); goal
+ladders and progression; multiple save slots; WASM build.
 
 ## Implementation decisions
 

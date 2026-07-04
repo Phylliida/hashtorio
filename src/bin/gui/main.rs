@@ -74,12 +74,37 @@ struct App {
     /// Recompiling resets it — retooling loses work in progress.
     clock: u64,
     goal_achieved: bool,
+    /// Where the economy persists (None in tests).
+    save_path: Option<std::path::PathBuf>,
 }
 
 const KINDS: [&str; 7] = ["weld", "rot", "split", "belt", "recipe", "priority", "module"];
 
 impl App {
-    fn new() -> App {
+    fn new(save_path: Option<std::path::PathBuf>) -> App {
+        // A saved economy replays its structure library so ids stay stable.
+        if let Some(path) = &save_path {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                match App::restore(&text, save_path.clone()) {
+                    Ok(app) => {
+                        println!("restored save from {}", path.display());
+                        return app;
+                    }
+                    Err(e) => {
+                        let bad = path.with_extension("json.bad");
+                        let _ = std::fs::rename(path, &bad);
+                        eprintln!(
+                            "save file unreadable ({e}); moved to {} and starting fresh",
+                            bad.display()
+                        );
+                    }
+                }
+            }
+        }
+        App::fresh(save_path)
+    }
+
+    fn fresh(save_path: Option<std::path::PathBuf>) -> App {
         let mut lib = Library::new();
         let mut structs = StructLib::new();
         let chassis_map: Vec<(&'static str, ItemType)> =
@@ -87,19 +112,23 @@ impl App {
         let target = chassis_map[0].1; // the welder chassis
         let draft = hashtorio::demo::draft(&mut structs);
         let current = compile(&mut lib, &mut structs, draft).expect("demo compiles");
-        // Seed capital: enough machines to bootstrap, and some run time.
+        // Seed capital: machines, belts, raw materials for preloads, and
+        // some run time.
         let mut inventory = std::collections::HashMap::new();
         for (kind, ty) in &chassis_map {
             let n = match *kind {
                 "weld" => 3,
-                "belt" => 4,
+                "belt" => 80,
                 "recipe" => 4,
                 "priority" => 3,
                 _ => 2,
             };
             inventory.insert(ty.0, n);
         }
-        App {
+        for prim in 0..8u32 {
+            inventory.insert(prim, 50);
+        }
+        let mut app = App {
             lib,
             structs,
             chassis: chassis_map,
@@ -109,35 +138,161 @@ impl App {
             budget: 20_000,
             clock: 0,
             goal_achieved: false,
-        }
+            save_path,
+        };
+        // The pre-deployed demo consumed its preloads like any compile.
+        let demo_draft = app.current.draft.clone();
+        app.pay_markings(&demo_draft);
+        app.save();
+        app
     }
 
-    /// Machines needed by a draft: chassis per node, module interiors
-    /// included (a sealed factory still contains real machines).
-    fn machine_cost(&mut self, draft: &Draft, need: &mut std::collections::HashMap<u32, u64>) {
-        for node in &draft.nodes {
-            let kind = hashtorio::draft::kind_str(node);
-            let ty = chassis(&mut self.structs, kind);
-            *need.entry(ty.0).or_insert(0) += 1;
-            if let DraftNode::Module { draft: sub, .. } = node {
-                self.machine_cost(sub, need);
+    fn restore(text: &str, save_path: Option<std::path::PathBuf>) -> Result<App, String> {
+        let v = json::parse(text)?;
+        let mut structs = StructLib::new();
+        // Replay the structure library beyond the eight primitives.
+        for (i, entry) in v
+            .get("structs")
+            .and_then(|x| x.arr())
+            .ok_or("save missing structs")?
+            .iter()
+            .enumerate()
+        {
+            let cells: Vec<(i32, i32, u8)> = entry
+                .get("cells")
+                .and_then(|x| x.arr())
+                .ok_or("bad struct entry")?
+                .iter()
+                .filter_map(|c| {
+                    let a = c.arr()?;
+                    Some((
+                        a.first()?.i64()? as i32,
+                        a.get(1)?.i64()? as i32,
+                        a.get(2)?.u64()? as u8,
+                    ))
+                })
+                .collect();
+            let name = entry.get("name").and_then(|n| n.str()).map(|n| n.to_string());
+            if i < 8 {
+                continue; // primitives already seeded
+            }
+            let got = structs.intern_raw(cells, name)?;
+            if got.0 as usize != i {
+                return Err(format!("structure id drift at {i}"));
             }
         }
+        let chassis_map: Vec<(&'static str, ItemType)> =
+            KINDS.iter().map(|k| (*k, chassis(&mut structs, k))).collect();
+        let target = chassis_map[0].1;
+        let mut lib = Library::new();
+        let draft = parse_draft_value(v.get("draft").ok_or("save missing draft")?, &structs, 0)?;
+        let current = compile(&mut lib, &mut structs, draft)?;
+        let mut inventory = std::collections::HashMap::new();
+        for pair in v.get("inventory").and_then(|x| x.arr()).unwrap_or(&[]) {
+            let a = pair.arr().ok_or("bad inventory pair")?;
+            let ty = a.first().and_then(|x| x.u64()).ok_or("bad inventory")? as u32;
+            let n = a.get(1).and_then(|x| x.u64()).ok_or("bad inventory")?;
+            inventory.insert(ty, n);
+        }
+        Ok(App {
+            lib,
+            structs,
+            chassis: chassis_map,
+            target,
+            current,
+            inventory,
+            budget: v.get("budget").and_then(|x| x.u64()).ok_or("save missing budget")?,
+            clock: v.get("clock").and_then(|x| x.u64()).unwrap_or(0),
+            goal_achieved: v
+                .get("goalAchieved")
+                .map(|g| matches!(g, Json::Bool(true)))
+                .unwrap_or(false),
+            save_path,
+        })
     }
 
+    /// Persist the economy (atomic: temp file + rename).
+    fn save(&self) {
+        let Some(path) = &self.save_path else { return };
+        let structs_json: Vec<String> = (0..self.structs.len())
+            .map(|i| {
+                let ty = ItemType(i as u32);
+                let name = match self.structs.raw_name(ty) {
+                    Some(n) => format!("\"{}\"", esc(n)),
+                    None => "null".into(),
+                };
+                format!(
+                    "{{\"name\":{name},\"cells\":{}}}",
+                    cells_json(&self.structs, ty)
+                )
+            })
+            .collect();
+        let mut ids: Vec<u32> = self.inventory.keys().copied().collect();
+        ids.sort_unstable();
+        let inv: Vec<String> = ids
+            .iter()
+            .map(|id| format!("[{id},{}]", self.inventory[id]))
+            .collect();
+        let body = format!(
+            "{{\"version\":1,\"budget\":{},\"clock\":{},\"goalAchieved\":{},\
+             \"structs\":[{}],\"inventory\":[{}],\"draft\":{}}}",
+            self.budget,
+            self.clock,
+            self.goal_achieved,
+            structs_json.join(","),
+            inv.join(","),
+            draft_json(&self.current.draft)
+        );
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &body).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
+    /// Affordability: machines and belts are capital (need <= own);
+    /// markings are consumables, deducted by [`App::pay_markings`].
     fn check_affordable(&mut self, draft: &Draft) -> Result<(), String> {
-        let mut need = std::collections::HashMap::new();
-        self.machine_cost(draft, &mut need);
-        for (&ty, &n) in &need {
-            let have = *self.inventory.get(&ty).unwrap_or(&0);
+        let report = draft.cost(&mut self.structs)?;
+        for (&ty, &n) in &report.machines {
+            let have = *self.inventory.get(&ty.0).unwrap_or(&0);
             if n > have {
                 return Err(format!(
-                    "not enough {}: this blueprint places {n}, you own {have} —                      manufacture more (machines are their chassis)",
-                    self.structs.name(ItemType(ty))
+                    "not enough {}: this blueprint places {n}, you own {have} — \
+                     manufacture more (machines are their chassis)",
+                    self.structs.name(ty)
+                ));
+            }
+        }
+        let belt_ty = chassis(&mut self.structs, "belt");
+        let have_belts = *self.inventory.get(&belt_ty.0).unwrap_or(&0);
+        if report.belts > have_belts {
+            return Err(format!(
+                "not enough belt segments: this layout spans {} belt-ticks of wire, \
+                 you own {have_belts} — shorten the runs or make more belts",
+                report.belts
+            ));
+        }
+        for (&ty, &n) in &report.markings {
+            let have = *self.inventory.get(&ty.0).unwrap_or(&0);
+            if n > have {
+                return Err(format!(
+                    "not enough {} for preloads: need {n}, you own {have} — \
+                     markings are real items placed on the line",
+                    self.structs.name(ty)
                 ));
             }
         }
         Ok(())
+    }
+
+    /// Consume the marking items (called only after a successful compile).
+    fn pay_markings(&mut self, draft: &Draft) {
+        if let Ok(report) = draft.cost(&mut self.structs) {
+            for (ty, n) in report.markings {
+                let slot = self.inventory.entry(ty.0).or_insert(0);
+                *slot = slot.saturating_sub(n);
+            }
+        }
     }
 
     fn kind_chassis(&self, kind: &str) -> ItemType {
@@ -709,6 +864,7 @@ fn harvest(app: &mut App, ticks: u64) -> Result<String, String> {
     }
     app.budget -= ticks;
     app.clock = to;
+    app.save();
     let gains_json: Vec<String> = gains
         .iter()
         .map(|(ty, n)| {
@@ -952,6 +1108,8 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
                 Ok(compiled) => {
                     app.current = compiled;
                     app.clock = 0; // retooling: the line starts cold
+                    let paid = app.current.draft.clone();
+                    app.pay_markings(&paid); // preloads are real items
                     let mut grant = String::from("null");
                     let goal_met_now = app
                         .current
@@ -970,6 +1128,7 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
                             esc(&app.structs.name(app.target))
                         );
                     }
+                    app.save();
                     let body = format!(
                         "{{\"ok\":true,\"grant\":{grant},\"scene\":{},\"state\":{}}}",
                         scene_json(app),
@@ -1046,7 +1205,8 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8470);
 
-    let mut app = App::new();
+    let save = std::path::PathBuf::from("hashtorio_save.json");
+    let mut app = App::new(Some(save));
 
     let listener =
         TcpListener::bind(("127.0.0.1", port)).expect("bind GUI port (pass another as arg)");
@@ -1061,7 +1221,7 @@ mod tests {
     use super::*;
 
     fn test_app() -> App {
-        App::new()
+        App::new(None)
     }
 
     #[test]
@@ -1159,6 +1319,73 @@ mod tests {
         let (_, _, body) = route(&mut app, "POST", "/api/compile", &top);
         assert!(!body.contains("\"ok\":false") || body.contains("wire input"),
             "affordable now (may still refuse for unwired builders): {body}");
+    }
+
+    #[test]
+    fn the_economy_survives_a_restart() {
+        let path = std::env::temp_dir()
+            .join(format!("hashtorio_test_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // Fresh app: play a little.
+        {
+            let mut app = App::new(Some(path.clone()));
+            route(&mut app, "POST", "/api/harvest", r#"{"ticks":150}"#);
+            assert_eq!(app.budget, 20_000 - 150);
+        }
+        // Restart: everything comes back, structure ids included.
+        {
+            let mut app = App::new(Some(path.clone()));
+            assert_eq!(app.budget, 20_000 - 150);
+            assert_eq!(app.clock, 150);
+            let welders = *app.inventory.get(&app.target.0).unwrap();
+            assert!(welders > 3, "harvested chassis survived: {welders}");
+            // The factory itself survived and keeps harvesting from its clock.
+            let before = welders;
+            route(&mut app, "POST", "/api/harvest", r#"{"ticks":50}"#);
+            assert!(*app.inventory.get(&app.target.0).unwrap() > before);
+            // Scene still serves (draft was restored and recompiled).
+            let (_, _, scene) = route(&mut app, "GET", "/api/scene", "");
+            assert!(scene.contains("chassis store"));
+        }
+        // Corrupt save: falls back fresh, preserves the bad file.
+        std::fs::write(&path, "{definitely not json").unwrap();
+        {
+            let app = App::new(Some(path.clone()));
+            assert_eq!(app.budget, 20_000, "fresh fallback");
+            assert!(path.with_extension("json.bad").exists());
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bad"));
+    }
+
+    #[test]
+    fn wires_and_preloads_cost_real_things() {
+        let mut app = test_app();
+        // A single very long wire: source at x=0, output at x=400 — 199
+        // grid cells each way, ~99 belt-ticks, far over the seed 80.
+        let long = r#"{"inputs":[{"ty":0,"label":"m","rate":[1,1]}],
+            "outputs":[{"ty":0,"label":"o"}],"nodes":[],
+            "wires":[{"from":["in",0],"to":["out",0]}],"markings":[],
+            "pos":{"inputs":[[0,4]],"nodes":[],"outputs":[[400,4]]}}"#;
+        let (_, _, body) = route(&mut app, "POST", "/api/compile", long);
+        assert!(body.contains("not enough belt segments"), "{body}");
+
+        // Preloads consume inventory: 30 iron marking with 50 owned works
+        // and deducts; a second compile of the same draft fails (20 left).
+        let preload = r#"{"inputs":[],
+            "outputs":[{"ty":0,"label":"o"}],
+            "nodes":[{"kind":"recipe","label":"drip","consume":[[0,1]],
+                      "produce":[[0,1]],"latency":1}],
+            "wires":[{"from":["node",0,0],"to":["out",0]}],
+            "markings":[{"to":["node",0,0],"n":30}],
+            "pos":{"inputs":[],"nodes":[[4,4]],"outputs":[[10,4]]}}"#;
+        let iron = 0u32;
+        let before = *app.inventory.get(&iron).unwrap();
+        let (_, _, body) = route(&mut app, "POST", "/api/compile", preload);
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert_eq!(*app.inventory.get(&iron).unwrap(), before - 30);
+        let (_, _, body) = route(&mut app, "POST", "/api/compile", preload);
+        assert!(body.contains("not enough iron for preloads"), "{body}");
     }
 
     #[test]

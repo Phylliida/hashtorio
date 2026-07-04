@@ -155,8 +155,50 @@ const S = { mode:'run', t:0, playing:true, tps:10, scene:null, frames:new Map(),
             fetching:new Set(), pos:null, customPos:null, last:performance.now() };
 const E = { draft:{ inputs:[], outputs:[], nodes:[], wires:[], markings:[] },
             pos:{ inputs:[], nodes:[], outputs:[] },
+            path:[],   // module indices: [] = top level; the editor can go inside
             tool:'move', wireFrom:null, drag:null, mouse:{x:0,y:0},
             sel:new Set() };
+// The draft level currently being edited (follow the module path).
+function draftAt(path) {
+  let d = E.draft;
+  for (const i of path) d = d.nodes[i].draft;
+  return d;
+}
+const D = () => draftAt(E.path);
+// Positions live ON each draft level (grid coords, the server's format);
+// E.pos is the active level's working copy in pixels.
+function flushPos() {
+  D().pos = { inputs: E.pos.inputs.map(toGrid), nodes: E.pos.nodes.map(toGrid),
+              outputs: E.pos.outputs.map(toGrid) };
+}
+function loadPos() {
+  const d = D(), p = d.pos || {};
+  const px = (arr, n) => {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const g = arr && arr[i];
+      out.push(g ? { x: g[0] * GRID, y: g[1] * GRID }
+                 : { x: GRID * (6 + (i % 4) * 8), y: GRID * (3 + ((i * 5) % 17)) });
+    }
+    return out;
+  };
+  E.pos = { inputs: px(p.inputs, d.inputs.length),
+            nodes: px(p.nodes, d.nodes.length),
+            outputs: px(p.outputs, d.outputs.length) };
+}
+function enterModule(i) {
+  if (D().nodes[i].kind !== 'module') return;
+  const label = D().nodes[i].label;
+  flushPos(); E.path.push(i); E.sel.clear(); E.wireFrom = null;
+  loadPos(); saveDraft();
+  toast('inside "' + label + '" — its inputs/outputs are the module ports; ' +
+        'double-click empty space to leave');
+}
+function exitModule() {
+  if (!E.path.length) return;
+  flushPos(); E.path.pop(); E.sel.clear(); E.wireFrom = null;
+  loadPos(); saveDraft();
+}
 
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
@@ -184,7 +226,7 @@ function wireLatencyPreview(from, to) {
   const og = ep => {
     if (ep[0] === 'in') { const g = toGrid(E.pos.inputs[ep[1]]); return [g[0]+1, g[1]]; }
     const g = toGrid(E.pos.nodes[ep[1]]);
-    return [g[0] + footOf(E.draft.nodes[ep[1]])[0], g[1] + ep[2]];
+    return [g[0] + footOf(D().nodes[ep[1]])[0], g[1] + ep[2]];
   };
   const ig = ep => {
     if (ep[0] === 'out') { const g = toGrid(E.pos.outputs[ep[1]]); return [g[0]-1, g[1]]; }
@@ -462,62 +504,64 @@ function draw() {
 const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
 function freeSpot() {
-  const k = E.draft.nodes.length + E.draft.inputs.length + E.draft.outputs.length;
+  const d = D();
+  const k = d.nodes.length + d.inputs.length + d.outputs.length;
   const x = 192 + (k % 4) * 192, y = 72 + ((k * 120) % 408);
   return { x: Math.round(x / GRID) * GRID, y: Math.round(y / GRID) * GRID };
 }
 function saveDraft() {
   try {
-    localStorage.setItem('hashtorio.draft.v1',
-      JSON.stringify({ draft: E.draft, pos: E.pos }));
+    if (E.pos.nodes) flushPos();
+    localStorage.setItem('hashtorio.draft.v2', JSON.stringify(E.draft));
   } catch (_) {}
 }
 function loadDraft() {
   try {
-    const s = localStorage.getItem('hashtorio.draft.v1');
+    const s = localStorage.getItem('hashtorio.draft.v2');
     if (!s) return false;
-    const { draft, pos } = JSON.parse(s);
-    E.draft = draft; E.pos = pos;
+    E.draft = JSON.parse(s);
+    E.path = [];
+    loadPos();
     return true;
   } catch (_) { return false; }
 }
 
 function fromType(from) {
-  if (from[0] === 'in') return E.draft.inputs[from[1]].ty;
-  return legsOut(E.draft.nodes[from[1]])[from[2]];
+  if (from[0] === 'in') return D().inputs[from[1]].ty;
+  return legsOut(D().nodes[from[1]])[from[2]];
 }
 function sinkType(to) {
-  if (to[0] === 'out') return E.draft.outputs[to[1]].ty;
-  return legsIn(E.draft.nodes[to[1]])[to[2]];
+  if (to[0] === 'out') return D().outputs[to[1]].ty;
+  return legsIn(D().nodes[to[1]])[to[2]];
 }
 
 function draftAddInput(ty, num, den, label) {
-  E.draft.inputs.push({ ty, rate: [num, den], label: label || tyName(ty) + ' source' });
+  D().inputs.push({ ty, rate: [num, den], label: label || tyName(ty) + ' source' });
   E.pos.inputs.push(freeSpot()); saveDraft();
 }
 function draftAddOutput(ty, label) {
-  E.draft.outputs.push({ ty, label: label || tyName(ty) + ' out' });
+  D().outputs.push({ ty, label: label || tyName(ty) + ' out' });
   E.pos.outputs.push(freeSpot()); saveDraft();
 }
 function draftAddNode(def) {
-  E.draft.nodes.push(def);
+  D().nodes.push(def);
   E.pos.nodes.push(freeSpot()); saveDraft();
 }
 function draftAddWire(from, to) {
-  if (E.draft.wires.some(w => eq(w.from, from)))
+  if (D().wires.some(w => eq(w.from, from)))
     throw Error("that output already feeds a wire — items can't be copied; use a splitter");
   const ft = fromType(from), st = sinkType(to);
   if (ft !== ANY_TY && st !== ANY_TY && ft !== st)
     throw Error(`type mismatch: ${tyName(ft)} → ${tyName(st)}`);
-  E.draft.wires.push({ from, to }); saveDraft();
+  D().wires.push({ from, to }); saveDraft();
 }
 function draftSetMarking(to, n) {
-  E.draft.markings = E.draft.markings.filter(m => !eq(m.to, to));
-  if (n > 0) E.draft.markings.push({ to, n });
+  D().markings = D().markings.filter(m => !eq(m.to, to));
+  if (n > 0) D().markings.push({ to, n });
   saveDraft();
 }
 function markingAt(to) {
-  const m = E.draft.markings.find(m => eq(m.to, to));
+  const m = D().markings.find(m => eq(m.to, to));
   return m ? m.n : 0;
 }
 function remapEp(ep, kind, removed) {
@@ -527,24 +571,47 @@ function remapEp(ep, kind, removed) {
   return [ep[0], ep[1] > removed ? ep[1] - 1 : ep[1], ...ep.slice(2)];
 }
 function draftDelete(kind, idx) {
+  const d = D();
   const touches = ep => {
     const tag = kind === 'node' ? 'node' : kind === 'input' ? 'in' : 'out';
     return ep[0] === tag && ep[1] === idx;
   };
-  E.draft.wires = E.draft.wires
+  d.wires = d.wires
     .filter(w => !touches(w.from) && !touches(w.to))
     .map(w => ({ from: remapEp(w.from, kind, idx), to: remapEp(w.to, kind, idx) }));
-  E.draft.markings = E.draft.markings
+  d.markings = d.markings
     .filter(m => !touches(m.to))
     .map(m => ({ to: remapEp(m.to, kind, idx), n: m.n }));
-  if (kind === 'node') { E.draft.nodes.splice(idx, 1); E.pos.nodes.splice(idx, 1); }
-  if (kind === 'input') { E.draft.inputs.splice(idx, 1); E.pos.inputs.splice(idx, 1); }
-  if (kind === 'output') { E.draft.outputs.splice(idx, 1); E.pos.outputs.splice(idx, 1); }
+  if (kind === 'node') { d.nodes.splice(idx, 1); E.pos.nodes.splice(idx, 1); }
+  if (kind === 'input') { d.inputs.splice(idx, 1); E.pos.inputs.splice(idx, 1); }
+  if (kind === 'output') { d.outputs.splice(idx, 1); E.pos.outputs.splice(idx, 1); }
+  // Deleting a PORT of a module edits its parent's interface: parent wires
+  // to that leg vanish; higher legs shift down.
+  if (E.path.length && (kind === 'input' || kind === 'output')) {
+    const parent = draftAt(E.path.slice(0, -1));
+    const modIdx = E.path[E.path.length - 1];
+    const fix = (ep, isFrom) => {
+      const portSide = kind === 'input' ? !isFrom : isFrom;
+      if (ep[0] !== 'node' || ep[1] !== modIdx || !portSide) return ep;
+      return ep[2] > idx ? ['node', modIdx, ep[2] - 1] : ep;
+    };
+    const gone = (ep, isFrom) => {
+      const portSide = kind === 'input' ? !isFrom : isFrom;
+      return ep[0] === 'node' && ep[1] === modIdx && portSide && ep[2] === idx;
+    };
+    parent.wires = parent.wires
+      .filter(w => !gone(w.from, true) && !gone(w.to, false))
+      .map(w => ({ from: fix(w.from, true), to: fix(w.to, false) }));
+    parent.markings = parent.markings
+      .filter(m => !(kind === 'input' && gone(m.to, false)))
+      .map(m => ({ to: fix(m.to, false), n: m.n }));
+  }
   saveDraft();
 }
-function draftDeleteWire(i) { E.draft.wires.splice(i, 1); saveDraft(); }
+function draftDeleteWire(i) { D().wires.splice(i, 1); saveDraft(); }
 function draftClear() {
   E.draft = { inputs:[], outputs:[], nodes:[], wires:[], markings:[] };
+  E.path = [];
   E.pos = { inputs:[], nodes:[], outputs:[] };
   saveDraft();
 }
@@ -568,6 +635,7 @@ function convertSub(d) {
     nodes: d.nodes.map(convertNode),
     wires: d.wires.map(w => ({ from:w.from.slice(), to:w.to.slice() })),
     markings: d.markings.map(m => ({ to:m.to.slice(), n:m.n })),
+    pos: d.pos ? JSON.parse(JSON.stringify(d.pos)) : undefined,
   };
 }
 function sceneToDraft() {
@@ -585,7 +653,9 @@ function sceneToDraft() {
   sc.outputs.forEach((o, i) => {
     if (o.marking > 0) E.draft.markings.push({ to:['out', i], n:o.marking });
   });
-  E.pos = JSON.parse(JSON.stringify(S.pos));
+  E.draft.pos = sc.pos ? JSON.parse(JSON.stringify(sc.pos)) : undefined;
+  E.path = [];
+  loadPos();
   E.sel.clear();
   saveDraft();
 }
@@ -597,19 +667,24 @@ function sceneToDraft() {
 // outer sources feed module inputs; interior outputs feeding the outside
 // become module outputs. Wires wholly inside move into the sub-draft.
 function sealSelection(name) {
+  const dd = D();
   const sel = [...E.sel].sort((a, b) => a - b);
   if (!sel.length) throw Error('select some nodes first (select tool)');
   const inSel = i => sel.includes(i);
   const subIdx = new Map(sel.map((g, j) => [g, j]));
-  const keep = E.draft.nodes.map((_, i) => i).filter(i => !inSel(i));
+  const keep = dd.nodes.map((_, i) => i).filter(i => !inSel(i));
   const keepIdx = new Map(keep.map((g, j) => [g, j]));
   const modIdx = keep.length;
-  const sub = { inputs:[], outputs:[], nodes: sel.map(i => E.draft.nodes[i]),
-                wires:[], markings:[] };
+  const selG = sel.map(i => toGrid(E.pos.nodes[i]));
+  const minx = Math.min(...selG.map(g => g[0])), miny = Math.min(...selG.map(g => g[1]));
+  const sub = { inputs:[], outputs:[], nodes: sel.map(i => dd.nodes[i]),
+                wires:[], markings:[],
+                pos: { inputs: [], outputs: [],
+                       nodes: selG.map(g => [g[0] - minx + 8, g[1] - miny + 3]) } };
   const mapFrom = f => f[0] === 'node' ? ['node', keepIdx.get(f[1]), f[2]] : f;
   const mapTo = t => t[0] === 'node' ? ['node', keepIdx.get(t[1]), t[2]] : t;
   const newWires = [], newMarkings = [];
-  for (const w of E.draft.wires) {
+  for (const w of dd.wires) {
     const fIn = w.from[0] === 'node' && inSel(w.from[1]);
     const tIn = w.to[0] === 'node' && inSel(w.to[1]);
     if (fIn && tIn) {
@@ -619,19 +694,21 @@ function sealSelection(name) {
       const ty = sinkType(w.to);
       const p = sub.inputs.length;
       sub.inputs.push({ ty, rate:[1, 1], label:'in ' + tyName(ty) });
+      sub.pos.inputs.push([2, 3 + p * 4]);
       sub.wires.push({ from:['in', p], to:['node', subIdx.get(w.to[1]), w.to[2]] });
       newWires.push({ from: mapFrom(w.from), to:['node', modIdx, p] });
     } else if (fIn) {
       const ty = fromType(w.from);
       const q = sub.outputs.length;
       sub.outputs.push({ ty, label:'out ' + tyName(ty) });
+      sub.pos.outputs.push([Math.max(...sub.pos.nodes.map(g => g[0])) + 8, 3 + q * 4]);
       sub.wires.push({ from:['node', subIdx.get(w.from[1]), w.from[2]], to:['out', q] });
       newWires.push({ from:['node', modIdx, q], to: mapTo(w.to) });
     } else {
       newWires.push({ from: mapFrom(w.from), to: mapTo(w.to) });
     }
   }
-  for (const m of E.draft.markings) {
+  for (const m of dd.markings) {
     if (m.to[0] === 'node' && inSel(m.to[1]))
       sub.markings.push({ to:['node', subIdx.get(m.to[1]), m.to[2]], n:m.n });
     else newMarkings.push({ to: mapTo(m.to), n:m.n });
@@ -639,20 +716,21 @@ function sealSelection(name) {
   const cx = sel.reduce((s, i) => s + E.pos.nodes[i].x, 0) / sel.length;
   const cy = sel.reduce((s, i) => s + E.pos.nodes[i].y, 0) / sel.length;
   E.pos.nodes = keep.map(i => E.pos.nodes[i]).concat([{ x: cx, y: cy }]);
-  E.draft.nodes = keep.map(i => E.draft.nodes[i])
+  dd.nodes = keep.map(i => dd.nodes[i])
     .concat([{ kind:'module', label:name, draft:sub }]);
-  E.draft.wires = newWires;
-  E.draft.markings = newMarkings;
+  dd.wires = newWires;
+  dd.markings = newMarkings;
   E.sel.clear();
   saveDraft();
 }
 
 // Splice a module's contents back into the parent.
 function unsealModule(idx) {
-  const mod = E.draft.nodes[idx];
+  const dd = D();
+  const mod = dd.nodes[idx];
   if (!mod || mod.kind !== 'module') throw Error('select a single module to unseal');
   const sub = mod.draft;
-  const keep = E.draft.nodes.map((_, i) => i).filter(i => i !== idx);
+  const keep = dd.nodes.map((_, i) => i).filter(i => i !== idx);
   const keepIdx = new Map(keep.map((g, j) => [g, j]));
   const subBase = keep.length;
   const mapOld = ep => ep[0] === 'node' && ep[1] !== idx
@@ -671,7 +749,7 @@ function unsealModule(idx) {
     return w && w.to[0] === 'node' ? mapSub(w.to) : null;
   };
   const newWires = [], newMarkings = [];
-  for (const w of E.draft.wires) {
+  for (const w of dd.wires) {
     const from = resolveFrom(w.from);
     if (from === null) continue;
     if (w.to[0] === 'node' && w.to[1] === idx) {
@@ -686,7 +764,7 @@ function unsealModule(idx) {
     if (w.from[0] === 'node' && w.to[0] === 'node')
       newWires.push({ from: mapSub(w.from), to: mapSub(w.to) });
   }
-  for (const m of E.draft.markings) {
+  for (const m of dd.markings) {
     if (m.to[0] === 'node' && m.to[1] === idx) {
       const to = sinkOfPort(m.to[2]);
       if (to !== null) newMarkings.push({ to, n:m.n });
@@ -697,13 +775,17 @@ function unsealModule(idx) {
   }
   const base = E.pos.nodes[idx];
   const newPos = keep.map(i => E.pos.nodes[i]);
-  sub.nodes.forEach((_, j) => newPos.push({
-    x: base.x + (j % 3) * 180 - 90, y: base.y + Math.floor(j / 3) * 110 - 40,
-  }));
-  E.draft.nodes = keep.map(i => E.draft.nodes[i]).concat(sub.nodes);
+  const subPos = (sub.pos && sub.pos.nodes) || [];
+  sub.nodes.forEach((_, j) => {
+    const g = subPos[j];
+    newPos.push(g
+      ? { x: base.x + (g[0] - 8) * GRID, y: base.y + (g[1] - 3) * GRID }
+      : { x: base.x + (j % 3) * 180 - 90, y: base.y + Math.floor(j / 3) * 110 - 40 });
+  });
+  dd.nodes = keep.map(i => dd.nodes[i]).concat(sub.nodes);
   E.pos.nodes = newPos;
-  E.draft.wires = newWires;
-  E.draft.markings = newMarkings;
+  dd.wires = newWires;
+  dd.markings = newMarkings;
   E.sel.clear();
   saveDraft();
 }
@@ -782,12 +864,8 @@ document.getElementById('harvest').onclick = async () => {
 };
 
 async function compileDraft() {
-  const payload = Object.assign({}, E.draft, { pos: {
-    inputs: E.pos.inputs.map(toGrid),
-    nodes: E.pos.nodes.map(toGrid),
-    outputs: E.pos.outputs.map(toGrid),
-  }});
-  const body = JSON.stringify(payload);
+  flushPos();
+  const body = JSON.stringify(E.draft);
   const r = await (await fetch('/api/compile', {
     method:'POST', headers:{ 'Content-Type':'application/json' }, body,
   })).json();
@@ -819,10 +897,11 @@ function applyScene(scene, customPos) {
 // edit mode: hit testing & interaction
 // ---------------------------------------------------------------------------
 function editorHit(x, y) {
+  const d = D();
   const near = (p, r) => (x - p.x) ** 2 + (y - p.y) ** 2 <= r * r;
-  for (let n = 0; n < E.draft.nodes.length; n++) {
-    const p = withSize(E.pos.nodes[n], E.draft.nodes[n]);
-    const ins = legsIn(E.draft.nodes[n]), outs = legsOut(E.draft.nodes[n]);
+  for (let n = 0; n < d.nodes.length; n++) {
+    const p = withSize(E.pos.nodes[n], d.nodes[n]);
+    const ins = legsIn(d.nodes[n]), outs = legsOut(d.nodes[n]);
     for (let l = 0; l < ins.length; l++)
       if (near(inPortPos(p, l), 8)) return { kind:'inport', to:['node', n, l] };
     for (let l = 0; l < outs.length; l++)
@@ -830,28 +909,28 @@ function editorHit(x, y) {
     if (x >= p.x && x <= p.x + p.w && y >= p.y && y <= p.y + p.h)
       return { kind:'node', idx:n };
   }
-  for (let i = 0; i < E.draft.inputs.length; i++) {
+  for (let i = 0; i < d.inputs.length; i++) {
     const p = E.pos.inputs[i];
     if (near({ x: p.x + 14, y: p.y }, 8)) return { kind:'outport', from:['in', i] };
     if (near(p, 16)) return { kind:'input', idx:i };
   }
-  for (let o = 0; o < E.draft.outputs.length; o++) {
+  for (let o = 0; o < d.outputs.length; o++) {
     const p = E.pos.outputs[o];
     if (near({ x: p.x, y: p.y }, 8)) return { kind:'inport', to:['out', o] };
     if (x >= p.x && x <= p.x + 140 && y >= p.y - 22 && y <= p.y + 22)
       return { kind:'output', idx:o };
   }
-  for (let w = 0; w < E.draft.wires.length; w++) {
-    const mid = pointAt(editWirePath(E.draft.wires[w]), 0.5);
+  for (let w = 0; w < d.wires.length; w++) {
+    const mid = pointAt(editWirePath(d.wires[w]), 0.5);
     if (near(mid, 10)) return { kind:'wire', idx:w };
   }
   return null;
 }
 const withSize = (p, node) => ({ ...p, w: NODE_W, h: nodeH(node) });
 const editWirePath = w => wirePath(
-  { nodes: E.pos.nodes.map((p, i) => withSize(p, E.draft.nodes[i])),
+  { nodes: E.pos.nodes.map((p, i) => withSize(p, D().nodes[i])),
     inputs: E.pos.inputs, outputs: E.pos.outputs },
-  E.draft.nodes, w.from, w.to);
+  D().nodes, w.from, w.to);
 
 function editorDown(x, y) {
   const hit = editorHit(x, y);
@@ -892,6 +971,15 @@ function editorDown(x, y) {
 cv.addEventListener('mousedown', e => {
   if (S.mode === 'edit') editorDown(e.offsetX, e.offsetY);
 });
+cv.addEventListener('dblclick', e => {
+  if (S.mode !== 'edit') return;
+  const hit = editorHit(e.offsetX, e.offsetY);
+  if (hit && hit.kind === 'node' && D().nodes[hit.idx].kind === 'module') {
+    enterModule(hit.idx);
+  } else if (!hit) {
+    exitModule();
+  }
+});
 cv.addEventListener('mousemove', e => {
   E.mouse = { x: e.offsetX, y: e.offsetY };
   if (S.mode === 'edit' && E.drag) {
@@ -912,13 +1000,14 @@ window.addEventListener('mouseup', () => {
 // edit mode: drawing
 // ---------------------------------------------------------------------------
 function drawEdit() {
+  const d = D();
   const W = cv.getBoundingClientRect().width, H = cv.getBoundingClientRect().height;
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = '#1a1e25';
   for (let gx = 0; gx < W; gx += GRID)
     for (let gy = 0; gy < H; gy += GRID) ctx.fillRect(gx, gy, 1.5, 1.5);
 
-  E.draft.wires.forEach((w, i) => {
+  d.wires.forEach((w, i) => {
     const p = editWirePath(w);
     strokePath(p, tyColor(sinkType(w.to)) + '88', 2);
     const lat = wireLatencyPreview(w.from, w.to);
@@ -937,13 +1026,13 @@ function drawEdit() {
   });
   if (E.wireFrom) {
     const a = endpointPos(
-      { nodes: E.pos.nodes.map((p, i) => withSize(p, E.draft.nodes[i])),
+      { nodes: E.pos.nodes.map((p, i) => withSize(p, d.nodes[i])),
         inputs: E.pos.inputs, outputs: E.pos.outputs },
-      E.draft.nodes, E.wireFrom, true);
+      d.nodes, E.wireFrom, true);
     strokePath(pathBetween(a, E.mouse, false), '#8fd3ff88', 1.5, true);
   }
 
-  E.draft.inputs.forEach((inp, i) => {
+  d.inputs.forEach((inp, i) => {
     const p = E.pos.inputs[i];
     ctx.fillStyle = '#39414f';
     ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, 7); ctx.fill();
@@ -954,7 +1043,7 @@ function drawEdit() {
     ctx.textAlign = 'left';
   });
 
-  E.draft.nodes.forEach((node, n) => {
+  d.nodes.forEach((node, n) => {
     const p = withSize(E.pos.nodes[n], node);
     // The chassis footprint: the machine's real extent on the grid.
     const [fw, fh] = footOf(node);
@@ -991,7 +1080,7 @@ function drawEdit() {
     legsOut(node).forEach((ty, l) => port(outPortPos(p, l), ty));
   });
 
-  E.draft.outputs.forEach((out, o) => {
+  d.outputs.forEach((out, o) => {
     const p = E.pos.outputs[o];
     roundRect(p.x, p.y - 22, 140, 44, 9);
     ctx.fillStyle = '#20262f'; ctx.fill();
@@ -1001,6 +1090,13 @@ function drawEdit() {
     ctx.fillText(out.label, p.x + 12, p.y + 4);
   });
 
+  // Breadcrumb: where in the nesting we are.
+  if (E.path.length) {
+    let crumb = 'factory', dd = E.draft;
+    for (const i of E.path) { crumb += ' \u25b8 ' + dd.nodes[i].label; dd = dd.nodes[i].draft; }
+    ctx.fillStyle = '#8fd3ff'; ctx.font = 'bold 13px system-ui';
+    ctx.fillText(crumb + '   (double-click empty space to leave)', 16, 22);
+  }
   ctx.fillStyle = '#5d6875'; ctx.font = '12px system-ui';
   const hints = {
     move: 'move: drag things around',
@@ -1036,6 +1132,9 @@ function setMode(m) {
     m === 'edit' ? '&#9654; back to run' : '&#9998; edit';
   if (m === 'edit' && E.draft.nodes.length + E.draft.inputs.length === 0) {
     sceneToDraft();
+  }
+  if (m === 'edit' && !E.pos.nodes.length && (E.draft.nodes.length || E.draft.inputs.length)) {
+    loadPos();
   }
 }
 
