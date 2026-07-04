@@ -72,6 +72,15 @@ animation, or as an honest refusal that teaches the rules ("items can't
 be copied", "add latency somewhere in that loop"). Load the current
 factory into the editor to remix it; drafts survive reloads.
 
+And it **seals**: select some machines and hit **◻ seal** — they collapse
+into a module whose boundary wires become typed ports, machines containing
+machines, as deep as you like. A sealed module runs off its memoized
+summary (identical modules share one cache entry, automatically) and draws
+as an opaque box with port flows: the interior isn't hidden by the
+renderer, it's absent from the data. Unseal to splice it back. The demo
+ships with its demand store sealed — warp it to a million, it costs the
+same.
+
 Next up (M1/M2): the typed wiring term language with hash-consing, then
 feedback via Kahn/(min,+) fixed points — at which point buffers, clocks, and
 sensors emerge as derived components.

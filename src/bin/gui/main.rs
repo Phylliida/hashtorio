@@ -1,23 +1,27 @@
-//! The hashtorio GUI: a zero-dependency HTTP server (std::net only) feeding
-//! a single-page canvas frontend — now with editing.
+//! The hashtorio GUI server: editing, sealing, and viewing factories.
 //!
 //! GET  /            the app
-//! GET  /api/scene   current compiled factory: topology + spec + audit
+//! GET  /api/scene   current factory: topology (modules opaque) + spec + audit
 //! GET  /api/frames  batched per-tick data (O(1) reads of counting maps)
-//! POST /api/compile a draft blueprint; on success it becomes the current
-//!                   factory, on failure the error is a friendly refusal —
-//!                   the engine teaching its own rules.
+//! POST /api/compile a draft blueprint (modules nested by value); on success
+//!                   it becomes the current factory, on failure the error is
+//!                   a friendly refusal — the engine teaching its own rules.
+//!
+//! The view is strictly parent-level: a sealed module renders as one node
+//! with port flows. Its interior is *not hidden by the renderer* — it is
+//! absent from the data, because the evaluator answered with the module's
+//! memoized summary. The abstraction boundary is real, not cosmetic.
 
 mod json;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+use hashtorio::counting::Counting;
 use hashtorio::demo;
 use hashtorio::draft::{Draft, DraftFrom, DraftInput, DraftNode, DraftOutput, DraftTo};
 use hashtorio::eval::{EvalError, Evaluator};
 use hashtorio::net::{ItemType, Library};
-use hashtorio::render::{Edge, EdgeFrom, EdgeTo, Scene};
 use hashtorio::report::{Audit, Summary};
 use json::Json;
 
@@ -28,11 +32,19 @@ const GUI_HORIZON: u64 = 4096;
 
 struct Compiled {
     draft: Draft,
-    scene: Scene,
+    input_flows: Vec<Counting>,
+    /// Parent-level output-leg countings per node (modules opaque).
+    node_outs: Vec<Vec<Counting>>,
+    /// Firing maps; `None` for modules (interior detail stays sealed).
+    firings: Vec<Option<Counting>>,
+    outputs: Vec<Counting>,
+    /// Per node, per input leg: the wire's supply counting map.
+    supplies: Vec<Vec<Counting>>,
+    /// Per node, per input leg: consumption map; `None` for module legs
+    /// (queueing happens inside the seal).
+    consumed: Vec<Vec<Option<Counting>>>,
     summary: Summary,
     audit: Audit,
-    /// Draft wire index -> scene edge index (interning sorts sources).
-    edge_map: Vec<usize>,
 }
 
 struct App {
@@ -56,55 +68,91 @@ fn friendly_eval_error(e: &EvalError) -> String {
             "no periodic steady state found within {horizon} ticks — \
              the design may have an enormous period"
         ),
+        EvalError::CycleThroughModule => {
+            "a feedback loop crosses a module boundary — seal the whole loop \
+             inside the module, or keep it outside"
+                .into()
+        }
         other => format!("evaluation failed: {other:?}"),
     }
 }
 
 fn compile(lib: &mut Library, draft: Draft) -> Result<Compiled, String> {
-    let (id, flows) = draft.build(lib)?;
+    let (id, input_flows) = draft.build(lib)?;
     let mut ev = Evaluator::new(lib);
     ev.horizon = GUI_HORIZON;
-    let summary = ev.summarize(id, &flows).map_err(|e| friendly_eval_error(&e))?;
-    let audit = ev.audit(id, &flows).map_err(|e| friendly_eval_error(&e))?;
-    let trace = ev
-        .trace_flattened(id, &flows)
+    let detail = ev
+        .evaluate_detailed(id, &input_flows)
         .map_err(|e| friendly_eval_error(&e))?;
-    let type_names: Vec<(ItemType, &str)> =
-        draft.types.iter().map(|(t, n)| (*t, n.as_str())).collect();
-    let node_labels = draft.nodes.iter().map(|n| n.label().to_string()).collect();
-    let out_labels = draft.outputs.iter().map(|o| o.label.clone()).collect();
-    let scene = Scene::new(lib, trace, node_labels, out_labels, &type_names);
+    let summary = ev
+        .summarize(id, &input_flows)
+        .map_err(|e| friendly_eval_error(&e))?;
+    let audit = ev
+        .audit(id, &input_flows)
+        .map_err(|e| friendly_eval_error(&e))?;
 
-    // Interning sorts wire sources, so scene edges may be reordered
-    // relative to draft wires; match them up by endpoints.
-    let matches = |e: &Edge, from: &DraftFrom, to: &DraftTo| {
-        let f = match (e.from, from) {
-            (EdgeFrom::Input(a), DraftFrom::Input(b)) => a == *b,
-            (EdgeFrom::Node { node, leg }, DraftFrom::Node(n, l)) => {
-                node == *n && leg == *l
-            }
-            _ => false,
-        };
-        let t = match (e.to, to) {
-            (EdgeTo::Output(a), DraftTo::Output(b)) => a == *b,
-            (EdgeTo::Node { node, leg }, DraftTo::Node(n, l)) => node == *n && leg == *l,
-            _ => false,
-        };
-        f && t
+    let marking_of = |to: DraftTo| -> u64 {
+        draft
+            .markings
+            .iter()
+            .filter(|(t, _)| *t == to)
+            .map(|(_, m)| *m)
+            .sum()
     };
-    let edge_map = draft
-        .wires
-        .iter()
-        .map(|(from, to)| {
-            scene
-                .edges()
+    let source_counting = |from: &DraftFrom| -> &Counting {
+        match from {
+            DraftFrom::Input(i) => &input_flows[*i],
+            DraftFrom::Node(n, l) => &detail.node_outs[*n][*l],
+        }
+    };
+    let mut supplies = Vec::with_capacity(draft.nodes.len());
+    let mut consumed = Vec::with_capacity(draft.nodes.len());
+    for (n, node) in draft.nodes.iter().enumerate() {
+        let legs = node.in_types().len();
+        let sup: Vec<Counting> = (0..legs)
+            .map(|l| {
+                let mut acc = Counting::constant(marking_of(DraftTo::Node(n, l)));
+                for (from, to) in &draft.wires {
+                    if *to == DraftTo::Node(n, l) {
+                        acc = acc.add(source_counting(from));
+                    }
+                }
+                acc
+            })
+            .collect();
+        let cons: Vec<Option<Counting>> = match node {
+            DraftNode::Recipe { consume, .. } => consume
                 .iter()
-                .position(|e| matches(e, from, to))
-                .ok_or_else(|| "internal: draft wire missing from scene".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+                .map(|&(_, c)| {
+                    Some(
+                        detail.firings[n]
+                            .as_ref()
+                            .expect("recipes have firings")
+                            .scale_floor(c, 1),
+                    )
+                })
+                .collect(),
+            DraftNode::Priority { .. } => vec![
+                Some(detail.node_outs[n][0].add(&detail.node_outs[n][1])),
+                Some(detail.node_outs[n][0].clone()),
+            ],
+            DraftNode::Module { .. } => vec![None; legs],
+        };
+        supplies.push(sup);
+        consumed.push(cons);
+    }
 
-    Ok(Compiled { draft, scene, summary, audit, edge_map })
+    Ok(Compiled {
+        input_flows,
+        node_outs: detail.node_outs,
+        firings: detail.firings,
+        outputs: detail.outputs,
+        supplies,
+        consumed,
+        summary,
+        audit,
+        draft,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -133,14 +181,94 @@ fn to_json(t: &DraftTo) -> String {
     }
 }
 
+fn node_json(d: &Draft, n: usize, node: &DraftNode) -> String {
+    let marking_of = |to: DraftTo| -> u64 {
+        d.markings.iter().filter(|(t, _)| *t == to).map(|(_, m)| *m).sum()
+    };
+    let legs: Vec<String> = node.in_types().iter().map(|t| t.0.to_string()).collect();
+    let outs: Vec<String> = node.out_types().iter().map(|t| t.0.to_string()).collect();
+    let markings: Vec<String> = (0..node.in_types().len())
+        .map(|l| marking_of(DraftTo::Node(n, l)).to_string())
+        .collect();
+    let core = match node {
+        DraftNode::Recipe { consume, produce, latency, .. } => {
+            let c: Vec<String> =
+                consume.iter().map(|(t, a)| format!("[{},{a}]", t.0)).collect();
+            let p: Vec<String> =
+                produce.iter().map(|(t, a)| format!("[{},{a}]", t.0)).collect();
+            format!(
+                "\"kind\":\"recipe\",\"consume\":[{}],\"produce\":[{}],\"latency\":{latency}",
+                c.join(","),
+                p.join(",")
+            )
+        }
+        DraftNode::Priority { item, token, .. } => format!(
+            "\"kind\":\"priority\",\"item\":{},\"token\":{}",
+            item.0, token.0
+        ),
+        DraftNode::Module { draft, .. } => {
+            format!("\"kind\":\"module\",\"draft\":{}", draft_json(draft))
+        }
+    };
+    format!(
+        "{{{core},\"label\":\"{}\",\"legs\":[{}],\"outs\":[{}],\"markings\":[{}]}}",
+        esc(node.label()),
+        legs.join(","),
+        outs.join(","),
+        markings.join(",")
+    )
+}
+
+/// A draft in the editor's own format (recursive; round-trips through
+/// POST /api/compile).
+fn draft_json(d: &Draft) -> String {
+    let inputs: Vec<String> = d
+        .inputs
+        .iter()
+        .map(|i| {
+            format!(
+                "{{\"ty\":{},\"label\":\"{}\",\"rate\":{}}}",
+                i.ty.0,
+                esc(&i.label),
+                rate_json(i.rate)
+            )
+        })
+        .collect();
+    let outputs: Vec<String> = d
+        .outputs
+        .iter()
+        .map(|o| format!("{{\"ty\":{},\"label\":\"{}\"}}", o.ty.0, esc(&o.label)))
+        .collect();
+    let nodes: Vec<String> = d
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(n, node)| node_json(d, n, node))
+        .collect();
+    let wires: Vec<String> = d
+        .wires
+        .iter()
+        .map(|(f, t)| format!("{{\"from\":{},\"to\":{}}}", from_json(f), to_json(t)))
+        .collect();
+    let markings: Vec<String> = d
+        .markings
+        .iter()
+        .map(|(t, m)| format!("{{\"to\":{},\"n\":{m}}}", to_json(t)))
+        .collect();
+    format!(
+        "{{\"inputs\":[{}],\"outputs\":[{}],\"nodes\":[{}],\"wires\":[{}],\"markings\":[{}]}}",
+        inputs.join(","),
+        outputs.join(","),
+        nodes.join(","),
+        wires.join(","),
+        markings.join(",")
+    )
+}
+
 fn scene_json(c: &Compiled) -> String {
     let d = &c.draft;
     let marking_of = |to: DraftTo| -> u64 {
-        d.markings
-            .iter()
-            .filter(|(t, _)| *t == to)
-            .map(|(_, m)| *m)
-            .sum()
+        d.markings.iter().filter(|(t, _)| *t == to).map(|(_, m)| *m).sum()
     };
     let types: Vec<String> = d
         .types
@@ -176,39 +304,7 @@ fn scene_json(c: &Compiled) -> String {
         .nodes
         .iter()
         .enumerate()
-        .map(|(n, node)| {
-            let legs: Vec<String> =
-                node.in_types().iter().map(|t| t.0.to_string()).collect();
-            let outs: Vec<String> =
-                node.out_types().iter().map(|t| t.0.to_string()).collect();
-            let markings: Vec<String> = (0..node.in_types().len())
-                .map(|l| marking_of(DraftTo::Node(n, l)).to_string())
-                .collect();
-            let core = match node {
-                DraftNode::Recipe { consume, produce, latency, .. } => {
-                    let c: Vec<String> =
-                        consume.iter().map(|(t, a)| format!("[{},{a}]", t.0)).collect();
-                    let p: Vec<String> =
-                        produce.iter().map(|(t, a)| format!("[{},{a}]", t.0)).collect();
-                    format!(
-                        "\"kind\":\"recipe\",\"consume\":[{}],\"produce\":[{}],\"latency\":{latency}",
-                        c.join(","),
-                        p.join(",")
-                    )
-                }
-                DraftNode::Priority { item, token, .. } => format!(
-                    "\"kind\":\"priority\",\"item\":{},\"token\":{}",
-                    item.0, token.0
-                ),
-            };
-            format!(
-                "{{{core},\"label\":\"{}\",\"legs\":[{}],\"outs\":[{}],\"markings\":[{}]}}",
-                esc(node.label()),
-                legs.join(","),
-                outs.join(","),
-                markings.join(",")
-            )
-        })
+        .map(|(n, node)| node_json(d, n, node))
         .collect();
     let edges: Vec<String> = d
         .wires
@@ -268,29 +364,43 @@ fn scene_json(c: &Compiled) -> String {
 }
 
 fn frame_json(c: &Compiled, t: u64) -> String {
-    let s = &c.scene;
-    let fired: Vec<String> =
-        (0..s.node_count()).map(|n| s.fired(n, t).to_string()).collect();
-    let occ: Vec<String> = (0..s.node_count())
+    let delta = |cnt: &Counting| cnt.eval(t) - if t == 0 { 0 } else { cnt.eval(t - 1) };
+    let fired: Vec<String> = (0..c.draft.nodes.len())
+        .map(|n| match &c.firings[n] {
+            Some(k) => delta(k).to_string(),
+            // A module's "activity" is motion on its output ports.
+            None => c.node_outs[n].iter().map(&delta).sum::<u64>().to_string(),
+        })
+        .collect();
+    let occ: Vec<String> = (0..c.draft.nodes.len())
         .map(|n| {
-            let legs: Vec<String> = (0..s.node_in_type_names(n).len())
-                .map(|l| s.occupancy(n, l, t).to_string())
+            let legs: Vec<String> = c.consumed[n]
+                .iter()
+                .enumerate()
+                .map(|(l, cons)| match cons {
+                    Some(cm) => (c.supplies[n][l].eval(t) - cm.eval(t)).to_string(),
+                    None => "null".into(), // sealed: queueing is interior
+                })
                 .collect();
             format!("[{}]", legs.join(","))
         })
         .collect();
-    // Flows in draft-wire order, via the edge map.
     let flow: Vec<String> = c
-        .edge_map
+        .draft
+        .wires
         .iter()
-        .map(|&ei| s.edge_flow(ei, t).to_string())
-        .collect();
-    let outs: Vec<String> = (0..s.output_count())
-        .map(|o| {
-            let total = s.delivered(o, t);
-            let delta = total - if t == 0 { 0 } else { s.delivered(o, t - 1) };
-            format!("[{total},{delta}]")
+        .map(|(from, _)| {
+            let cnt = match from {
+                DraftFrom::Input(i) => &c.input_flows[*i],
+                DraftFrom::Node(n, l) => &c.node_outs[*n][*l],
+            };
+            delta(cnt).to_string()
         })
+        .collect();
+    let outs: Vec<String> = c
+        .outputs
+        .iter()
+        .map(|cnt| format!("[{},{}]", cnt.eval(t), delta(cnt)))
         .collect();
     format!(
         "{{\"fired\":[{}],\"occ\":[{}],\"flow\":[{}],\"outs\":[{}]}}",
@@ -308,7 +418,7 @@ fn frames_json(c: &Compiled, from: u64, n: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// JSON in: the draft payload
+// JSON in: the draft payload (recursive for modules)
 // ---------------------------------------------------------------------------
 
 fn parse_endpoint_from(v: &Json) -> Result<DraftFrom, String> {
@@ -361,8 +471,10 @@ fn parse_pairs(
         .collect()
 }
 
-fn parse_draft(body: &str) -> Result<Draft, String> {
-    let v = json::parse(body).map_err(|e| format!("bad JSON: {e}"))?;
+fn parse_draft_value(v: &Json, depth: usize) -> Result<Draft, String> {
+    if depth > 32 {
+        return Err("modules nested too deep".into());
+    }
     let palette = demo::palette();
     let mut d = Draft { types: palette.clone(), ..Default::default() };
 
@@ -427,6 +539,13 @@ fn parse_draft(body: &str) -> Result<Draft, String> {
                 item: parse_ty(node.get("item"), &palette)?,
                 token: parse_ty(node.get("token"), &palette)?,
             }),
+            Some("module") => d.nodes.push(DraftNode::Module {
+                label,
+                draft: Box::new(parse_draft_value(
+                    node.get("draft").ok_or("module missing its draft")?,
+                    depth + 1,
+                )?),
+            }),
             _ => return Err(format!("node {n}: unknown kind")),
         }
     }
@@ -442,6 +561,11 @@ fn parse_draft(body: &str) -> Result<Draft, String> {
         d.markings.push((to, n));
     }
     Ok(d)
+}
+
+fn parse_draft(body: &str) -> Result<Draft, String> {
+    let v = json::parse(body).map_err(|e| format!("bad JSON: {e}"))?;
+    parse_draft_value(&v, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -467,12 +591,12 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
             ("200 OK".into(), "application/json", frames_json(&app.current, from, n))
         }
         ("POST", "/api/compile") => {
-            let result = parse_draft(body)
-                .and_then(|draft| compile(&mut app.lib, draft));
+            let result = parse_draft(body).and_then(|draft| compile(&mut app.lib, draft));
             match result {
                 Ok(compiled) => {
                     app.current = compiled;
-                    let body = format!("{{\"ok\":true,\"scene\":{}}}", scene_json(&app.current));
+                    let body =
+                        format!("{{\"ok\":true,\"scene\":{}}}", scene_json(&app.current));
                     ("200 OK".into(), "application/json", body)
                 }
                 Err(e) => (
@@ -567,59 +691,64 @@ mod tests {
     }
 
     #[test]
-    fn get_routes_serve_scene_and_frames() {
+    fn scene_shows_the_sealed_module() {
         let mut app = test_app();
-        let (status, _, body) = route(&mut app, "GET", "/api/scene", "");
-        assert_eq!(status, "200 OK");
-        assert!(body.contains("gear assembler"));
-        assert!(body.contains("\"types\""));
-        let (_, _, body) = route(&mut app, "GET", "/api/frames?from=100&n=2", "");
-        assert!(body.contains("\"from\":100"));
-        let (_, _, body) = route(&mut app, "GET", "/", "");
-        assert!(body.contains("<canvas"));
+        let (_, _, body) = route(&mut app, "GET", "/api/scene", "");
+        assert!(body.contains("demand store"));
+        assert!(body.contains("\"kind\":\"module\""));
+        assert!(body.contains("\"draft\""), "module carries its sub-draft");
+        // Frames: module legs report null occupancy (interior is sealed).
+        let (_, _, frames) = route(&mut app, "GET", "/api/frames?from=50&n=1", "");
+        assert!(frames.contains("null"), "{frames}");
     }
 
     #[test]
-    fn compile_swaps_the_current_factory() {
+    fn module_draft_round_trips_through_compile() {
         let mut app = test_app();
-        let draft = r#"{"inputs":[{"ty":0,"label":"mine","rate":[1,1]}],
-            "outputs":[{"ty":2,"label":"gears out"}],
-            "nodes":[{"kind":"recipe","label":"press","consume":[[0,2]],
-                      "produce":[[2,1]],"latency":3}],
+        let sub = r#"{"inputs":[{"ty":2,"label":"g","rate":[1,1]}],
+            "outputs":[{"ty":2,"label":"o"}],
+            "nodes":[{"kind":"recipe","label":"belt","consume":[[2,1]],
+                      "produce":[[2,1]],"latency":2}],
             "wires":[{"from":["in",0],"to":["node",0,0]},
                      {"from":["node",0,0],"to":["out",0]}],
             "markings":[]}"#;
-        let (_, _, body) = route(&mut app, "POST", "/api/compile", draft);
+        let top = format!(
+            r#"{{"inputs":[{{"ty":0,"label":"mine","rate":[1,1]}}],
+            "outputs":[{{"ty":2,"label":"out"}}],
+            "nodes":[{{"kind":"recipe","label":"press","consume":[[0,2]],
+                       "produce":[[2,1]],"latency":3}},
+                     {{"kind":"module","label":"boxed belt","draft":{sub}}}],
+            "wires":[{{"from":["in",0],"to":["node",0,0]}},
+                     {{"from":["node",0,0],"to":["node",1,0]}},
+                     {{"from":["node",1,0],"to":["out",0]}}],
+            "markings":[]}}"#
+        );
+        let (_, _, body) = route(&mut app, "POST", "/api/compile", &top);
         assert!(body.contains("\"ok\":true"), "{body}");
         assert!(body.contains("\"rate\":[1,2]"), "{body}");
-        // The current scene really swapped.
-        let (_, _, scene) = route(&mut app, "GET", "/api/scene", "");
-        assert!(scene.contains("gears out"));
-        // Frames follow the new factory: first gear lands at t=5.
-        let (_, _, frames) = route(&mut app, "GET", "/api/frames?from=5&n=1", "");
-        assert!(frames.contains("\"outs\":[[1,1]]"), "{frames}");
+        assert!(body.contains("boxed belt"));
     }
 
     #[test]
-    fn compile_refusals_are_friendly() {
+    fn loops_through_module_boundaries_refuse_kindly() {
         let mut app = test_app();
-        // Copying an output.
-        let dup = r#"{"inputs":[{"ty":0,"rate":[1,1]}],
-            "outputs":[{"ty":0,"label":"a"},{"ty":0,"label":"b"}],"nodes":[],
-            "wires":[{"from":["in",0],"to":["out",0]},{"from":["in",0],"to":["out",1]}],
+        let sub = r#"{"inputs":[{"ty":2,"label":"g","rate":[1,1]}],
+            "outputs":[{"ty":2,"label":"o"}],
+            "nodes":[{"kind":"recipe","label":"belt","consume":[[2,1]],
+                      "produce":[[2,1]],"latency":1}],
+            "wires":[{"from":["in",0],"to":["node",0,0]},
+                     {"from":["node",0,0],"to":["out",0]}],
             "markings":[]}"#;
-        let (_, _, body) = route(&mut app, "POST", "/api/compile", dup);
-        assert!(body.contains("can't be copied"), "{body}");
-        // Zeno loop.
-        let zeno = r#"{"inputs":[],"outputs":[],
-            "nodes":[{"kind":"recipe","label":"z","consume":[[0,1]],
-                      "produce":[[0,1]],"latency":0}],
-            "wires":[{"from":["node",0,0],"to":["node",0,0]}],
-            "markings":[{"to":["node",0,0],"n":1}]}"#;
-        let (_, _, body) = route(&mut app, "POST", "/api/compile", zeno);
-        assert!(body.contains("zero-latency"), "{body}");
-        // A refusal must not clobber the current factory.
+        let top = format!(
+            r#"{{"inputs":[],"outputs":[],
+            "nodes":[{{"kind":"module","label":"loopy","draft":{sub}}}],
+            "wires":[{{"from":["node",0,0],"to":["node",0,0]}}],
+            "markings":[{{"to":["node",0,0],"n":3}}]}}"#
+        );
+        let (_, _, body) = route(&mut app, "POST", "/api/compile", &top);
+        assert!(body.contains("module boundary"), "{body}");
+        // The demo survives the refusal.
         let (_, _, scene) = route(&mut app, "GET", "/api/scene", "");
-        assert!(scene.contains("gear assembler"));
+        assert!(scene.contains("demand store"));
     }
 }

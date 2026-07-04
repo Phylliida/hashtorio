@@ -215,12 +215,31 @@ degrades as they use more of it.
   headlessly: node drives the real editor functions (simulated port
   clicks) against the live server.
 
-**Beyond M7 (future):** input-regime-parametric summaries (deferred from
-M5); module sealing in the editor (select a subgraph → module with ports —
-the recursion primitive reaching the player's hands); module
-sealing/opening flow (power-down-to-open); recipe/item content and
-progression; WASM build (the kernel is std-only, so this is mostly build
-plumbing).
+- **M8** ✅: module sealing — the recursion primitive in the player's
+  hands. `DraftNode::Module` nests sub-drafts **by value** in the editor
+  (one JSON blob, localStorage-friendly); at compile, sub-drafts intern
+  first, so identical sealed modules dedup to one `NetId` — by-value in the
+  editor, content-addressed in the engine. The GUI gains a select tool and
+  seal/unseal: boundary wires become ports automatically (outer sources →
+  module inputs, interior outputs feeding outside → module outputs),
+  interior wires and markings move inside, and unseal splices everything
+  back. The compiled view is strictly parent-level via
+  `Evaluator::evaluate_detailed`: a sealed module renders as one node with
+  port flows and *null* interior occupancy — the interior isn't hidden by
+  the renderer, it is absent from the data, because the evaluator answered
+  from the module's memoized summary. The abstraction boundary is real,
+  not cosmetic. Cycles crossing a module boundary refuse kindly ("seal the
+  whole loop inside, or keep it outside") — a GUI-view restriction, not an
+  engine one (the engine flattens such cycles fine); lifting it means
+  instrumenting flatten with an index correspondence. The demo now ships
+  with its demand store sealed, and a regression test pins that sealing
+  preserved every rate.
+
+**Beyond M8 (future):** enter-a-module editing (edit interiors in place
+instead of unseal/reseal); input-regime-parametric summaries (deferred
+from M5); module opening flow during *play* (power-down-to-open);
+recipe/item content and progression; WASM build (the kernel is std-only,
+so this is mostly build plumbing).
 
 ## Implementation decisions
 
