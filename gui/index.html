@@ -161,6 +161,28 @@ window.addEventListener('resize', resize);
 // shared geometry
 // ---------------------------------------------------------------------------
 const NODE_W = 150;
+const GRID = 24;             // px per grid cell; positions snap to this
+const BELT_SPEED = 2;        // grid cells per tick along wires
+// Machine footprints in grid cells (chassis bounding boxes).
+const FOOT = { weld:[2,3], rot:[2,2], split:[3,2], belt:[2,1],
+               recipe:[2,2], priority:[3,3], module:[3,3] };
+const footOf = n => FOOT[n.kind] || [2,2];
+const toGrid = p => [Math.round(p.x / GRID), Math.round(p.y / GRID)];
+// Port cells mirror the server: out at (x+w, y+leg), in at (x-1, y+leg).
+function wireLatencyPreview(from, to) {
+  const og = ep => {
+    if (ep[0] === 'in') { const g = toGrid(E.pos.inputs[ep[1]]); return [g[0]+1, g[1]]; }
+    const g = toGrid(E.pos.nodes[ep[1]]);
+    return [g[0] + footOf(E.draft.nodes[ep[1]])[0], g[1] + ep[2]];
+  };
+  const ig = ep => {
+    if (ep[0] === 'out') { const g = toGrid(E.pos.outputs[ep[1]]); return [g[0]-1, g[1]]; }
+    const g = toGrid(E.pos.nodes[ep[1]]);
+    return [g[0] - 1, g[1] + ep[2]];
+  };
+  const a = og(from), b = ig(to);
+  return Math.floor((Math.abs(a[0]-b[0]) + Math.abs(a[1]-b[1])) / BELT_SPEED);
+}
 const legsIn = n => n.kind === 'recipe' ? n.consume.map(c => c[0])
   : n.kind === 'priority' ? [n.item, n.token]
   : n.kind === 'module' ? n.draft.inputs.map(i => i.ty)
@@ -298,21 +320,38 @@ function draw() {
   sc.edges.forEach((e, i) => {
     const p = wirePath(S.pos, sc.nodes, e.from, e.to);
     strokePath(p, tyColor(e.ty) + '44', 2);
-    if (nxt) {
+    const lat = sc.lats ? sc.lats[i] : 0;
+    const cells = tyCells(e.ty);
+    const drawItem = q => {
+      if (cells && cells.length > 1) drawThumb(cells, q.x, q.y, 3);
+      else {
+        ctx.fillStyle = tyColor(e.ty);
+        ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, 7); ctx.fill();
+      }
+    };
+    if (lat > 0 && cur) {
+      // Items physically in transit, spread along the wire and drifting.
+      const transit = cur.transit ? cur.transit[i] : 0;
+      const dots = Math.min(transit, 8);
+      for (let j = 0; j < dots; j++) {
+        drawItem(pointAt(p, ((j + phase) % dots) / dots * 0.9 + 0.05));
+      }
+      if (transit > 8) {
+        const q = pointAt(p, 0.5);
+        ctx.fillStyle = '#fff'; ctx.font = 'bold 11px system-ui';
+        ctx.fillText('×' + transit, q.x + 6, q.y - 6);
+      }
+      const mid = pointAt(p, 0.5);
+      ctx.fillStyle = '#5d6875'; ctx.font = '9.5px system-ui';
+      ctx.fillText(lat + 't', mid.x - 6, mid.y + 12);
+    } else if (nxt) {
       const flow = nxt.flow[i];
       if (flow > 0) {
         const dots = Math.min(flow, 6);
-        const cells = tyCells(e.ty);
         for (let j = 0; j < dots; j++) {
           const s = phase - j * 0.07;
           if (s < 0 || s > 1) continue;
-          const q = pointAt(p, s);
-          if (cells && cells.length > 1) {
-            drawThumb(cells, q.x, q.y, 3);
-          } else {
-            ctx.fillStyle = tyColor(e.ty);
-            ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, 7); ctx.fill();
-          }
+          drawItem(pointAt(p, s));
         }
         if (flow > 6) {
           const q = pointAt(p, Math.min(Math.max(phase, 0.05), 0.95));
@@ -413,7 +452,8 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
 function freeSpot() {
   const k = E.draft.nodes.length + E.draft.inputs.length + E.draft.outputs.length;
-  return { x: 200 + (k % 4) * 200, y: 80 + ((k * 131) % 420) };
+  const x = 192 + (k % 4) * 192, y = 72 + ((k * 120) % 408);
+  return { x: Math.round(x / GRID) * GRID, y: Math.round(y / GRID) * GRID };
 }
 function saveDraft() {
   try {
@@ -538,6 +578,8 @@ function sceneToDraft() {
   E.sel.clear();
   saveDraft();
 }
+// Keep sub-draft positions when sealing/round-tripping (used by convertSub).
+
 
 // ---- sealing ----------------------------------------------------------------
 // Collapse the selected nodes into one module. Boundary wires become ports:
@@ -701,7 +743,12 @@ function parseGate(text) {
 
 // ---- compile ---------------------------------------------------------------
 async function compileDraft() {
-  const body = JSON.stringify(E.draft);
+  const payload = Object.assign({}, E.draft, { pos: {
+    inputs: E.pos.inputs.map(toGrid),
+    nodes: E.pos.nodes.map(toGrid),
+    outputs: E.pos.outputs.map(toGrid),
+  }});
+  const body = JSON.stringify(payload);
   const r = await (await fetch('/api/compile', {
     method:'POST', headers:{ 'Content-Type':'application/json' }, body,
   })).json();
@@ -717,7 +764,14 @@ async function compileDraft() {
 function applyScene(scene, customPos) {
   S.scene = scene; TYPES = scene.types;
   S.frames.clear(); S.fetching.clear(); S.t = 0;
-  S.customPos = customPos || null;
+  if (scene.pos && scene.pos.nodes.length === scene.nodes.length
+      && (scene.pos.nodes.length + scene.pos.inputs.length) > 0) {
+    const px = ps => ps.map(([x, y]) => ({ x: x * GRID, y: y * GRID }));
+    S.customPos = { inputs: px(scene.pos.inputs), nodes: px(scene.pos.nodes),
+                    outputs: px(scene.pos.outputs) };
+  } else {
+    S.customPos = customPos || null;
+  }
   layout(); fillPanel(); ensure(0);
 }
 
@@ -805,7 +859,14 @@ cv.addEventListener('mousemove', e => {
     E.drag.arr[E.drag.idx].y = e.offsetY + E.drag.dy;
   }
 });
-window.addEventListener('mouseup', () => { if (E.drag) { E.drag = null; saveDraft(); } });
+window.addEventListener('mouseup', () => {
+  if (E.drag) {
+    const p = E.drag.arr[E.drag.idx];
+    p.x = Math.round(p.x / GRID) * GRID;
+    p.y = Math.round(p.y / GRID) * GRID;
+    E.drag = null; saveDraft();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // edit mode: drawing
@@ -814,12 +875,18 @@ function drawEdit() {
   const W = cv.getBoundingClientRect().width, H = cv.getBoundingClientRect().height;
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = '#1a1e25';
-  for (let gx = 20; gx < W; gx += 28)
-    for (let gy = 20; gy < H; gy += 28) ctx.fillRect(gx, gy, 1.5, 1.5);
+  for (let gx = 0; gx < W; gx += GRID)
+    for (let gy = 0; gy < H; gy += GRID) ctx.fillRect(gx, gy, 1.5, 1.5);
 
   E.draft.wires.forEach((w, i) => {
     const p = editWirePath(w);
     strokePath(p, tyColor(sinkType(w.to)) + '88', 2);
+    const lat = wireLatencyPreview(w.from, w.to);
+    if (lat > 0) {
+      const mid = pointAt(p, 0.5);
+      ctx.fillStyle = '#5d6875'; ctx.font = '9.5px system-ui';
+      ctx.fillText(lat + 't', mid.x - 6, mid.y + 12);
+    }
     if (E.tool === 'del') {
       const mid = pointAt(p, 0.5);
       ctx.fillStyle = '#e05e78';
@@ -849,6 +916,12 @@ function drawEdit() {
 
   E.draft.nodes.forEach((node, n) => {
     const p = withSize(E.pos.nodes[n], node);
+    // The chassis footprint: the machine's real extent on the grid.
+    const [fw, fh] = footOf(node);
+    ctx.strokeStyle = '#39414f88'; ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.strokeRect(p.x, p.y, fw * GRID, fh * GRID);
+    ctx.setLineDash([]);
     roundRect(p.x, p.y, p.w, p.h, 9);
     ctx.fillStyle = node.kind === 'priority' ? '#2b2433'
       : node.kind === 'module' ? '#1f2a33' : '#232a35';
