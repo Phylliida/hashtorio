@@ -39,12 +39,22 @@ pub enum DraftNode {
         item: ItemType,
         token: ItemType,
     },
+    /// A sealed sub-factory, nested **by value**: the editor's whole
+    /// document stays one blob. At compile time the sub-draft interns
+    /// first, so two identical sealed modules dedup to the same `NetId` —
+    /// by-value in the editor, content-addressed in the engine.
+    Module {
+        label: String,
+        draft: Box<Draft>,
+    },
 }
 
 impl DraftNode {
     pub fn label(&self) -> &str {
         match self {
-            DraftNode::Recipe { label, .. } | DraftNode::Priority { label, .. } => label,
+            DraftNode::Recipe { label, .. }
+            | DraftNode::Priority { label, .. }
+            | DraftNode::Module { label, .. } => label,
         }
     }
 
@@ -52,6 +62,7 @@ impl DraftNode {
         match self {
             DraftNode::Recipe { consume, .. } => consume.iter().map(|&(t, _)| t).collect(),
             DraftNode::Priority { item, token, .. } => vec![*item, *token],
+            DraftNode::Module { draft, .. } => draft.inputs.iter().map(|i| i.ty).collect(),
         }
     }
 
@@ -59,6 +70,7 @@ impl DraftNode {
         match self {
             DraftNode::Recipe { produce, .. } => produce.iter().map(|&(t, _)| t).collect(),
             DraftNode::Priority { item, .. } => vec![*item, *item],
+            DraftNode::Module { draft, .. } => draft.outputs.iter().map(|o| o.ty).collect(),
         }
     }
 }
@@ -153,12 +165,25 @@ impl Draft {
     /// Compile: build, intern, and return the net plus its input flows.
     pub fn build(&self, lib: &mut Library) -> Result<(NetId, Vec<Counting>), String> {
         self.check()?;
+        // Phase one: intern every sealed sub-factory (recursively). Two
+        // identical modules come back as the same NetId.
+        let mut module_ids: Vec<Option<NetId>> = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            module_ids.push(match node {
+                DraftNode::Module { label, draft } => Some(
+                    draft
+                        .build(lib)
+                        .map_err(|e| format!("in module '{label}': {e}"))?
+                        .0,
+                ),
+                _ => None,
+            });
+        }
         let mut b = NetBuilder::new();
         let ins: Vec<_> = self.inputs.iter().map(|i| b.input(i.ty)).collect();
-        let handles: Vec<_> = self
-            .nodes
-            .iter()
-            .map(|node| match node {
+        let mut handles = Vec::with_capacity(self.nodes.len());
+        for (n, node) in self.nodes.iter().enumerate() {
+            handles.push(match node {
                 DraftNode::Recipe { consume, produce, latency, .. } => {
                     let in_tys: Vec<ItemType> = consume.iter().map(|&(t, _)| t).collect();
                     let out_tys: Vec<ItemType> = produce.iter().map(|&(t, _)| t).collect();
@@ -173,8 +198,11 @@ impl Draft {
                     )
                 }
                 DraftNode::Priority { item, token, .. } => b.priority(*item, *token),
-            })
-            .collect();
+                DraftNode::Module { .. } => {
+                    b.module(lib, module_ids[n].expect("phase one filled this"))
+                }
+            });
+        }
         let outs: Vec<_> = self.outputs.iter().map(|o| b.output(o.ty)).collect();
 
         for (from, to) in &self.wires {

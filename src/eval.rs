@@ -38,6 +38,9 @@ pub enum EvalError {
     RateExplosion,
     /// No ultimately periodic steady state found within the horizon.
     NoPeriodicSteadyState { horizon: u64 },
+    /// A feedback cycle crosses a module boundary (only reported by
+    /// [`Evaluator::evaluate_detailed`]; plain evaluation flattens instead).
+    CycleThroughModule,
 }
 
 impl std::fmt::Display for EvalError {
@@ -72,6 +75,16 @@ struct NetRun {
 enum Flow {
     Done(NetRun),
     NeedsFlatten,
+}
+
+/// Per-node detail at one net level (modules opaque). What a GUI needs to
+/// animate a factory without piercing its abstraction boundaries.
+pub struct NetDetail {
+    pub outputs: Vec<Counting>,
+    /// Output-leg countings per node (modules included).
+    pub node_outs: Vec<Vec<Counting>>,
+    /// Firing maps; `None` for module nodes (their firings are interior).
+    pub firings: Vec<Option<Counting>>,
 }
 
 /// A fully-resolved evaluation of a recipe-only (flattened) net: everything
@@ -128,6 +141,31 @@ impl<'l> Evaluator<'l> {
                     Flow::NeedsFlatten => unreachable!("flattened nets contain no modules"),
                 }
             }
+        }
+    }
+
+    /// Evaluate with per-node detail at THIS net's level: modules stay
+    /// black boxes (memoized summaries), and their output-leg countings are
+    /// reported like any node's. Fails with [`EvalError::CycleThroughModule`]
+    /// if a feedback cycle crosses a module boundary — at that point there
+    /// is no parent-level story to tell; flatten or contain the loop.
+    pub fn evaluate_detailed(
+        &mut self,
+        id: NetId,
+        inputs: &[Counting],
+    ) -> Result<NetDetail, EvalError> {
+        let net = self.lib.get(id).clone();
+        match self.eval_net(&net, inputs)? {
+            Flow::Done(run) => Ok(NetDetail {
+                outputs: run.outputs,
+                node_outs: run
+                    .node_outs
+                    .into_iter()
+                    .map(|o| o.expect("all nodes evaluated"))
+                    .collect(),
+                firings: run.firings,
+            }),
+            Flow::NeedsFlatten => Err(EvalError::CycleThroughModule),
         }
     }
 

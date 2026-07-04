@@ -69,11 +69,15 @@
     <button id="t-wire">wire</button>
     <button id="t-mark">preload</button>
     <button id="t-del">delete</button>
+    <button id="t-sel">select</button>
     <span class="sep"></span>
     <button id="a-src">+ source</button>
     <button id="a-mach">+ machine</button>
     <button id="a-gate">+ gate</button>
     <button id="a-out">+ output</button>
+    <span class="sep"></span>
+    <button id="a-seal">&#9723; seal</button>
+    <button id="a-unseal">unseal</button>
     <span class="sep"></span>
     <button id="a-demo">load current</button>
     <button id="a-clear">clear</button>
@@ -115,7 +119,8 @@ const S = { mode:'run', t:0, playing:true, tps:10, scene:null, frames:new Map(),
             fetching:new Set(), pos:null, customPos:null, last:performance.now() };
 const E = { draft:{ inputs:[], outputs:[], nodes:[], wires:[], markings:[] },
             pos:{ inputs:[], nodes:[], outputs:[] },
-            tool:'move', wireFrom:null, drag:null, mouse:{x:0,y:0} };
+            tool:'move', wireFrom:null, drag:null, mouse:{x:0,y:0},
+            sel:new Set() };
 
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
@@ -131,8 +136,14 @@ window.addEventListener('resize', resize);
 // shared geometry
 // ---------------------------------------------------------------------------
 const NODE_W = 150;
-const legsIn = n => n.kind === 'recipe' ? n.consume.map(c => c[0]) : [n.item, n.token];
-const legsOut = n => n.kind === 'recipe' ? n.produce.map(c => c[0]) : [n.item, n.item];
+const legsIn = n => n.kind === 'recipe' ? n.consume.map(c => c[0])
+  : n.kind === 'priority' ? [n.item, n.token]
+  : n.draft.inputs.map(i => i.ty);
+const legsOut = n => n.kind === 'recipe' ? n.produce.map(c => c[0])
+  : n.kind === 'priority' ? [n.item, n.item]
+  : n.draft.outputs.map(o => o.ty);
+const kindTag = n => n.kind === 'priority' ? 'else-gate'
+  : n.kind === 'module' ? 'sealed module' : 'recipe';
 const nodeH = n =>
   36 + Math.max(legsIn(n).length, legsOut(n).length, 1) * 14 + 4;
 const inPortPos = (p, leg) => ({ x: p.x, y: p.y + 42 + leg * 14 });
@@ -291,18 +302,25 @@ function draw() {
     const p = S.pos.nodes[n];
     const fired = nxt ? nxt.fired[n] : 0;
     roundRect(p.x, p.y, p.w, p.h, 9);
-    ctx.fillStyle = node.kind === 'priority' ? '#2b2433' : '#232a35';
+    ctx.fillStyle = node.kind === 'priority' ? '#2b2433'
+      : node.kind === 'module' ? '#1f2a33' : '#232a35';
     ctx.fill();
     ctx.lineWidth = fired > 0 ? 2.5 : 1;
     ctx.strokeStyle = fired > 0
       ? `rgba(244,185,66,${0.35 + 0.65 * Math.sin(Math.PI * phase)})`
       : '#39414f';
     ctx.stroke();
+    if (node.kind === 'module') {
+      // Double border: the seal made visible.
+      roundRect(p.x + 3, p.y + 3, p.w - 6, p.h - 6, 6);
+      ctx.strokeStyle = '#8fd3ff55'; ctx.lineWidth = 1; ctx.stroke();
+    }
     ctx.fillStyle = '#e6edf3'; ctx.font = '12px system-ui';
     ctx.fillText(node.label, p.x + 9, p.y + 15);
-    ctx.fillStyle = node.kind === 'priority' ? '#c792ea' : '#7d8a99';
+    ctx.fillStyle = node.kind === 'priority' ? '#c792ea'
+      : node.kind === 'module' ? '#8fd3ff' : '#7d8a99';
     ctx.font = '10px system-ui';
-    ctx.fillText(node.kind === 'priority' ? 'else-gate' : 'recipe', p.x + 9, p.y + 27);
+    ctx.fillText(kindTag(node), p.x + 9, p.y + 27);
     if (fired > 0) {
       ctx.fillStyle = '#f4b942'; ctx.textAlign = 'right';
       ctx.fillText('⚙×' + fired, p.x + p.w - 8, p.y + 15);
@@ -311,6 +329,11 @@ function draw() {
     if (cur) node.legs.forEach((ty, l) => {
       const occ = cur.occ[n][l];
       const q = inPortPos(p, l);
+      if (occ === null) {
+        ctx.font = '9.5px system-ui'; ctx.fillStyle = '#5d6875';
+        ctx.fillText(`${tyName(ty)} ▸ sealed`, p.x + 8, q.y + 4);
+        return;
+      }
       ctx.fillStyle = tyColor(ty) + '33';
       ctx.fillRect(p.x + 8, q.y - 4, 76, 8);
       ctx.fillStyle = tyColor(ty);
@@ -436,15 +459,29 @@ function draftClear() {
   saveDraft();
 }
 
+function convertNode(n) {
+  if (n.kind === 'recipe')
+    return { kind:'recipe', label:n.label, consume:n.consume.map(x => x.slice()),
+             produce:n.produce.map(x => x.slice()), latency:n.latency };
+  if (n.kind === 'priority')
+    return { kind:'priority', label:n.label, item:n.item, token:n.token };
+  return { kind:'module', label:n.label, draft: convertSub(n.draft) };
+}
+function convertSub(d) {
+  return {
+    inputs: d.inputs.map(i => ({ ty:i.ty, rate:i.rate.slice(), label:i.label })),
+    outputs: d.outputs.map(o => ({ ty:o.ty, label:o.label })),
+    nodes: d.nodes.map(convertNode),
+    wires: d.wires.map(w => ({ from:w.from.slice(), to:w.to.slice() })),
+    markings: d.markings.map(m => ({ to:m.to.slice(), n:m.n })),
+  };
+}
 function sceneToDraft() {
   const sc = S.scene;
   E.draft = {
     inputs: sc.inputs.map(i => ({ ty:i.ty, rate:i.rate.slice(), label:i.label })),
     outputs: sc.outputs.map(o => ({ ty:o.ty, label:o.label })),
-    nodes: sc.nodes.map(n => n.kind === 'recipe'
-      ? { kind:'recipe', label:n.label, consume:n.consume.map(x => x.slice()),
-          produce:n.produce.map(x => x.slice()), latency:n.latency }
-      : { kind:'priority', label:n.label, item:n.item, token:n.token }),
+    nodes: sc.nodes.map(convertNode),
     wires: sc.edges.map(e => ({ from:e.from.slice(), to:e.to.slice() })),
     markings: [],
   };
@@ -455,6 +492,123 @@ function sceneToDraft() {
     if (o.marking > 0) E.draft.markings.push({ to:['out', i], n:o.marking });
   });
   E.pos = JSON.parse(JSON.stringify(S.pos));
+  E.sel.clear();
+  saveDraft();
+}
+
+// ---- sealing ----------------------------------------------------------------
+// Collapse the selected nodes into one module. Boundary wires become ports:
+// outer sources feed module inputs; interior outputs feeding the outside
+// become module outputs. Wires wholly inside move into the sub-draft.
+function sealSelection(name) {
+  const sel = [...E.sel].sort((a, b) => a - b);
+  if (!sel.length) throw Error('select some nodes first (select tool)');
+  const inSel = i => sel.includes(i);
+  const subIdx = new Map(sel.map((g, j) => [g, j]));
+  const keep = E.draft.nodes.map((_, i) => i).filter(i => !inSel(i));
+  const keepIdx = new Map(keep.map((g, j) => [g, j]));
+  const modIdx = keep.length;
+  const sub = { inputs:[], outputs:[], nodes: sel.map(i => E.draft.nodes[i]),
+                wires:[], markings:[] };
+  const mapFrom = f => f[0] === 'node' ? ['node', keepIdx.get(f[1]), f[2]] : f;
+  const mapTo = t => t[0] === 'node' ? ['node', keepIdx.get(t[1]), t[2]] : t;
+  const newWires = [], newMarkings = [];
+  for (const w of E.draft.wires) {
+    const fIn = w.from[0] === 'node' && inSel(w.from[1]);
+    const tIn = w.to[0] === 'node' && inSel(w.to[1]);
+    if (fIn && tIn) {
+      sub.wires.push({ from:['node', subIdx.get(w.from[1]), w.from[2]],
+                       to:['node', subIdx.get(w.to[1]), w.to[2]] });
+    } else if (tIn) {
+      const ty = sinkType(w.to);
+      const p = sub.inputs.length;
+      sub.inputs.push({ ty, rate:[1, 1], label:'in ' + tyName(ty) });
+      sub.wires.push({ from:['in', p], to:['node', subIdx.get(w.to[1]), w.to[2]] });
+      newWires.push({ from: mapFrom(w.from), to:['node', modIdx, p] });
+    } else if (fIn) {
+      const ty = fromType(w.from);
+      const q = sub.outputs.length;
+      sub.outputs.push({ ty, label:'out ' + tyName(ty) });
+      sub.wires.push({ from:['node', subIdx.get(w.from[1]), w.from[2]], to:['out', q] });
+      newWires.push({ from:['node', modIdx, q], to: mapTo(w.to) });
+    } else {
+      newWires.push({ from: mapFrom(w.from), to: mapTo(w.to) });
+    }
+  }
+  for (const m of E.draft.markings) {
+    if (m.to[0] === 'node' && inSel(m.to[1]))
+      sub.markings.push({ to:['node', subIdx.get(m.to[1]), m.to[2]], n:m.n });
+    else newMarkings.push({ to: mapTo(m.to), n:m.n });
+  }
+  const cx = sel.reduce((s, i) => s + E.pos.nodes[i].x, 0) / sel.length;
+  const cy = sel.reduce((s, i) => s + E.pos.nodes[i].y, 0) / sel.length;
+  E.pos.nodes = keep.map(i => E.pos.nodes[i]).concat([{ x: cx, y: cy }]);
+  E.draft.nodes = keep.map(i => E.draft.nodes[i])
+    .concat([{ kind:'module', label:name, draft:sub }]);
+  E.draft.wires = newWires;
+  E.draft.markings = newMarkings;
+  E.sel.clear();
+  saveDraft();
+}
+
+// Splice a module's contents back into the parent.
+function unsealModule(idx) {
+  const mod = E.draft.nodes[idx];
+  if (!mod || mod.kind !== 'module') throw Error('select a single module to unseal');
+  const sub = mod.draft;
+  const keep = E.draft.nodes.map((_, i) => i).filter(i => i !== idx);
+  const keepIdx = new Map(keep.map((g, j) => [g, j]));
+  const subBase = keep.length;
+  const mapOld = ep => ep[0] === 'node' && ep[1] !== idx
+    ? ['node', keepIdx.get(ep[1]), ep[2]] : ep;
+  const mapSub = ep => ['node', subBase + ep[1], ep[2]];
+  // Resolve a parent-side endpoint that touches the module through its ports.
+  const resolveFrom = f => {
+    if (f[0] === 'node' && f[1] === idx) {
+      const w = sub.wires.find(w => w.to[0] === 'out' && w.to[1] === f[2]);
+      return w && w.from[0] === 'node' ? mapSub(w.from) : null; // port fed by sub input: degenerate, drop
+    }
+    return mapOld(f);
+  };
+  const sinkOfPort = p => {
+    const w = sub.wires.find(w => w.from[0] === 'in' && w.from[1] === p);
+    return w && w.to[0] === 'node' ? mapSub(w.to) : null;
+  };
+  const newWires = [], newMarkings = [];
+  for (const w of E.draft.wires) {
+    const from = resolveFrom(w.from);
+    if (from === null) continue;
+    if (w.to[0] === 'node' && w.to[1] === idx) {
+      const to = sinkOfPort(w.to[2]);
+      if (to === null) continue; // port unconnected inside: dangling
+      newWires.push({ from, to });
+    } else {
+      newWires.push({ from, to: mapOld(w.to) });
+    }
+  }
+  for (const w of sub.wires) {
+    if (w.from[0] === 'node' && w.to[0] === 'node')
+      newWires.push({ from: mapSub(w.from), to: mapSub(w.to) });
+  }
+  for (const m of E.draft.markings) {
+    if (m.to[0] === 'node' && m.to[1] === idx) {
+      const to = sinkOfPort(m.to[2]);
+      if (to !== null) newMarkings.push({ to, n:m.n });
+    } else newMarkings.push({ to: mapOld(m.to), n:m.n });
+  }
+  for (const m of sub.markings) {
+    if (m.to[0] === 'node') newMarkings.push({ to: mapSub(m.to), n:m.n });
+  }
+  const base = E.pos.nodes[idx];
+  const newPos = keep.map(i => E.pos.nodes[i]);
+  sub.nodes.forEach((_, j) => newPos.push({
+    x: base.x + (j % 3) * 180 - 90, y: base.y + Math.floor(j / 3) * 110 - 40,
+  }));
+  E.draft.nodes = keep.map(i => E.draft.nodes[i]).concat(sub.nodes);
+  E.pos.nodes = newPos;
+  E.draft.wires = newWires;
+  E.draft.markings = newMarkings;
+  E.sel.clear();
   saveDraft();
 }
 
@@ -586,9 +740,14 @@ function editorDown(x, y) {
     } else if (E.tool === 'del') {
       if (!hit) return;
       if (hit.kind === 'wire') draftDeleteWire(hit.idx);
-      else if (hit.kind === 'node') draftDelete('node', hit.idx);
+      else if (hit.kind === 'node') { draftDelete('node', hit.idx); E.sel.clear(); }
       else if (hit.kind === 'input') draftDelete('input', hit.idx);
       else if (hit.kind === 'output') draftDelete('output', hit.idx);
+    } else if (E.tool === 'sel') {
+      if (hit && hit.kind === 'node') {
+        if (E.sel.has(hit.idx)) E.sel.delete(hit.idx);
+        else E.sel.add(hit.idx);
+      }
     }
   } catch (err) { toast(err.message, true); E.wireFrom = null; }
 }
@@ -648,14 +807,22 @@ function drawEdit() {
   E.draft.nodes.forEach((node, n) => {
     const p = withSize(E.pos.nodes[n], node);
     roundRect(p.x, p.y, p.w, p.h, 9);
-    ctx.fillStyle = node.kind === 'priority' ? '#2b2433' : '#232a35';
+    ctx.fillStyle = node.kind === 'priority' ? '#2b2433'
+      : node.kind === 'module' ? '#1f2a33' : '#232a35';
     ctx.fill();
-    ctx.strokeStyle = '#4a5566'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.strokeStyle = E.sel.has(n) ? '#8fd3ff' : '#4a5566';
+    ctx.lineWidth = E.sel.has(n) ? 2.5 : 1;
+    ctx.stroke();
+    if (node.kind === 'module') {
+      roundRect(p.x + 3, p.y + 3, p.w - 6, p.h - 6, 6);
+      ctx.strokeStyle = '#8fd3ff55'; ctx.lineWidth = 1; ctx.stroke();
+    }
     ctx.fillStyle = '#e6edf3'; ctx.font = '12px system-ui';
     ctx.fillText(node.label.slice(0, 22), p.x + 9, p.y + 15);
-    ctx.fillStyle = node.kind === 'priority' ? '#c792ea' : '#7d8a99';
+    ctx.fillStyle = node.kind === 'priority' ? '#c792ea'
+      : node.kind === 'module' ? '#8fd3ff' : '#7d8a99';
     ctx.font = '10px system-ui';
-    ctx.fillText(node.kind === 'priority' ? 'else-gate' : 'recipe', p.x + 9, p.y + 27);
+    ctx.fillText(kindTag(node), p.x + 9, p.y + 27);
     legsIn(node).forEach((ty, l) => {
       const q = inPortPos(p, l);
       port(q, ty);
@@ -685,6 +852,7 @@ function drawEdit() {
                      : 'wire: click an output port to start a wire',
     mark: 'preload: click an input port to set initial items',
     del: 'delete: click a node, source, output, or wire ×',
+    sel: `select: click nodes to toggle (${E.sel.size} selected) — then seal`,
   };
   ctx.fillText(hints[E.tool], 16, H - 14);
 }
@@ -717,9 +885,8 @@ function setMode(m) {
 
 function setTool(t) {
   E.tool = t; E.wireFrom = null;
-  for (const id of ['move', 'wire', 'mark', 'del']) {
-    document.getElementById('t-' + id).classList.toggle('on',
-      id === (t === 'mark' ? 'mark' : t));
+  for (const id of ['move', 'wire', 'mark', 'del', 'sel']) {
+    document.getElementById('t-' + id).classList.toggle('on', id === t);
   }
 }
 
@@ -782,6 +949,24 @@ document.getElementById('t-move').onclick = () => setTool('move');
 document.getElementById('t-wire').onclick = () => setTool('wire');
 document.getElementById('t-mark').onclick = () => setTool('mark');
 document.getElementById('t-del').onclick = () => setTool('del');
+document.getElementById('t-sel').onclick = () => setTool('sel');
+document.getElementById('a-seal').onclick = () => {
+  try {
+    if (!E.sel.size) throw Error('select some nodes first (select tool)');
+    const name = prompt('module name:', 'my module');
+    if (name === null) return;
+    sealSelection(name);
+    toast('sealed — its loops are now interior; compile to see the summary');
+  } catch (err) { toast(err.message, true); }
+};
+document.getElementById('a-unseal').onclick = () => {
+  try {
+    const sel = [...E.sel];
+    if (sel.length !== 1) throw Error('select exactly one module to unseal');
+    unsealModule(sel[0]);
+    toast('unsealed');
+  } catch (err) { toast(err.message, true); }
+};
 document.getElementById('a-src').onclick = () => {
   const v = prompt('source — item and rate:', 'iron 1/1');
   if (v === null) return;

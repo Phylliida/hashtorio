@@ -23,7 +23,37 @@ fn main() {
 
     let type_names: Vec<(hashtorio::net::ItemType, &str)> =
         draft.types.iter().map(|(t, n)| (*t, n.as_str())).collect();
-    let node_labels = draft.nodes.iter().map(|n| n.label().to_string()).collect();
+    // The terminal view renders the FLATTENED net (the demo contains a
+    // sealed module), so label nodes by their own shape.
+    let tn = |ty: hashtorio::net::ItemType| {
+        draft.type_name(ty).to_string()
+    };
+    let node_labels: Vec<String> = trace
+        .net
+        .nodes
+        .iter()
+        .map(|node| match node {
+            hashtorio::net::Node::Recipe { recipe, in_types, out_types } => {
+                let side = |tys: &[hashtorio::net::ItemType], amts: &[u64]| {
+                    tys.iter()
+                        .zip(amts)
+                        .map(|(t, a)| format!("{a} {}", tn(*t)))
+                        .collect::<Vec<_>>()
+                        .join("+")
+                };
+                format!(
+                    "{}>{} @{}",
+                    side(in_types, &recipe.consume),
+                    side(out_types, &recipe.produce),
+                    recipe.latency
+                )
+            }
+            hashtorio::net::Node::Priority { item, token } => {
+                format!("if {} else... ({})", tn(*token), tn(*item))
+            }
+            hashtorio::net::Node::Module(_) => "module".into(),
+        })
+        .collect();
     let out_labels = draft.outputs.iter().map(|o| o.label.clone()).collect();
     let scene = Scene::new(&lib, trace, node_labels, out_labels, &type_names);
 
