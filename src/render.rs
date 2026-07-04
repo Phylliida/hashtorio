@@ -20,6 +20,26 @@ use crate::counting::Counting;
 use crate::eval::Trace;
 use crate::net::{ItemType, Library, Node};
 
+/// A drawable connection: one (source endpoint, sink endpoint) pair. Wires
+/// with several sources become several edges.
+#[derive(Debug, Clone, Copy)]
+pub enum EdgeFrom {
+    Input(usize),
+    Node { node: usize, leg: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EdgeTo {
+    Node { node: usize, leg: usize },
+    Output(usize),
+}
+
+pub struct Edge {
+    pub from: EdgeFrom,
+    pub to: EdgeTo,
+    pub ty: ItemType,
+}
+
 pub struct Scene {
     trace: Trace,
     labels: Vec<String>,
@@ -30,6 +50,9 @@ pub struct Scene {
     supplies: Vec<Vec<Counting>>,
     /// Per node, per input leg: the leg's consumption counting map.
     consumed: Vec<Vec<Counting>>,
+    edges: Vec<Edge>,
+    /// Per edge: the source endpoint's counting map (for flow animation).
+    edge_countings: Vec<Counting>,
 }
 
 impl Scene {
@@ -82,6 +105,44 @@ impl Scene {
                 Node::Module(_) => unreachable!("scenes render flattened nets"),
             });
         }
+        // Drawable edges: one per (source, sink) pair, node legs then outputs.
+        let mut edges = Vec::new();
+        let mut edge_countings = Vec::new();
+        {
+            let mut push_edges = |sources: &[crate::net::Source], to: EdgeTo, ty: ItemType| {
+                for src in sources {
+                    let (from, counting) = match src {
+                        crate::net::Source::Input(i) => (
+                            EdgeFrom::Input(*i as usize),
+                            trace.inputs[*i as usize].clone(),
+                        ),
+                        crate::net::Source::NodeOut { node, leg } => (
+                            EdgeFrom::Node { node: *node as usize, leg: *leg as usize },
+                            trace.node_outs[*node as usize][*leg as usize].clone(),
+                        ),
+                    };
+                    edges.push(Edge { from, to, ty });
+                    edge_countings.push(counting);
+                }
+            };
+            for (n, tys) in in_types.iter().enumerate() {
+                for (l, &ty) in tys.iter().enumerate() {
+                    push_edges(
+                        &trace.net.wires[layout.node_input_wire(n, l)].sources,
+                        EdgeTo::Node { node: n, leg: l },
+                        ty,
+                    );
+                }
+            }
+            for (o, &ty) in trace.net.outputs.iter().enumerate() {
+                push_edges(
+                    &trace.net.wires[layout.output_wire(o)].sources,
+                    EdgeTo::Output(o),
+                    ty,
+                );
+            }
+        }
+
         Scene {
             trace,
             labels,
@@ -93,7 +154,56 @@ impl Scene {
             in_types,
             supplies,
             consumed,
+            edges,
+            edge_countings,
         }
+    }
+
+    pub fn edges(&self) -> &[Edge] {
+        &self.edges
+    }
+
+    /// Items crossing edge `i` at exactly tick `t`.
+    pub fn edge_flow(&self, i: usize, t: u64) -> u64 {
+        let c = &self.edge_countings[i];
+        c.eval(t) - if t == 0 { 0 } else { c.eval(t - 1) }
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.labels.len()
+    }
+
+    pub fn node_label(&self, n: usize) -> &str {
+        &self.labels[n]
+    }
+
+    pub fn node_kind(&self, n: usize) -> &'static str {
+        match &self.trace.net.nodes[n] {
+            Node::Recipe { .. } => "recipe",
+            Node::Priority { .. } => "priority",
+            Node::Module(_) => "module",
+        }
+    }
+
+    pub fn node_in_type_names(&self, n: usize) -> Vec<&str> {
+        self.in_types[n].iter().map(|&ty| self.type_name(ty)).collect()
+    }
+
+    pub fn output_count(&self) -> usize {
+        self.out_labels.len()
+    }
+
+    pub fn output_label(&self, o: usize) -> &str {
+        &self.out_labels[o]
+    }
+
+    pub fn input_count(&self) -> usize {
+        self.trace.inputs.len()
+    }
+
+    /// Public type-name lookup (also used by the GUI server).
+    pub fn type_label(&self, ty: ItemType) -> &str {
+        self.type_name(ty)
     }
 
     /// Items queued on the wire feeding node `n`, leg `l`, at tick `t`.
