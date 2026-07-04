@@ -86,10 +86,14 @@ footprints (placement collision is the same check as welding), and wires
 carry items across real distance — latency IS geometry, so moving machines
 apart genuinely slows the line, and every feedback loop has physical
 extent. And it has an **economy**: a machine is a chassis structure you
-own; blueprints cost the machines they place; watching and warping are
-free but **harvesting** commits tick budget and banks the line's output —
-exactly, as an O(1) eval difference. Manufacture welder chassis to own
-more welders: the factory that builds factories is the game loop itself.
+own; blueprints cost the machines they place, wires cost a belt segment
+per tick of latency, and preloads consume real items at every retool.
+Watching and warping are free but **harvesting** commits tick budget and
+banks the line's output — exactly, as an O(1) eval difference. Manufacture
+welder chassis to own more welders: the factory that builds factories is
+the game loop itself. Progress persists in `hashtorio_save.json` across
+restarts. Double-click a module in the editor to step inside and edit its
+interior in place — every nesting level has its own space.
 
 And it **builds structures, not numbers**: item types are 2D shapes
 (hash-consed cell-sets — structure lives in the type, so the caching

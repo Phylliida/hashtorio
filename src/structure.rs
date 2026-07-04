@@ -101,6 +101,21 @@ impl StructLib {
         self.intern(cells, Some(name.to_string()))
     }
 
+    /// Intern with an optional name — used when replaying a saved library
+    /// so that structure ids are stable across restarts.
+    pub fn intern_raw(
+        &mut self,
+        cells: Vec<Cell>,
+        name: Option<String>,
+    ) -> Result<ItemType, String> {
+        self.intern(cells, name)
+    }
+
+    /// The stored name, if any (None for anonymous constructed shapes).
+    pub fn raw_name(&self, ty: ItemType) -> Option<&str> {
+        self.names[ty.0 as usize].as_deref()
+    }
+
     pub fn contains(&self, ty: ItemType) -> bool {
         (ty.0 as usize) < self.shapes.len()
     }

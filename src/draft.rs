@@ -424,6 +424,44 @@ impl Draft {
         }
     }
 
+    /// What this blueprint costs, recursively through module interiors:
+    /// machines (one chassis each), belts (one segment per tick of wire
+    /// latency — a belt chassis is two cells long, and BELT_SPEED is two
+    /// cells per tick), and markings (real items preloaded onto the line).
+    /// Machines and belts are capital (need <= own); markings are consumed.
+    pub fn cost(&self, structs: &mut StructLib) -> Result<CostReport, String> {
+        let mut report = CostReport::default();
+        self.cost_into(structs, &mut report)?;
+        Ok(report)
+    }
+
+    fn cost_into(&self, structs: &mut StructLib, report: &mut CostReport) -> Result<(), String> {
+        for node in &self.nodes {
+            let ty = crate::structure::chassis(structs, kind_str(node));
+            *report.machines.entry(ty).or_insert(0) += 1;
+            if let DraftNode::Module { draft, .. } = node {
+                draft.cost_into(structs, report)?;
+            }
+        }
+        for (from, to) in &self.wires {
+            report.belts += self.wire_latency(structs, from, to);
+        }
+        for (to, n) in &self.markings {
+            let ty = self
+                .sink_type(*to)
+                .ok_or("a marking sits on a missing port")?;
+            if ty == ANY {
+                return Err(
+                    "preloads on builder ports aren't supported — their item type \
+                     depends on wiring; preload a typed port instead"
+                        .into(),
+                );
+            }
+            *report.markings.entry(ty).or_insert(0) += n;
+        }
+        Ok(())
+    }
+
     /// Compile: infer builder types, check footprints, build (inserting a
     /// belt per wire with geometric latency), intern.
     pub fn build(&self, lib: &mut Library, structs: &mut StructLib) -> Result<Built, String> {
@@ -530,6 +568,17 @@ impl Draft {
             .collect();
         Ok(Built { id, flows, node_types, wire_lats })
     }
+}
+
+/// What a blueprint costs to deploy.
+#[derive(Debug, Default)]
+pub struct CostReport {
+    /// Chassis needed per machine kind (capital: need <= own).
+    pub machines: std::collections::HashMap<ItemType, u64>,
+    /// Belt segments needed (capital): one per tick of wire latency.
+    pub belts: u64,
+    /// Items preloaded onto the line (consumed at compile).
+    pub markings: std::collections::HashMap<ItemType, u64>,
 }
 
 /// The result of compiling a draft.
