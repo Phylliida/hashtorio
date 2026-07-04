@@ -259,12 +259,38 @@ degrades as they use more of it.
   GUI renders shapes everywhere: items on wires, output ports, the goal
   panel.
 
-**Beyond M9 (future):** self-hosting economy (machine placement costs
-manufactured chassis — needs a persistence/progression layer);
-enter-a-module editing; input-regime-parametric summaries (deferred from
-M5); factory-space (machines on a grid, belts as geometry, distance =
-latency); richer constructor algebra (materials transmutation rules,
-3D cells); WASM build.
+- **M10** ✅: factory-space — distance is time, chassis are footprints.
+  Drafts carry grid positions (empty = old abstract mode, so nothing prior
+  broke); each wire compiles into an identity belt recipe with latency =
+  Manhattan distance / BELT_SPEED — M9's polymorphic Belt was the missing
+  piece, kernel unchanged again. Machine footprints are the chassis cells;
+  placement collision is the same check as welding. Self-loops necessarily
+  have length, so feedback has physical extent (Zeno = geometry). The demo
+  immediately taught the lesson: its clock's feedback wire gained length,
+  demand slowed, the store diverged, the summarizer refused — space
+  changed game balance and had to be rebalanced. Frames carry per-wire
+  transit (departed − arrived, exact); the GUI strings items physically
+  along wires with latency labels, snapping, footprint outlines.
+- **M11** ✅: the self-hosting economy. The pivotal identity: **a machine
+  IS a chassis structure you own** — no separate machine entity. Inventory
+  is structure counts; compiling checks blueprint cost against it
+  recursively (module interiors included): "not enough weld chassis: this
+  blueprint places 10, you own 3 — manufacture more." The other currency
+  is the **tick budget**: watching and warping stay free (they simulate
+  the blueprint — the whole engine thesis preserved), but **harvest**
+  commits budget and banks output structures at exact eval differences,
+  O(1) in harvested ticks. The factory keeps an internal clock across
+  harvests; recompiling resets it (retooling loses work in progress —
+  redesign has a real price). Meeting the manufacturing goal grants
+  budget, once. The loop closes: harvest chassis → own more welders →
+  place bigger factories → manufacture more chassis. Von Neumann's
+  constructor, with a conservation audit.
+
+**Beyond M11 (future):** enter-a-module editing; input-regime-parametric
+summaries (deferred from M5); belt/wire costs (roads are currently free);
+marking costs; persistence to disk (economy is in-memory per server run);
+richer constructor algebra (transmutation rules, 3D cells); goal ladders
+and progression; WASM build.
 
 ## Implementation decisions
 
