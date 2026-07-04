@@ -15,7 +15,8 @@ fn main() {
     let mut lib = Library::new();
     let mut structs = hashtorio::structure::StructLib::new();
     let draft = demo::draft(&mut structs);
-    let (id, inputs, _) = draft.build(&mut lib, &mut structs).expect("demo draft compiles");
+    let built = draft.build(&mut lib, &mut structs).expect("demo draft compiles");
+    let (id, inputs) = (built.id, built.flows);
 
     let mut ev = Evaluator::new(&lib);
     let summary = ev.summarize(id, &inputs).expect("demo summarizes");

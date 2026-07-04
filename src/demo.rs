@@ -64,6 +64,10 @@ pub fn store_module(item: ItemType) -> Draft {
         (F::Node(1, 0), T::Output(0)),  // granted items leave
         (F::Node(0, 1), T::Output(1)),  // census pulses
     ];
+    // Interior space of the pocket dimension.
+    d.input_pos = vec![(2, 2), (2, 8)];
+    d.node_pos = vec![(6, 2), (12, 2)];
+    d.output_pos = vec![(18, 2), (18, 8)];
     d
 }
 
@@ -92,11 +96,13 @@ pub fn draft(structs: &mut StructLib) -> Draft {
         op: BuildOp::Weld { dx: 0, dy: 2 },
         latency: 2,
     });
+    // In factory-space the clock's feedback wire has physical length
+    // (+1 tick), so recipe latency 1 gives the intended 1/2 period.
     d.nodes.push(DraftNode::Recipe {
         label: "demand clock (1/2)".into(),
         consume: vec![(TOK, 1)],
         produce: vec![(TOK, 1), (DEMAND, 1)],
-        latency: 2,
+        latency: 1,
     });
     d.nodes.push(DraftNode::Module {
         label: "chassis store".into(),
@@ -121,6 +127,17 @@ pub fn draft(structs: &mut StructLib) -> Draft {
         (F::Node(5, 1), T::Output(1)),  // level pulses
     ];
     d.markings = vec![(T::Node(4, 0), 1)];
+    // Factory-space: the layout is semantic — distance is latency.
+    d.input_pos = vec![(2, 6), (2, 10)];
+    d.node_pos = vec![
+        (6, 6),   // welder A
+        (12, 6),  // splitter
+        (18, 2),  // rotator
+        (24, 6),  // welder B
+        (18, 14), // demand clock
+        (31, 6),  // chassis store
+    ];
+    d.output_pos = vec![(38, 6), (38, 12)];
     d
 }
 
@@ -135,7 +152,8 @@ mod tests {
         let mut lib = Library::new();
         let mut structs = StructLib::new();
         let d = draft(&mut structs);
-        let (id, flows, node_types) = d.build(&mut lib, &mut structs).unwrap();
+        let built = d.build(&mut lib, &mut structs).unwrap();
+        let (id, flows, node_types) = (built.id, built.flows, built.node_types);
 
         // Inference found the chassis: welder B's output IS the target.
         let goal = target(&mut structs);
@@ -161,6 +179,7 @@ mod tests {
             label: "spare store".into(),
             draft: Box::new(store_module(goal)),
         });
+        d.node_pos.push((31, 16)); // parked off to the side
         d.build(&mut lib, &mut structs).unwrap();
         assert_eq!(lib.len(), 2, "identical sub-drafts dedup to one NetId");
     }

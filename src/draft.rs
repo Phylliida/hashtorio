@@ -86,6 +86,28 @@ impl BuildOp {
     }
 }
 
+/// The machine kind, as the chassis registry names it.
+pub fn kind_str(node: &DraftNode) -> &'static str {
+    match node {
+        DraftNode::Recipe { .. } => "recipe",
+        DraftNode::Priority { .. } => "priority",
+        DraftNode::Module { .. } => "module",
+        DraftNode::Builder { op: BuildOp::Weld { .. }, .. } => "weld",
+        DraftNode::Builder { op: BuildOp::Rot, .. } => "rot",
+        DraftNode::Builder { op: BuildOp::Split, .. } => "split",
+        DraftNode::Builder { op: BuildOp::Belt, .. } => "belt",
+    }
+}
+
+fn footprint_size(structs: &mut StructLib, node: &DraftNode) -> (i32, i32) {
+    let ch = crate::structure::chassis(structs, kind_str(node));
+    let cells = structs.cells(ch);
+    (
+        cells.iter().map(|c| c.0).max().unwrap_or(0) + 1,
+        cells.iter().map(|c| c.1).max().unwrap_or(0) + 1,
+    )
+}
+
 impl DraftNode {
     pub fn label(&self) -> &str {
         match self {
@@ -129,6 +151,9 @@ pub enum DraftTo {
     Output(usize),
 }
 
+/// Items travel `BELT_SPEED` grid cells per tick along wires.
+pub const BELT_SPEED: i32 = 2;
+
 #[derive(Debug, Clone, Default)]
 pub struct Draft {
     /// The item palette: (id, display name).
@@ -138,6 +163,14 @@ pub struct Draft {
     pub nodes: Vec<DraftNode>,
     pub wires: Vec<(DraftFrom, DraftTo)>,
     pub markings: Vec<(DraftTo, u64)>,
+    /// Factory-space: grid positions, parallel to the lists above. Empty
+    /// means "abstract mode" (no geometry: wires instant, no footprints).
+    /// When present, geometry is *semantic*: wire latency = distance /
+    /// BELT_SPEED, and machine chassis are literal footprints that must
+    /// not overlap.
+    pub input_pos: Vec<(i32, i32)>,
+    pub node_pos: Vec<(i32, i32)>,
+    pub output_pos: Vec<(i32, i32)>,
 }
 
 impl Draft {
@@ -200,6 +233,96 @@ impl Draft {
             if input.rate.1 == 0 {
                 return Err(format!("source '{}' has a zero-tick period", input.label));
             }
+        }
+        if self.spatial()
+            && (self.input_pos.len() != self.inputs.len()
+                || self.node_pos.len() != self.nodes.len()
+                || self.output_pos.len() != self.outputs.len())
+        {
+            return Err("positions out of step with parts (internal editor bug)".into());
+        }
+        Ok(())
+    }
+
+    fn spatial(&self) -> bool {
+        !(self.input_pos.is_empty() && self.node_pos.is_empty() && self.output_pos.is_empty())
+    }
+
+    /// The grid cell where a source endpoint's out-port sits.
+    fn out_port_cell(&self, structs: &mut StructLib, from: &DraftFrom) -> (i32, i32) {
+        match from {
+            DraftFrom::Input(i) => {
+                let p = self.input_pos[*i];
+                (p.0 + 1, p.1)
+            }
+            DraftFrom::Node(n, leg) => {
+                let p = self.node_pos[*n];
+                let (w, _) = footprint_size(structs, &self.nodes[*n]);
+                (p.0 + w, p.1 + *leg as i32)
+            }
+        }
+    }
+
+    /// The grid cell where a sink endpoint's in-port sits.
+    fn in_port_cell(&self, to: &DraftTo) -> (i32, i32) {
+        match to {
+            DraftTo::Node(n, leg) => {
+                let p = self.node_pos[*n];
+                (p.0 - 1, p.1 + *leg as i32)
+            }
+            DraftTo::Output(o) => {
+                let p = self.output_pos[*o];
+                (p.0 - 1, p.1)
+            }
+        }
+    }
+
+    /// Wire latency from geometry: Manhattan distance over belt speed.
+    fn wire_latency(&self, structs: &mut StructLib, from: &DraftFrom, to: &DraftTo) -> u64 {
+        if !self.spatial() {
+            return 0;
+        }
+        let a = self.out_port_cell(structs, from);
+        let b = self.in_port_cell(to);
+        (((a.0 - b.0).abs() + (a.1 - b.1).abs()) / BELT_SPEED) as u64
+    }
+
+    /// Machines are their chassis: footprints must not overlap.
+    fn check_footprints(&self, structs: &mut StructLib) -> Result<(), String> {
+        if !self.spatial() {
+            return Ok(());
+        }
+        let mut occupied: std::collections::HashMap<(i32, i32), String> =
+            std::collections::HashMap::new();
+        let mut claim = |cells: Vec<(i32, i32)>, who: &str| -> Result<(), String> {
+            for c in cells {
+                if let Some(prev) = occupied.insert(c, who.to_string()) {
+                    return Err(format!(
+                        "'{who}' and '{prev}' overlap at ({}, {}) — machines are their \
+                         chassis; give them room",
+                        c.0, c.1
+                    ));
+                }
+            }
+            Ok(())
+        };
+        for (i, input) in self.inputs.iter().enumerate() {
+            let p = self.input_pos[i];
+            claim(vec![p], &input.label)?;
+        }
+        for (n, node) in self.nodes.iter().enumerate() {
+            let p = self.node_pos[n];
+            let ch = crate::structure::chassis(structs, kind_str(node));
+            let cells = structs
+                .cells(ch)
+                .iter()
+                .map(|&(x, y, _)| (p.0 + x, p.1 + y))
+                .collect();
+            claim(cells, node.label())?;
+        }
+        for (o, out) in self.outputs.iter().enumerate() {
+            let p = self.output_pos[o];
+            claim(vec![p, (p.0, p.1 + 1)], &out.label)?;
         }
         Ok(())
     }
@@ -301,15 +424,11 @@ impl Draft {
         }
     }
 
-    /// Compile: infer builder types, build, intern; returns the net, its
-    /// input flows, and every node's concrete (in, out) leg types.
-    #[allow(clippy::type_complexity)]
-    pub fn build(
-        &self,
-        lib: &mut Library,
-        structs: &mut StructLib,
-    ) -> Result<(NetId, Vec<Counting>, Vec<(Vec<ItemType>, Vec<ItemType>)>), String> {
+    /// Compile: infer builder types, check footprints, build (inserting a
+    /// belt per wire with geometric latency), intern.
+    pub fn build(&self, lib: &mut Library, structs: &mut StructLib) -> Result<Built, String> {
         self.check()?;
+        self.check_footprints(structs)?;
         let node_types = self.infer(structs)?;
         // Intern every sealed sub-factory (recursively). Two identical
         // modules come back as the same NetId.
@@ -320,7 +439,7 @@ impl Draft {
                     draft
                         .build(lib, structs)
                         .map_err(|e| format!("in module '{label}': {e}"))?
-                        .0,
+                        .id,
                 ),
                 _ => None,
             });
@@ -362,7 +481,13 @@ impl Draft {
         }
         let outs: Vec<_> = self.outputs.iter().map(|o| b.output(o.ty)).collect();
 
+        // Distance is time: each wire with geometric latency compiles into
+        // an identity belt recipe. Belt nodes are appended after user nodes,
+        // so user indices stay 1:1 with the draft.
+        let mut wire_lats = Vec::with_capacity(self.wires.len());
         for (from, to) in &self.wires {
+            let lat = self.wire_latency(structs, from, to);
+            wire_lats.push(lat);
             let src = match *from {
                 DraftFrom::Input(i) => ins[i],
                 DraftFrom::Node(n, leg) => handles[n].output(leg as u32),
@@ -371,7 +496,17 @@ impl Draft {
                 DraftTo::Node(n, leg) => handles[n].input(leg as u32),
                 DraftTo::Output(o) => outs[o],
             };
-            b.connect(src, sink);
+            if lat == 0 {
+                b.connect(src, sink);
+            } else {
+                let ty = match *from {
+                    DraftFrom::Input(i) => self.inputs[i].ty,
+                    DraftFrom::Node(n, leg) => node_types[n].1[leg],
+                };
+                let belt = b.recipe(Recipe::new(vec![1], vec![1], lat), &[ty], &[ty]);
+                b.connect(src, belt.input(0));
+                b.connect(belt.output(0), sink);
+            }
         }
         for (to, m) in &self.markings {
             let sink = match *to {
@@ -393,8 +528,20 @@ impl Draft {
                 }
             })
             .collect();
-        Ok((id, flows, node_types))
+        Ok(Built { id, flows, node_types, wire_lats })
     }
+}
+
+/// The result of compiling a draft.
+#[derive(Debug)]
+pub struct Built {
+    pub id: NetId,
+    pub flows: Vec<Counting>,
+    /// Concrete (in, out) leg types per draft node (builders resolved).
+    #[allow(clippy::type_complexity)]
+    pub node_types: Vec<(Vec<ItemType>, Vec<ItemType>)>,
+    /// Geometric latency per draft wire (0 = instant/abstract).
+    pub wire_lats: Vec<u64>,
 }
 
 fn friendly_net_error(e: &NetError, draft: &Draft) -> String {
@@ -447,7 +594,8 @@ mod tests {
 
         let mut lib = Library::new();
         let mut structs = crate::structure::StructLib::new();
-        let (id, flows, _) = d.build(&mut lib, &mut structs).unwrap();
+        let built = d.build(&mut lib, &mut structs).unwrap();
+        let (id, flows) = (built.id, built.flows);
         let mut ev = Evaluator::new(&lib);
         let s = ev.summarize(id, &flows).unwrap();
         assert_eq!(s.outputs[0].rate, (1, 2));

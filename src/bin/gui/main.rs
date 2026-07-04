@@ -46,6 +46,10 @@ struct Compiled {
     consumed: Vec<Vec<Option<Counting>>>,
     /// Concrete (in, out) leg types per node, builders resolved.
     node_types: Vec<(Vec<ItemType>, Vec<ItemType>)>,
+    /// Geometric latency per wire; arrivals = departures shifted by it.
+    wire_lats: Vec<u64>,
+    /// Per wire: the arrival counting map at the sink end.
+    arrivals: Vec<Counting>,
     summary: Summary,
     audit: Audit,
 }
@@ -113,7 +117,9 @@ fn compile(
     structs: &mut StructLib,
     draft: Draft,
 ) -> Result<Compiled, String> {
-    let (id, input_flows, node_types) = draft.build(lib, structs)?;
+    let built = draft.build(lib, structs)?;
+    let (id, input_flows, node_types, wire_lats) =
+        (built.id, built.flows, built.node_types, built.wire_lats);
     let mut ev = Evaluator::new(lib);
     ev.horizon = GUI_HORIZON;
     let detail = ev
@@ -140,6 +146,14 @@ fn compile(
             DraftFrom::Node(n, l) => &detail.node_outs[*n][*l],
         }
     };
+    // Arrivals at the sink end of each wire: departures shifted by the
+    // wire's geometric latency (belts are identity recipes, exactly).
+    let arrivals: Vec<Counting> = draft
+        .wires
+        .iter()
+        .zip(&wire_lats)
+        .map(|((from, _), &lat)| source_counting(from).shift(lat))
+        .collect();
     let mut supplies = Vec::with_capacity(draft.nodes.len());
     let mut consumed = Vec::with_capacity(draft.nodes.len());
     for (n, node) in draft.nodes.iter().enumerate() {
@@ -147,9 +161,9 @@ fn compile(
         let sup: Vec<Counting> = (0..legs)
             .map(|l| {
                 let mut acc = Counting::constant(marking_of(DraftTo::Node(n, l)));
-                for (from, to) in &draft.wires {
+                for (w, (_, to)) in draft.wires.iter().enumerate() {
                     if *to == DraftTo::Node(n, l) {
-                        acc = acc.add(source_counting(from));
+                        acc = acc.add(&arrivals[w]);
                     }
                 }
                 acc
@@ -190,6 +204,8 @@ fn compile(
         supplies,
         consumed,
         node_types,
+        wire_lats,
+        arrivals,
         summary,
         audit,
         draft,
@@ -334,13 +350,21 @@ fn draft_json(d: &Draft) -> String {
         .iter()
         .map(|(t, m)| format!("{{\"to\":{},\"n\":{m}}}", to_json(t)))
         .collect();
+    let pos_list = |ps: &[(i32, i32)]| -> String {
+        let items: Vec<String> = ps.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
+        format!("[{}]", items.join(","))
+    };
     format!(
-        "{{\"inputs\":[{}],\"outputs\":[{}],\"nodes\":[{}],\"wires\":[{}],\"markings\":[{}]}}",
+        "{{\"inputs\":[{}],\"outputs\":[{}],\"nodes\":[{}],\"wires\":[{}],\"markings\":[{}],\
+         \"pos\":{{\"inputs\":{},\"nodes\":{},\"outputs\":{}}}}}",
         inputs.join(","),
         outputs.join(","),
         nodes.join(","),
         wires.join(","),
-        markings.join(",")
+        markings.join(","),
+        pos_list(&d.input_pos),
+        pos_list(&d.node_pos),
+        pos_list(&d.output_pos)
     )
 }
 
@@ -490,14 +514,24 @@ fn scene_json(app: &App) -> String {
             met.map(rate_json).unwrap_or("null".into())
         )
     };
+    let pos_list = |ps: &[(i32, i32)]| -> String {
+        let items: Vec<String> = ps.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
+        format!("[{}]", items.join(","))
+    };
+    let lats: Vec<String> = c.wire_lats.iter().map(|l| l.to_string()).collect();
     format!(
         "{{\"types\":[{}],\"inputs\":[{}],\"outputs\":[{}],\"nodes\":[{}],\
-         \"edges\":[{}],\"spec\":[{}],\"audit\":[{}],\"goal\":{goal}}}",
+         \"edges\":[{}],\"lats\":[{}],\"pos\":{{\"inputs\":{},\"nodes\":{},\"outputs\":{}}},\
+         \"spec\":[{}],\"audit\":[{}],\"goal\":{goal}}}",
         types.join(","),
         inputs.join(","),
         outputs.join(","),
         nodes.join(","),
         edges.join(","),
+        lats.join(","),
+        pos_list(&d.input_pos),
+        pos_list(&d.node_pos),
+        pos_list(&d.output_pos),
         spec.join(","),
         audit.join(",")
     )
@@ -525,16 +559,20 @@ fn frame_json(c: &Compiled, t: u64) -> String {
             format!("[{}]", legs.join(","))
         })
         .collect();
-    let flow: Vec<String> = c
+    // Arrivals animate at the sink; transit = departed minus arrived,
+    // the items physically on the wire right now.
+    let flow: Vec<String> = c.arrivals.iter().map(|a| delta(a).to_string()).collect();
+    let transit: Vec<String> = c
         .draft
         .wires
         .iter()
-        .map(|(from, _)| {
-            let cnt = match from {
+        .zip(&c.arrivals)
+        .map(|((from, _), arr)| {
+            let dep = match from {
                 DraftFrom::Input(i) => &c.input_flows[*i],
                 DraftFrom::Node(n, l) => &c.node_outs[*n][*l],
             };
-            delta(cnt).to_string()
+            (dep.eval(t) - arr.eval(t)).to_string()
         })
         .collect();
     let outs: Vec<String> = c
@@ -543,10 +581,11 @@ fn frame_json(c: &Compiled, t: u64) -> String {
         .map(|cnt| format!("[{},{}]", cnt.eval(t), delta(cnt)))
         .collect();
     format!(
-        "{{\"fired\":[{}],\"occ\":[{}],\"flow\":[{}],\"outs\":[{}]}}",
+        "{{\"fired\":[{}],\"occ\":[{}],\"flow\":[{}],\"transit\":[{}],\"outs\":[{}]}}",
         fired.join(","),
         occ.join(","),
         flow.join(","),
+        transit.join(","),
         outs.join(",")
     )
 }
@@ -712,6 +751,22 @@ fn parse_draft_value(v: &Json, structs: &StructLib, depth: usize) -> Result<Draf
         let to = parse_endpoint_to(m.get("to").ok_or("marking missing port")?)?;
         let n = m.get("n").and_then(|x| x.u64()).ok_or("marking missing count")?;
         d.markings.push((to, n));
+    }
+    if let Some(pos) = v.get("pos") {
+        let read = |key: &str| -> Vec<(i32, i32)> {
+            pos.get(key)
+                .and_then(|x| x.arr())
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|p| {
+                    let a = p.arr()?;
+                    Some((a.first()?.i64()? as i32, a.get(1)?.i64()? as i32))
+                })
+                .collect()
+        };
+        d.input_pos = read("inputs");
+        d.node_pos = read("nodes");
+        d.output_pos = read("outputs");
     }
     Ok(d)
 }
