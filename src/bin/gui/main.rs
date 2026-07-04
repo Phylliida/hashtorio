@@ -19,9 +19,10 @@ use std::net::{TcpListener, TcpStream};
 
 use hashtorio::counting::Counting;
 use hashtorio::demo;
-use hashtorio::draft::{Draft, DraftFrom, DraftInput, DraftNode, DraftOutput, DraftTo};
+use hashtorio::draft::{BuildOp, Draft, DraftFrom, DraftInput, DraftNode, DraftOutput, DraftTo};
 use hashtorio::eval::{EvalError, Evaluator};
 use hashtorio::net::{ItemType, Library};
+use hashtorio::structure::{chassis, StructLib, ANY};
 use hashtorio::report::{Audit, Summary};
 use json::Json;
 
@@ -43,13 +44,43 @@ struct Compiled {
     /// Per node, per input leg: consumption map; `None` for module legs
     /// (queueing happens inside the seal).
     consumed: Vec<Vec<Option<Counting>>>,
+    /// Concrete (in, out) leg types per node, builders resolved.
+    node_types: Vec<(Vec<ItemType>, Vec<ItemType>)>,
     summary: Summary,
     audit: Audit,
 }
 
 struct App {
     lib: Library,
+    structs: StructLib,
+    /// Chassis structure per machine kind: machine-types are structures.
+    chassis: Vec<(&'static str, ItemType)>,
+    /// The manufacturing goal: the welder's own chassis.
+    target: ItemType,
     current: Compiled,
+}
+
+const KINDS: [&str; 7] = ["weld", "rot", "split", "belt", "recipe", "priority", "module"];
+
+impl App {
+    fn new() -> App {
+        let mut lib = Library::new();
+        let mut structs = StructLib::new();
+        let chassis_map: Vec<(&'static str, ItemType)> =
+            KINDS.iter().map(|k| (*k, chassis(&mut structs, k))).collect();
+        let target = chassis_map[0].1; // the welder chassis
+        let draft = hashtorio::demo::draft(&mut structs);
+        let current = compile(&mut lib, &mut structs, draft).expect("demo compiles");
+        App { lib, structs, chassis: chassis_map, target, current }
+    }
+
+    fn kind_chassis(&self, kind: &str) -> ItemType {
+        self.chassis
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, t)| *t)
+            .expect("known kind")
+    }
 }
 
 fn friendly_eval_error(e: &EvalError) -> String {
@@ -77,8 +108,12 @@ fn friendly_eval_error(e: &EvalError) -> String {
     }
 }
 
-fn compile(lib: &mut Library, draft: Draft) -> Result<Compiled, String> {
-    let (id, input_flows) = draft.build(lib)?;
+fn compile(
+    lib: &mut Library,
+    structs: &mut StructLib,
+    draft: Draft,
+) -> Result<Compiled, String> {
+    let (id, input_flows, node_types) = draft.build(lib, structs)?;
     let mut ev = Evaluator::new(lib);
     ev.horizon = GUI_HORIZON;
     let detail = ev
@@ -108,7 +143,7 @@ fn compile(lib: &mut Library, draft: Draft) -> Result<Compiled, String> {
     let mut supplies = Vec::with_capacity(draft.nodes.len());
     let mut consumed = Vec::with_capacity(draft.nodes.len());
     for (n, node) in draft.nodes.iter().enumerate() {
-        let legs = node.in_types().len();
+        let legs = node_types[n].0.len();
         let sup: Vec<Counting> = (0..legs)
             .map(|l| {
                 let mut acc = Counting::constant(marking_of(DraftTo::Node(n, l)));
@@ -137,6 +172,11 @@ fn compile(lib: &mut Library, draft: Draft) -> Result<Compiled, String> {
                 Some(detail.node_outs[n][0].clone()),
             ],
             DraftNode::Module { .. } => vec![None; legs],
+            DraftNode::Builder { op, .. } => {
+                let k = detail.firings[n].as_ref().expect("builders compile to recipes");
+                let per = if matches!(op, BuildOp::Split) { 2 } else { 1 };
+                (0..legs).map(|_| Some(k.scale_floor(per, 1))).collect()
+            }
         };
         supplies.push(sup);
         consumed.push(cons);
@@ -149,6 +189,7 @@ fn compile(lib: &mut Library, draft: Draft) -> Result<Compiled, String> {
         outputs: detail.outputs,
         supplies,
         consumed,
+        node_types,
         summary,
         audit,
         draft,
@@ -181,13 +222,34 @@ fn to_json(t: &DraftTo) -> String {
     }
 }
 
-fn node_json(d: &Draft, n: usize, node: &DraftNode) -> String {
+fn kind_of(node: &DraftNode) -> &'static str {
+    match node {
+        DraftNode::Recipe { .. } => "recipe",
+        DraftNode::Priority { .. } => "priority",
+        DraftNode::Module { .. } => "module",
+        DraftNode::Builder { op: BuildOp::Weld { .. }, .. } => "weld",
+        DraftNode::Builder { op: BuildOp::Rot, .. } => "rot",
+        DraftNode::Builder { op: BuildOp::Split, .. } => "split",
+        DraftNode::Builder { op: BuildOp::Belt, .. } => "belt",
+    }
+}
+
+fn node_json(
+    d: &Draft,
+    n: usize,
+    node: &DraftNode,
+    resolved: Option<&(Vec<ItemType>, Vec<ItemType>)>,
+) -> String {
     let marking_of = |to: DraftTo| -> u64 {
         d.markings.iter().filter(|(t, _)| *t == to).map(|(_, m)| *m).sum()
     };
-    let legs: Vec<String> = node.in_types().iter().map(|t| t.0.to_string()).collect();
-    let outs: Vec<String> = node.out_types().iter().map(|t| t.0.to_string()).collect();
-    let markings: Vec<String> = (0..node.in_types().len())
+    let (in_tys, out_tys) = match resolved {
+        Some((i, o)) => (i.clone(), o.clone()),
+        None => (node.in_types(), node.out_types()),
+    };
+    let legs: Vec<String> = in_tys.iter().map(|t| t.0.to_string()).collect();
+    let outs: Vec<String> = out_tys.iter().map(|t| t.0.to_string()).collect();
+    let markings: Vec<String> = (0..in_tys.len())
         .map(|l| marking_of(DraftTo::Node(n, l)).to_string())
         .collect();
     let core = match node {
@@ -209,6 +271,14 @@ fn node_json(d: &Draft, n: usize, node: &DraftNode) -> String {
         DraftNode::Module { draft, .. } => {
             format!("\"kind\":\"module\",\"draft\":{}", draft_json(draft))
         }
+        DraftNode::Builder { op, latency, .. } => match op {
+            BuildOp::Weld { dx, dy } => format!(
+                "\"kind\":\"weld\",\"dx\":{dx},\"dy\":{dy},\"latency\":{latency}"
+            ),
+            BuildOp::Rot => format!("\"kind\":\"rot\",\"latency\":{latency}"),
+            BuildOp::Split => format!("\"kind\":\"split\",\"latency\":{latency}"),
+            BuildOp::Belt => format!("\"kind\":\"belt\",\"latency\":{latency}"),
+        },
     };
     format!(
         "{{{core},\"label\":\"{}\",\"legs\":[{}],\"outs\":[{}],\"markings\":[{}]}}",
@@ -217,6 +287,15 @@ fn node_json(d: &Draft, n: usize, node: &DraftNode) -> String {
         outs.join(","),
         markings.join(",")
     )
+}
+
+fn cells_json(structs: &StructLib, ty: ItemType) -> String {
+    let cells: Vec<String> = structs
+        .cells(ty)
+        .iter()
+        .map(|(x, y, m)| format!("[{x},{y},{m}]"))
+        .collect();
+    format!("[{}]", cells.join(","))
 }
 
 /// A draft in the editor's own format (recursive; round-trips through
@@ -243,7 +322,7 @@ fn draft_json(d: &Draft) -> String {
         .nodes
         .iter()
         .enumerate()
-        .map(|(n, node)| node_json(d, n, node))
+        .map(|(n, node)| node_json(d, n, node, None))
         .collect();
     let wires: Vec<String> = d
         .wires
@@ -265,15 +344,51 @@ fn draft_json(d: &Draft) -> String {
     )
 }
 
-fn scene_json(c: &Compiled) -> String {
+fn scene_json(app: &App) -> String {
+    let c = &app.current;
+    let structs = &app.structs;
     let d = &c.draft;
     let marking_of = |to: DraftTo| -> u64 {
         d.markings.iter().filter(|(t, _)| *t == to).map(|(_, m)| *m).sum()
     };
-    let types: Vec<String> = d
-        .types
+    // Resolved sink type of a wire (builders concrete post-inference).
+    let edge_ty = |to: &DraftTo| -> ItemType {
+        match to {
+            DraftTo::Node(n, l) => c.node_types[*n].0[*l],
+            DraftTo::Output(o) => d.outputs[*o].ty,
+        }
+    };
+    // Every type id the frontend will need to draw, with its cells.
+    // The eight primitives are always present (editor prompts name them).
+    let mut used: Vec<u32> = (0..8).collect();
+    let mut note = |t: ItemType| {
+        if t != ANY && structs.contains(t) && !used.contains(&t.0) {
+            used.push(t.0);
+        }
+    };
+    for i in &d.inputs {
+        note(i.ty);
+    }
+    for o in &d.outputs {
+        note(o.ty);
+    }
+    for (ins, outs) in &c.node_types {
+        for t in ins.iter().chain(outs) {
+            note(*t);
+        }
+    }
+    note(app.target);
+    used.sort_unstable();
+    let types: Vec<String> = used
         .iter()
-        .map(|(t, n)| format!("{{\"id\":{},\"name\":\"{}\"}}", t.0, esc(n)))
+        .map(|&id| {
+            let ty = ItemType(id);
+            format!(
+                "{{\"id\":{id},\"name\":\"{}\",\"cells\":{}}}",
+                esc(&structs.name(ty)),
+                cells_json(structs, ty)
+            )
+        })
         .collect();
     let inputs: Vec<String> = d
         .inputs
@@ -304,17 +419,25 @@ fn scene_json(c: &Compiled) -> String {
         .nodes
         .iter()
         .enumerate()
-        .map(|(n, node)| node_json(d, n, node))
+        .map(|(n, node)| {
+            let base = node_json(d, n, node, Some(&c.node_types[n]));
+            let ch = app.kind_chassis(kind_of(node));
+            format!(
+                "{{{},\"chassis\":{}}}",
+                &base[1..base.len() - 1],
+                cells_json(structs, ch)
+            )
+        })
         .collect();
     let edges: Vec<String> = d
         .wires
         .iter()
         .map(|(from, to)| {
-            let ty = d.sink_type(*to).map(|t| t.0).unwrap_or(0);
             format!(
-                "{{\"from\":{},\"to\":{},\"ty\":{ty}}}",
+                "{{\"from\":{},\"to\":{},\"ty\":{}}}",
                 from_json(from),
-                to_json(to)
+                to_json(to),
+                edge_ty(to).0
             )
         })
         .collect();
@@ -340,7 +463,7 @@ fn scene_json(c: &Compiled) -> String {
             format!(
                 "{{\"ty\":\"{}\",\"injected\":{},\"minted\":{},\"consumed\":{},\
                  \"delivered\":{},\"discarded\":{},\"accumulating\":{}}}",
-                esc(d.type_name(r.ty)),
+                esc(&structs.name(r.ty)),
                 rate_json(r.injected),
                 rate_json(r.minted),
                 rate_json(r.consumed),
@@ -350,9 +473,26 @@ fn scene_json(c: &Compiled) -> String {
             )
         })
         .collect();
+    // The manufacturing goal: met when some output emits the target shape.
+    let goal = {
+        let met = d
+            .outputs
+            .iter()
+            .enumerate()
+            .find(|(_, o)| o.ty == app.target)
+            .map(|(i, _)| c.summary.outputs[i].rate)
+            .filter(|r| r.0 > 0);
+        format!(
+            "{{\"name\":\"{}\",\"cells\":{},\"met\":{},\"rate\":{}}}",
+            esc(&structs.name(app.target)),
+            cells_json(structs, app.target),
+            met.is_some(),
+            met.map(rate_json).unwrap_or("null".into())
+        )
+    };
     format!(
         "{{\"types\":[{}],\"inputs\":[{}],\"outputs\":[{}],\"nodes\":[{}],\
-         \"edges\":[{}],\"spec\":[{}],\"audit\":[{}]}}",
+         \"edges\":[{}],\"spec\":[{}],\"audit\":[{}],\"goal\":{goal}}}",
         types.join(","),
         inputs.join(","),
         outputs.join(","),
@@ -445,10 +585,10 @@ fn parse_endpoint_to(v: &Json) -> Result<DraftTo, String> {
     }
 }
 
-fn parse_ty(v: Option<&Json>, palette: &[(ItemType, String)]) -> Result<ItemType, String> {
+fn parse_ty(v: Option<&Json>, structs: &StructLib) -> Result<ItemType, String> {
     let id = v.and_then(|x| x.u64()).ok_or("missing item type")?;
     let ty = ItemType(id as u32);
-    if palette.iter().any(|(t, _)| *t == ty) {
+    if structs.contains(ty) {
         Ok(ty)
     } else {
         Err(format!("unknown item type id {id}"))
@@ -457,26 +597,25 @@ fn parse_ty(v: Option<&Json>, palette: &[(ItemType, String)]) -> Result<ItemType
 
 fn parse_pairs(
     v: Option<&Json>,
-    palette: &[(ItemType, String)],
+    structs: &StructLib,
 ) -> Result<Vec<(ItemType, u64)>, String> {
     v.and_then(|x| x.arr())
         .ok_or("missing recipe legs")?
         .iter()
         .map(|pair| {
             let a = pair.arr().ok_or("bad recipe leg")?;
-            let ty = parse_ty(a.first(), palette)?;
+            let ty = parse_ty(a.first(), structs)?;
             let amt = a.get(1).and_then(|x| x.u64()).ok_or("bad recipe amount")?;
             Ok((ty, amt))
         })
         .collect()
 }
 
-fn parse_draft_value(v: &Json, depth: usize) -> Result<Draft, String> {
+fn parse_draft_value(v: &Json, structs: &StructLib, depth: usize) -> Result<Draft, String> {
     if depth > 32 {
         return Err("modules nested too deep".into());
     }
-    let palette = demo::palette();
-    let mut d = Draft { types: palette.clone(), ..Default::default() };
+    let mut d = Draft { types: demo::palette(), ..Default::default() };
 
     for (i, input) in v
         .get("inputs")
@@ -487,7 +626,7 @@ fn parse_draft_value(v: &Json, depth: usize) -> Result<Draft, String> {
     {
         let rate = input.get("rate").and_then(|r| r.arr()).ok_or("source needs a rate")?;
         d.inputs.push(DraftInput {
-            ty: parse_ty(input.get("ty"), &palette)?,
+            ty: parse_ty(input.get("ty"), structs)?,
             label: input
                 .get("label")
                 .and_then(|l| l.str())
@@ -507,7 +646,7 @@ fn parse_draft_value(v: &Json, depth: usize) -> Result<Draft, String> {
         .enumerate()
     {
         d.outputs.push(DraftOutput {
-            ty: parse_ty(out.get("ty"), &palette)?,
+            ty: parse_ty(out.get("ty"), structs)?,
             label: out
                 .get("label")
                 .and_then(|l| l.str())
@@ -530,22 +669,36 @@ fn parse_draft_value(v: &Json, depth: usize) -> Result<Draft, String> {
         match node.get("kind").and_then(|k| k.str()) {
             Some("recipe") => d.nodes.push(DraftNode::Recipe {
                 label,
-                consume: parse_pairs(node.get("consume"), &palette)?,
-                produce: parse_pairs(node.get("produce"), &palette)?,
+                consume: parse_pairs(node.get("consume"), structs)?,
+                produce: parse_pairs(node.get("produce"), structs)?,
                 latency: node.get("latency").and_then(|x| x.u64()).unwrap_or(1),
             }),
             Some("priority") => d.nodes.push(DraftNode::Priority {
                 label,
-                item: parse_ty(node.get("item"), &palette)?,
-                token: parse_ty(node.get("token"), &palette)?,
+                item: parse_ty(node.get("item"), structs)?,
+                token: parse_ty(node.get("token"), structs)?,
             }),
             Some("module") => d.nodes.push(DraftNode::Module {
                 label,
                 draft: Box::new(parse_draft_value(
                     node.get("draft").ok_or("module missing its draft")?,
+                    structs,
                     depth + 1,
                 )?),
             }),
+            Some(kind @ ("weld" | "rot" | "split" | "belt")) => {
+                let latency = node.get("latency").and_then(|x| x.u64()).unwrap_or(1);
+                let op = match kind {
+                    "weld" => BuildOp::Weld {
+                        dx: node.get("dx").and_then(|x| x.i64()).unwrap_or(1) as i32,
+                        dy: node.get("dy").and_then(|x| x.i64()).unwrap_or(0) as i32,
+                    },
+                    "rot" => BuildOp::Rot,
+                    "split" => BuildOp::Split,
+                    _ => BuildOp::Belt,
+                };
+                d.nodes.push(DraftNode::Builder { label, op, latency });
+            }
             _ => return Err(format!("node {n}: unknown kind")),
         }
     }
@@ -563,9 +716,9 @@ fn parse_draft_value(v: &Json, depth: usize) -> Result<Draft, String> {
     Ok(d)
 }
 
-fn parse_draft(body: &str) -> Result<Draft, String> {
+fn parse_draft(body: &str, structs: &StructLib) -> Result<Draft, String> {
     let v = json::parse(body).map_err(|e| format!("bad JSON: {e}"))?;
-    parse_draft_value(&v, 0)
+    parse_draft_value(&v, structs, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -583,7 +736,7 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
     match (method, route) {
         ("GET", "/") => ("200 OK".into(), "text/html; charset=utf-8", INDEX_HTML.to_string()),
         ("GET", "/api/scene") => {
-            ("200 OK".into(), "application/json", scene_json(&app.current))
+            ("200 OK".into(), "application/json", scene_json(app))
         }
         ("GET", "/api/frames") => {
             let from = param("from").unwrap_or(0);
@@ -591,12 +744,12 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
             ("200 OK".into(), "application/json", frames_json(&app.current, from, n))
         }
         ("POST", "/api/compile") => {
-            let result = parse_draft(body).and_then(|draft| compile(&mut app.lib, draft));
+            let result = parse_draft(body, &app.structs)
+                .and_then(|draft| compile(&mut app.lib, &mut app.structs, draft));
             match result {
                 Ok(compiled) => {
                     app.current = compiled;
-                    let body =
-                        format!("{{\"ok\":true,\"scene\":{}}}", scene_json(&app.current));
+                    let body = format!("{{\"ok\":true,\"scene\":{}}}", scene_json(app));
                     ("200 OK".into(), "application/json", body)
                 }
                 Err(e) => (
@@ -668,9 +821,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8470);
 
-    let mut lib = Library::new();
-    let current = compile(&mut lib, demo::draft()).expect("demo compiles");
-    let mut app = App { lib, current };
+    let mut app = App::new();
 
     let listener =
         TcpListener::bind(("127.0.0.1", port)).expect("bind GUI port (pass another as arg)");
@@ -685,16 +836,14 @@ mod tests {
     use super::*;
 
     fn test_app() -> App {
-        let mut lib = Library::new();
-        let current = compile(&mut lib, demo::draft()).unwrap();
-        App { lib, current }
+        App::new()
     }
 
     #[test]
     fn scene_shows_the_sealed_module() {
         let mut app = test_app();
         let (_, _, body) = route(&mut app, "GET", "/api/scene", "");
-        assert!(body.contains("demand store"));
+        assert!(body.contains("chassis store"));
         assert!(body.contains("\"kind\":\"module\""));
         assert!(body.contains("\"draft\""), "module carries its sub-draft");
         // Frames: module legs report null occupancy (interior is sealed).
@@ -749,6 +898,6 @@ mod tests {
         assert!(body.contains("module boundary"), "{body}");
         // The demo survives the refusal.
         let (_, _, scene) = route(&mut app, "GET", "/api/scene", "");
-        assert!(scene.contains("demand store"));
+        assert!(scene.contains("chassis store"));
     }
 }

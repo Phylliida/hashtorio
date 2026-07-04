@@ -21,6 +21,7 @@ pub mod recipe;
 pub mod render;
 pub mod report;
 pub mod stepper;
+pub mod structure;
 pub mod world;
 
 pub use counting::Counting;

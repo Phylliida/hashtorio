@@ -13,21 +13,27 @@ use hashtorio::render::Scene;
 
 fn main() {
     let mut lib = Library::new();
-    let draft = demo::draft();
-    let (id, inputs) = draft.build(&mut lib).expect("demo draft compiles");
+    let mut structs = hashtorio::structure::StructLib::new();
+    let draft = demo::draft(&mut structs);
+    let (id, inputs, _) = draft.build(&mut lib, &mut structs).expect("demo draft compiles");
 
     let mut ev = Evaluator::new(&lib);
     let summary = ev.summarize(id, &inputs).expect("demo summarizes");
     let audit = ev.audit(id, &inputs).expect("demo audits");
     let trace = ev.trace_flattened(id, &inputs).expect("demo traces");
 
+    // Names for every interned structure (constructed ones included).
+    let owned_names: Vec<(hashtorio::net::ItemType, String)> = (0..structs.len())
+        .map(|i| {
+            let ty = hashtorio::net::ItemType(i as u32);
+            (ty, structs.name(ty))
+        })
+        .collect();
     let type_names: Vec<(hashtorio::net::ItemType, &str)> =
-        draft.types.iter().map(|(t, n)| (*t, n.as_str())).collect();
+        owned_names.iter().map(|(t, n)| (*t, n.as_str())).collect();
     // The terminal view renders the FLATTENED net (the demo contains a
     // sealed module), so label nodes by their own shape.
-    let tn = |ty: hashtorio::net::ItemType| {
-        draft.type_name(ty).to_string()
-    };
+    let tn = |ty: hashtorio::net::ItemType| structs.name(ty);
     let node_labels: Vec<String> = trace
         .net
         .nodes
@@ -60,7 +66,7 @@ fn main() {
     println!("hashtorio playground — a factory as a theorem\n");
     println!("published spec (exact, from the cache entry):");
     for (o, port) in summary.outputs.iter().enumerate() {
-        let name = ["delivered", "spilled", "level pulses"][o];
+        let name = &draft.outputs[o].label;
         let first = port
             .first
             .map(|t| format!("first at t={t}"))
@@ -113,7 +119,7 @@ fn main() {
             }
             ["spec"] => {
                 for (o, port) in summary.outputs.iter().enumerate() {
-                    let name = ["delivered", "spilled", "level pulses"][o];
+                    let name = &draft.outputs[o].label;
                     println!("  {name}: {}/{} per tick", port.rate.0, port.rate.1);
                 }
             }

@@ -45,6 +45,13 @@ impl Json {
     pub fn usize(&self) -> Option<usize> {
         self.u64().map(|v| v as usize)
     }
+
+    pub fn i64(&self) -> Option<i64> {
+        match self {
+            Json::Num(n) if n.fract() == 0.0 && n.abs() <= 2f64.powi(53) => Some(*n as i64),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse(s: &str) -> Result<Json, String> {
