@@ -302,6 +302,65 @@ impl App {
             .map(|(_, t)| *t)
             .expect("known kind")
     }
+
+    /// The inverse of [`App::pay_markings`]: return preloaded items to
+    /// stock. Live editing retools the running line on every change, so
+    /// its markings are *conserved* (refunded, then the new line's charged)
+    /// rather than re-spent each keystroke.
+    fn refund_markings(&mut self, draft: &Draft) {
+        if let Ok(report) = draft.cost(&mut self.structs) {
+            for (ty, n) in report.markings {
+                *self.inventory.entry(ty.0).or_insert(0) += n;
+            }
+        }
+    }
+
+    /// If the current factory *newly* meets the manufacturing goal, flip the
+    /// flag, grant budget, and return the announcement JSON; else `"null"`.
+    /// Call after `self.current` is in place. Shared by compile and live.
+    fn maybe_goal_grant(&mut self) -> String {
+        let goal_met_now = self.current.draft.outputs.iter().enumerate().any(|(i, o)| {
+            o.ty == self.target && self.current.summary.outputs[i].rate.0 > 0
+        });
+        if goal_met_now && !self.goal_achieved {
+            self.goal_achieved = true;
+            self.budget += 50_000;
+            format!(
+                "\"goal achieved: {} — +50,000 tick budget\"",
+                esc(&self.structs.name(self.target))
+            )
+        } else {
+            "null".into()
+        }
+    }
+
+    /// Apply a draft to the *running* line: recompile and hot-swap while
+    /// keeping the harvest clock (no cold retool) and conserving preloaded
+    /// items. An invalid or unaffordable draft changes nothing — the line
+    /// keeps running exactly as it was, and the caller reports the refusal.
+    fn apply_live(&mut self, draft: Draft) -> Result<String, String> {
+        // Compile first: a draft with no summarizable steady state must not
+        // touch the economy at all.
+        let compiled = compile(&mut self.lib, &mut self.structs, draft.clone())?;
+        // Conserve markings across the retool: the old line's preloads come
+        // back before the new line's are charged, so wiggling an edit can
+        // neither drain nor mint items.
+        let old = self.current.draft.clone();
+        self.refund_markings(&old);
+        if let Err(e) = self.check_affordable(&draft) {
+            self.pay_markings(&old); // undo the refund; the old line stands
+            return Err(e);
+        }
+        self.pay_markings(&draft);
+        self.current = compiled; // clock intentionally preserved
+        let grant = self.maybe_goal_grant();
+        self.save();
+        Ok(format!(
+            "{{\"ok\":true,\"grant\":{grant},\"scene\":{},\"state\":{}}}",
+            scene_json(self),
+            state_json(self)
+        ))
+    }
 }
 
 fn friendly_eval_error(e: &EvalError) -> String {
@@ -1110,24 +1169,7 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
                     app.clock = 0; // retooling: the line starts cold
                     let paid = app.current.draft.clone();
                     app.pay_markings(&paid); // preloads are real items
-                    let mut grant = String::from("null");
-                    let goal_met_now = app
-                        .current
-                        .draft
-                        .outputs
-                        .iter()
-                        .enumerate()
-                        .any(|(i, o)| {
-                            o.ty == app.target && app.current.summary.outputs[i].rate.0 > 0
-                        });
-                    if goal_met_now && !app.goal_achieved {
-                        app.goal_achieved = true;
-                        app.budget += 50_000;
-                        grant = format!(
-                            "\"goal achieved: {} — +50,000 tick budget\"",
-                            esc(&app.structs.name(app.target))
-                        );
-                    }
+                    let grant = app.maybe_goal_grant();
                     app.save();
                     let body = format!(
                         "{{\"ok\":true,\"grant\":{grant},\"scene\":{},\"state\":{}}}",
@@ -1136,6 +1178,19 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
                     );
                     ("200 OK".into(), "application/json", body)
                 }
+                Err(e) => (
+                    "200 OK".into(),
+                    "application/json",
+                    format!("{{\"ok\":false,\"error\":\"{}\"}}", esc(&e)),
+                ),
+            }
+        }
+        // Live edit: apply the draft to the running line without the cold
+        // retool. Keeps the clock, conserves preloads, refuses gracefully.
+        ("POST", "/api/live") => {
+            let result = parse_draft(body, &app.structs).and_then(|draft| app.apply_live(draft));
+            match result {
+                Ok(body) => ("200 OK".into(), "application/json", body),
                 Err(e) => (
                     "200 OK".into(),
                     "application/json",
@@ -1234,6 +1289,48 @@ mod tests {
         // Frames: module legs report null occupancy (interior is sealed).
         let (_, _, frames) = route(&mut app, "GET", "/api/frames?from=50&n=1", "");
         assert!(frames.contains("null"), "{frames}");
+    }
+
+    #[test]
+    fn live_edit_keeps_the_clock_and_conserves_preloads() {
+        let mut app = test_app();
+        // Advance the harvest clock; live editing must not reset it.
+        route(&mut app, "POST", "/api/harvest", r#"{"ticks":200}"#);
+        assert_eq!(app.clock, 200);
+        let iron = 0u32;
+        let iron_before = *app.inventory.get(&iron).unwrap();
+
+        // A drip line with a 30-iron preload, applied to the running line.
+        let drip = r#"{"inputs":[],"outputs":[{"ty":0,"label":"o"}],
+            "nodes":[{"kind":"recipe","label":"drip","consume":[[0,1]],
+                      "produce":[[0,1]],"latency":1}],
+            "wires":[{"from":["node",0,0],"to":["out",0]}],
+            "markings":[{"to":["node",0,0],"n":30}],
+            "pos":{"inputs":[],"nodes":[[4,4]],"outputs":[[10,4]]}}"#;
+        let (_, _, body) = route(&mut app, "POST", "/api/live", drip);
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert_eq!(app.clock, 200, "live editing keeps the line's clock");
+        assert_eq!(*app.inventory.get(&iron).unwrap(), iron_before - 30);
+
+        // Re-applying the SAME draft refunds the old preload before charging
+        // the new one: inventory is conserved, not drained a second time.
+        let (_, _, body) = route(&mut app, "POST", "/api/live", drip);
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert_eq!(
+            *app.inventory.get(&iron).unwrap(),
+            iron_before - 30,
+            "live re-apply conserves markings (refund old, charge new)"
+        );
+
+        // An unaffordable edit is refused; the running line is untouched.
+        let greedy = drip.replace("\"n\":30", "\"n\":999999");
+        let (_, _, body) = route(&mut app, "POST", "/api/live", &greedy);
+        assert!(body.contains("not enough iron"), "{body}");
+        assert_eq!(
+            *app.inventory.get(&iron).unwrap(),
+            iron_before - 30,
+            "a refused live edit leaves inventory (and the line) intact"
+        );
     }
 
     #[test]
