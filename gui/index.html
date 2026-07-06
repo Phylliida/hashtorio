@@ -50,6 +50,11 @@
   <span class="title">hashtorio</span>
   <button id="modebtn">&#9998; edit</button>
   <span class="sep"></span>
+  <button id="zoomout" title="zoom out (− / wheel)">&#8722;</button>
+  <span id="zoompct" style="min-width:40px;text-align:center;color:#8fd3ff;font-variant-numeric:tabular-nums">100%</span>
+  <button id="zoomin" title="zoom in (+ / wheel)">+</button>
+  <button id="zoomreset" title="reset view (0)">&#9974;</button>
+  <span class="sep"></span>
   <span id="runtools" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <button id="play">&#10074;&#10074; pause</button>
     <select id="speed">
@@ -154,7 +159,8 @@ function drawThumb(cells, cx, cy, cell) {
 // ---------------------------------------------------------------------------
 const S = { mode:'run', t:0, playing:true, tps:10, scene:null, frames:new Map(),
             fetching:new Set(), pos:null, customPos:null, last:performance.now(),
-            subFrames:new Map(), subFetching:new Set(), subLats:null };
+            subFrames:new Map(), subFetching:new Set(), subLats:null,
+            cam:{ scale:1, x:0, y:0 }, pan:null };
 const E = { draft:{ inputs:[], outputs:[], nodes:[], wires:[], markings:[] },
             pos:{ inputs:[], nodes:[], outputs:[] },
             path:[],   // module indices: [] = top level; the editor can go inside
@@ -414,6 +420,33 @@ async function ensureSub(t) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// camera: zoom + pan. World → screen (CSS px) = world * scale + offset. The
+// dpr base transform stays in place; this rides on top of it.
+// ---------------------------------------------------------------------------
+function camApply() {
+  ctx.save();
+  ctx.translate(S.cam.x, S.cam.y);
+  ctx.scale(S.cam.scale, S.cam.scale);
+}
+function camReset() { ctx.restore(); }
+function toWorld(sx, sy) {
+  return { x: (sx - S.cam.x) / S.cam.scale, y: (sy - S.cam.y) / S.cam.scale };
+}
+// Zoom keeping the world point under (sx, sy) pinned to that screen spot.
+function zoomAt(sx, sy, factor) {
+  const ns = Math.min(4, Math.max(0.15, S.cam.scale * factor));
+  const k = ns / S.cam.scale;
+  S.cam.x = sx - (sx - S.cam.x) * k;
+  S.cam.y = sy - (sy - S.cam.y) * k;
+  S.cam.scale = ns;
+}
+function zoomCenter(factor) {
+  const r = cv.getBoundingClientRect();
+  zoomAt(r.width / 2, r.height / 2, factor);
+}
+function resetView() { S.cam = { scale: 1, x: 0, y: 0 }; }
+
 // Items on a wire at the current sub-tick, shared by the run and live-edit
 // views. On a belt (lat>0) they spread along the wire and drift; on a
 // zero-latency hop they pulse across. Structured items draw as their real
@@ -457,6 +490,7 @@ function draw() {
   const sc = S.scene; if (!sc || !S.pos) return;
   const T = Math.floor(S.t), phase = S.t - T;
   const cur = S.frames.get(T), nxt = S.frames.get(T + 1);
+  camApply();
 
   sc.edges.forEach((e, i) => {
     const p = wirePath(S.pos, sc.nodes, e.from, e.to);
@@ -548,6 +582,8 @@ function draw() {
       }
     }
   });
+
+  camReset();
 
   if (!cur) {
     ctx.fillStyle = '#7d8a99'; ctx.font = '13px system-ui';
@@ -1062,11 +1098,17 @@ function editorDown(x, y) {
 }
 
 cv.addEventListener('mousedown', e => {
-  if (S.mode === 'edit') editorDown(e.offsetX, e.offsetY);
+  // Middle-drag, or shift+left-drag, pans the view (both modes).
+  if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
+    S.pan = { x: e.offsetX - S.cam.x, y: e.offsetY - S.cam.y };
+    e.preventDefault(); return;
+  }
+  if (S.mode === 'edit') { const w = toWorld(e.offsetX, e.offsetY); editorDown(w.x, w.y); }
 });
 cv.addEventListener('dblclick', e => {
   if (S.mode !== 'edit') return;
-  const hit = editorHit(e.offsetX, e.offsetY);
+  const w = toWorld(e.offsetX, e.offsetY);
+  const hit = editorHit(w.x, w.y);
   if (hit && hit.kind === 'node' && D().nodes[hit.idx].kind === 'module') {
     enterModule(hit.idx);
   } else if (!hit) {
@@ -1074,13 +1116,16 @@ cv.addEventListener('dblclick', e => {
   }
 });
 cv.addEventListener('mousemove', e => {
-  E.mouse = { x: e.offsetX, y: e.offsetY };
+  if (S.pan) { S.cam.x = e.offsetX - S.pan.x; S.cam.y = e.offsetY - S.pan.y; return; }
+  const w = toWorld(e.offsetX, e.offsetY);
+  E.mouse = { x: w.x, y: w.y };
   if (S.mode === 'edit' && E.drag) {
-    E.drag.arr[E.drag.idx].x = e.offsetX + E.drag.dx;
-    E.drag.arr[E.drag.idx].y = e.offsetY + E.drag.dy;
+    E.drag.arr[E.drag.idx].x = w.x + E.drag.dx;
+    E.drag.arr[E.drag.idx].y = w.y + E.drag.dy;
   }
 });
 window.addEventListener('mouseup', () => {
+  if (S.pan) { S.pan = null; return; }
   if (E.drag) {
     const p = E.drag.arr[E.drag.idx];
     p.x = Math.round(p.x / GRID) * GRID;
@@ -1088,6 +1133,11 @@ window.addEventListener('mouseup', () => {
     E.drag = null; saveDraft();
   }
 });
+// Wheel zooms toward the cursor.
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * 0.0015));
+}, { passive: false });
 
 // ---------------------------------------------------------------------------
 // edit mode: drawing
@@ -1096,9 +1146,15 @@ function drawEdit() {
   const d = D();
   const W = cv.getBoundingClientRect().width, H = cv.getBoundingClientRect().height;
   ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = '#1a1e25';
-  for (let gx = 0; gx < W; gx += GRID)
-    for (let gy = 0; gy < H; gy += GRID) ctx.fillRect(gx, gy, 1.5, 1.5);
+  camApply();
+  // Grid dots across the visible world region, so they pan/zoom with it.
+  if (S.cam.scale > 0.5) {
+    ctx.fillStyle = '#1a1e25';
+    const tl = toWorld(0, 0), br = toWorld(W, H);
+    for (let gx = Math.floor(tl.x / GRID) * GRID; gx < br.x; gx += GRID)
+      for (let gy = Math.floor(tl.y / GRID) * GRID; gy < br.y; gy += GRID)
+        ctx.fillRect(gx, gy, 1.5, 1.5);
+  }
 
   d.wires.forEach((w, i) => {
     const p = editWirePath(w);
@@ -1182,6 +1238,7 @@ function drawEdit() {
     ctx.fillStyle = '#7d8a99'; ctx.font = '11px system-ui';
     ctx.fillText(out.label, p.x + 12, p.y + 4);
   });
+  camReset();
 
   // Breadcrumb: where in the nesting we are.
   if (E.path.length) {
@@ -1238,14 +1295,14 @@ function drawLiveOverlay() {
   const T = Math.floor(S.t), phase = S.t - T;
   const cur = frames.get(T), nxt = frames.get(T + 1);
   const d = D();                                 // the level being edited
+  camApply();
   d.wires.forEach((w, i) => {
     const p = editWirePath(w);
     const transit = cur && cur.transit ? cur.transit[i] : 0;
     const flow = nxt ? nxt.flow[i] : 0;
     drawWireItems(p, sinkType(w.to), latOf(i), transit, flow, phase);
   });
-  if (!cur) return;
-  d.nodes.forEach((node, n) => {
+  if (cur) d.nodes.forEach((node, n) => {
     const ep = E.pos.nodes[n]; if (!ep) return;
     const p = withSize(ep, node);
     const fired = nxt ? nxt.fired[n] : 0;
@@ -1266,6 +1323,7 @@ function drawLiveOverlay() {
       ctx.fillText(val, pp.x - 10, pp.y + 3); ctx.textAlign = 'left';
     });
   });
+  camReset();
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1399,7 @@ function fillPanel() {
 function loop(now) {
   const dt = Math.min(0.1, (now - S.last) / 1000);
   S.last = now;
+  document.getElementById('zoompct').textContent = Math.round(S.cam.scale * 100) + '%';
   if (S.mode === 'run') {
     if (S.playing) S.t += dt * S.tps;
     ensure(S.t);
@@ -1375,6 +1434,16 @@ function setPlaying(v) {
 }
 document.getElementById('play').onclick = () => setPlaying(!S.playing);
 document.getElementById('e-play').onclick = () => setPlaying(!S.playing);
+document.getElementById('zoomin').onclick = () => zoomCenter(1.25);
+document.getElementById('zoomout').onclick = () => zoomCenter(0.8);
+document.getElementById('zoomreset').onclick = resetView;
+window.addEventListener('keydown', e => {
+  const tag = document.activeElement && document.activeElement.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  if (e.key === '+' || e.key === '=') zoomCenter(1.25);
+  else if (e.key === '-' || e.key === '_') zoomCenter(0.8);
+  else if (e.key === '0') resetView();
+});
 document.getElementById('speed').onchange = e => { S.tps = +e.target.value; };
 document.getElementById('go').onclick = () =>
   warpTo(+document.getElementById('warp').value.replace(/[,_ ]/g, ''));
