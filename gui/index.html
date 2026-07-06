@@ -85,7 +85,8 @@
     <span class="sep"></span>
     <button id="a-demo">load current</button>
     <button id="a-clear">clear</button>
-    <button id="a-compile" class="primary">&#9881; compile</button>
+    <span class="sep"></span>
+    <button id="e-play">&#10074;&#10074; pause</button>
   </span>
 </header>
 <main>
@@ -152,7 +153,8 @@ function drawThumb(cells, cx, cy, cell) {
 // state
 // ---------------------------------------------------------------------------
 const S = { mode:'run', t:0, playing:true, tps:10, scene:null, frames:new Map(),
-            fetching:new Set(), pos:null, customPos:null, last:performance.now() };
+            fetching:new Set(), pos:null, customPos:null, last:performance.now(),
+            subFrames:new Map(), subFetching:new Set(), subLats:null };
 const E = { draft:{ inputs:[], outputs:[], nodes:[], wires:[], markings:[] },
             pos:{ inputs:[], nodes:[], outputs:[] },
             path:[],   // module indices: [] = top level; the editor can go inside
@@ -190,14 +192,14 @@ function enterModule(i) {
   if (D().nodes[i].kind !== 'module') return;
   const label = D().nodes[i].label;
   flushPos(); E.path.push(i); E.sel.clear(); E.wireFrom = null;
-  loadPos(); saveDraft();
+  loadPos(); saveDraft(); refreshSub();
   toast('inside "' + label + '" — its inputs/outputs are the module ports; ' +
         'double-click empty space to leave');
 }
 function exitModule() {
   if (!E.path.length) return;
   flushPos(); E.path.pop(); E.sel.clear(); E.wireFrom = null;
-  loadPos(); saveDraft();
+  loadPos(); saveDraft(); refreshSub();
 }
 
 const cv = document.getElementById('cv');
@@ -358,6 +360,55 @@ async function ensure(t) {
           for (const kk of S.frames.keys()) if (!keep.has(kk)) S.frames.delete(kk);
         }
       } finally { S.fetching.delete(key); }
+      return;
+    }
+  }
+}
+
+// Type ids are globally unique and immutable (StructLib is append-only), so
+// interior types can be folded into the shared registry without ever losing
+// a shape as factories recompile.
+function mergeTypes(list) {
+  if (!list) return;
+  for (const t of list) if (!TYPES.some(x => x.id === t.id)) TYPES.push(t);
+}
+
+// Entering (or re-applying inside) a sealed module: fetch its interior scene
+// for the item shapes that live only inside and the interior wire latencies,
+// and drop any stale interior frames.
+async function refreshSub() {
+  S.subFrames.clear(); S.subFetching.clear();
+  if (!E.path.length) { S.subLats = null; return; }
+  const pathq = E.path.join(',');
+  try {
+    const sc = await (await fetch('/api/subscene?path=' + pathq)).json();
+    if (E.path.join(',') !== pathq) return;      // navigated away meanwhile
+    mergeTypes(sc.types);
+    S.subLats = sc.lats || [];
+  } catch (_) { S.subLats = null; }
+}
+
+// Interior per-tick frames for the module the editor is inside (mirrors
+// `ensure`, but drilled by path). Frames are dropped on navigation.
+async function ensureSub(t) {
+  if (!E.path.length) return;
+  t = Math.max(0, Math.floor(t));
+  const pathq = E.path.join(',');
+  for (let k = t; k < t + 8; k++) {
+    if (!S.subFrames.has(k)) {
+      const key = 's' + k;
+      if (S.subFetching.has(key)) return;
+      S.subFetching.add(key);
+      try {
+        const r = await (await fetch(`/api/subframes?path=${pathq}&from=${k}&n=64`)).json();
+        if (E.path.join(',') !== pathq) return;  // navigated away meanwhile
+        r.frames.forEach((f, i) => S.subFrames.set(r.from + i, f));
+        if (S.subFrames.size > 4096) {
+          const keep = new Set();
+          for (let j = Math.floor(S.t) - 64; j < Math.floor(S.t) + 256; j++) keep.add(j);
+          for (const kk of S.subFrames.keys()) if (!keep.has(kk)) S.subFrames.delete(kk);
+        }
+      } finally { S.subFetching.delete(key); }
       return;
     }
   }
@@ -870,24 +921,8 @@ document.getElementById('harvest').onclick = async () => {
   toast(`harvested ${ticks.toLocaleString()} ticks: ${summary}`);
 };
 
-async function compileDraft() {
-  flushPos();
-  const body = JSON.stringify(E.draft);
-  const r = await (await fetch('/api/compile', {
-    method:'POST', headers:{ 'Content-Type':'application/json' }, body,
-  })).json();
-  if (r.ok) {
-    applyScene(r.scene, JSON.parse(JSON.stringify(E.pos)));
-    if (r.state) applyState(r.state);
-    setMode('run');
-    toast(r.grant ? r.grant : 'compiled — line rebuilt from tick 0');
-  } else {
-    toast(r.error, true);
-  }
-  return r;
-}
 function applyScene(scene, customPos) {
-  S.scene = scene; TYPES = scene.types;
+  S.scene = scene; mergeTypes(scene.types);
   S.frames.clear(); S.fetching.clear(); S.t = 0;
   if (scene.pos && scene.pos.nodes.length === scene.nodes.length
       && (scene.pos.nodes.length + scene.pos.inputs.length) > 0) {
@@ -910,7 +945,7 @@ function applyScene(scene, customPos) {
 let liveTimer = null, liveInFlight = false, livePending = false, liveErrAt = 0;
 
 function hotSwap(scene) {
-  S.scene = scene; TYPES = scene.types;
+  S.scene = scene; mergeTypes(scene.types);
   S.frames.clear(); S.fetching.clear();      // frames now describe the new line
   const px = ps => ps.map(([x, y]) => ({ x: x * GRID, y: y * GRID }));
   if (scene.pos && scene.pos.nodes.length === scene.nodes.length)
@@ -938,6 +973,7 @@ async function runLive() {
     if (r.ok) {
       hotSwap(r.scene);
       S.appliedSig = sentSig;                 // overlay may animate again
+      if (E.path.length) refreshSub();        // interior changed too; re-pull it
       if (r.state) applyState(r.state);
       if (r.grant) toast(r.grant);
     } else if (performance.now() - liveErrAt > 1500) {
@@ -1176,12 +1212,15 @@ function port(q, ty) {
 // that alignment to hold — node kinds + leg counts, wire endpoints, port
 // counts — and nothing that doesn't (positions, labels, latency, markings).
 // The live overlay only draws while the current draft still matches it.
-function alignSig(d) {
-  return JSON.stringify([
-    d.nodes.map(n => [n.kind, legsIn(n).length, legsOut(n).length]),
+function alignSig(d) { return JSON.stringify(sigOf(d)); }
+function sigOf(d) {
+  return [
+    d.nodes.map(n => n.kind === 'module'
+      ? ['module', legsIn(n).length, legsOut(n).length, sigOf(n.draft)]
+      : [n.kind, legsIn(n).length, legsOut(n).length]),
     d.wires.map(w => [w.from, w.to]),
     d.inputs.length, d.outputs.length,
-  ]);
+  ];
 }
 
 // The live animation drawn on top of the editor at the top level: items
@@ -1189,18 +1228,21 @@ function alignSig(d) {
 // same O(1) frame reads the run view uses. It appears only while the draft
 // still matches what the server last compiled (so indices are aligned).
 function drawLiveOverlay() {
-  if (E.path.length) return;                    // inside a sealed module: no data
   const sc = S.scene;
+  // The recursive signature holds only while the *whole* nested draft still
+  // matches what the server last compiled — so top and interior frames align.
   if (!sc || alignSig(E.draft) !== S.appliedSig) return;
+  const inside = E.path.length > 0;              // animating a module interior?
+  const frames = inside ? S.subFrames : S.frames;
+  const latOf = i => inside ? (S.subLats ? S.subLats[i] : 0) : (sc.lats ? sc.lats[i] : 0);
   const T = Math.floor(S.t), phase = S.t - T;
-  const cur = S.frames.get(T), nxt = S.frames.get(T + 1);
-  const d = E.draft;
+  const cur = frames.get(T), nxt = frames.get(T + 1);
+  const d = D();                                 // the level being edited
   d.wires.forEach((w, i) => {
     const p = editWirePath(w);
-    const lat = sc.lats ? sc.lats[i] : 0;
     const transit = cur && cur.transit ? cur.transit[i] : 0;
     const flow = nxt ? nxt.flow[i] : 0;
-    drawWireItems(p, sinkType(w.to), lat, transit, flow, phase);
+    drawWireItems(p, sinkType(w.to), latOf(i), transit, flow, phase);
   });
   if (!cur) return;
   d.nodes.forEach((node, n) => {
@@ -1310,7 +1352,7 @@ function loop(now) {
       scrub.value = Math.floor(S.t);
   } else {
     if (S.playing) S.t += dt * S.tps;   // the line keeps running while you edit
-    ensure(S.t);
+    if (E.path.length) ensureSub(S.t); else ensure(S.t);
     drawEdit();
     drawLiveOverlay();
   }
@@ -1325,10 +1367,14 @@ function warpTo(v) {
 // buttons
 document.getElementById('modebtn').onclick = () =>
   setMode(S.mode === 'edit' ? 'run' : 'edit');
-document.getElementById('play').onclick = e => {
-  S.playing = !S.playing;
-  e.target.innerHTML = S.playing ? '&#10074;&#10074; pause' : '&#9654; play';
-};
+function setPlaying(v) {
+  S.playing = v;
+  const lbl = v ? '&#10074;&#10074; pause' : '&#9654; play';
+  document.getElementById('play').innerHTML = lbl;
+  document.getElementById('e-play').innerHTML = lbl;
+}
+document.getElementById('play').onclick = () => setPlaying(!S.playing);
+document.getElementById('e-play').onclick = () => setPlaying(!S.playing);
 document.getElementById('speed').onchange = e => { S.tps = +e.target.value; };
 document.getElementById('go').onclick = () =>
   warpTo(+document.getElementById('warp').value.replace(/[,_ ]/g, ''));
@@ -1409,7 +1455,6 @@ document.getElementById('a-demo').onclick = () => { sceneToDraft(); toast('curre
 document.getElementById('a-clear').onclick = () => {
   if (confirm('clear the whole draft?')) draftClear();
 };
-document.getElementById('a-compile').onclick = () => compileDraft();
 
 // ---------------------------------------------------------------------------
 // boot
