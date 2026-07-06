@@ -363,6 +363,43 @@ async function ensure(t) {
   }
 }
 
+// Items on a wire at the current sub-tick, shared by the run and live-edit
+// views. On a belt (lat>0) they spread along the wire and drift; on a
+// zero-latency hop they pulse across. Structured items draw as their real
+// shape, primitives as a colored dot.
+function drawWireItems(p, ty, lat, transit, flow, phase) {
+  const cells = tyCells(ty);
+  const drawItem = q => {
+    if (cells && cells.length > 1) drawThumb(cells, q.x, q.y, 3);
+    else {
+      ctx.fillStyle = tyColor(ty);
+      ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, 7); ctx.fill();
+    }
+  };
+  if (lat > 0) {
+    const dots = Math.min(transit, 8);
+    for (let j = 0; j < dots; j++)
+      drawItem(pointAt(p, ((j + phase) % dots) / dots * 0.9 + 0.05));
+    if (transit > 8) {
+      const q = pointAt(p, 0.5);
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 11px system-ui';
+      ctx.fillText('×' + transit, q.x + 6, q.y - 6);
+    }
+  } else if (flow > 0) {
+    const dots = Math.min(flow, 6);
+    for (let j = 0; j < dots; j++) {
+      const s = phase - j * 0.07;
+      if (s < 0 || s > 1) continue;
+      drawItem(pointAt(p, s));
+    }
+    if (flow > 6) {
+      const q = pointAt(p, Math.min(Math.max(phase, 0.05), 0.95));
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 11px system-ui';
+      ctx.fillText('×' + flow, q.x + 6, q.y - 6);
+    }
+  }
+}
+
 function draw() {
   const W = cv.getBoundingClientRect().width, H = cv.getBoundingClientRect().height;
   ctx.clearRect(0, 0, W, H);
@@ -374,44 +411,13 @@ function draw() {
     const p = wirePath(S.pos, sc.nodes, e.from, e.to);
     strokePath(p, tyColor(e.ty) + '44', 2);
     const lat = sc.lats ? sc.lats[i] : 0;
-    const cells = tyCells(e.ty);
-    const drawItem = q => {
-      if (cells && cells.length > 1) drawThumb(cells, q.x, q.y, 3);
-      else {
-        ctx.fillStyle = tyColor(e.ty);
-        ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, 7); ctx.fill();
-      }
-    };
+    const transit = cur && cur.transit ? cur.transit[i] : 0;
+    const flow = nxt ? nxt.flow[i] : 0;
+    drawWireItems(p, e.ty, lat, transit, flow, phase);
     if (lat > 0 && cur) {
-      // Items physically in transit, spread along the wire and drifting.
-      const transit = cur.transit ? cur.transit[i] : 0;
-      const dots = Math.min(transit, 8);
-      for (let j = 0; j < dots; j++) {
-        drawItem(pointAt(p, ((j + phase) % dots) / dots * 0.9 + 0.05));
-      }
-      if (transit > 8) {
-        const q = pointAt(p, 0.5);
-        ctx.fillStyle = '#fff'; ctx.font = 'bold 11px system-ui';
-        ctx.fillText('×' + transit, q.x + 6, q.y - 6);
-      }
       const mid = pointAt(p, 0.5);
       ctx.fillStyle = '#5d6875'; ctx.font = '9.5px system-ui';
       ctx.fillText(lat + 't', mid.x - 6, mid.y + 12);
-    } else if (nxt) {
-      const flow = nxt.flow[i];
-      if (flow > 0) {
-        const dots = Math.min(flow, 6);
-        for (let j = 0; j < dots; j++) {
-          const s = phase - j * 0.07;
-          if (s < 0 || s > 1) continue;
-          drawItem(pointAt(p, s));
-        }
-        if (flow > 6) {
-          const q = pointAt(p, Math.min(Math.max(phase, 0.05), 0.95));
-          ctx.fillStyle = '#fff'; ctx.font = 'bold 11px system-ui';
-          ctx.fillText('×' + flow, q.x + 6, q.y - 6);
-        }
-      }
     }
   });
 
@@ -514,6 +520,7 @@ function saveDraft() {
     if (E.pos.nodes) flushPos();
     localStorage.setItem('hashtorio.draft.v2', JSON.stringify(E.draft));
   } catch (_) {}
+  scheduleLive();
 }
 function loadDraft() {
   try {
@@ -894,6 +901,56 @@ function applyScene(scene, customPos) {
 }
 
 // ---------------------------------------------------------------------------
+// live editing: apply-as-you-go
+// ---------------------------------------------------------------------------
+// Every edit debounces a POST to /api/live, which recompiles and swaps the
+// running factory *keeping its clock* and conserving preloads. On success
+// the animation hot-swaps and keeps playing at the same tick; a refusal
+// leaves the last good line running and just says why.
+let liveTimer = null, liveInFlight = false, livePending = false, liveErrAt = 0;
+
+function hotSwap(scene) {
+  S.scene = scene; TYPES = scene.types;
+  S.frames.clear(); S.fetching.clear();      // frames now describe the new line
+  const px = ps => ps.map(([x, y]) => ({ x: x * GRID, y: y * GRID }));
+  if (scene.pos && scene.pos.nodes.length === scene.nodes.length)
+    S.customPos = { inputs: px(scene.pos.inputs), nodes: px(scene.pos.nodes),
+                    outputs: px(scene.pos.outputs) };
+  layout(); fillPanel(); ensure(S.t);        // S.t preserved: the line kept running
+}
+
+function scheduleLive() {
+  if (S.mode !== 'edit') return;
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(runLive, 260);
+}
+
+async function runLive() {
+  if (liveInFlight) { livePending = true; return; }
+  liveInFlight = true;
+  try {
+    flushPos();
+    const sentSig = alignSig(E.draft);
+    const body = JSON.stringify(E.draft);
+    const r = await (await fetch('/api/live', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    })).json();
+    if (r.ok) {
+      hotSwap(r.scene);
+      S.appliedSig = sentSig;                 // overlay may animate again
+      if (r.state) applyState(r.state);
+      if (r.grant) toast(r.grant);
+    } else if (performance.now() - liveErrAt > 1500) {
+      toast(r.error, true); liveErrAt = performance.now();
+    }
+  } catch (_) {
+  } finally {
+    liveInFlight = false;
+    if (livePending) { livePending = false; scheduleLive(); }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // edit mode: hit testing & interaction
 // ---------------------------------------------------------------------------
 function editorHit(x, y) {
@@ -1114,6 +1171,61 @@ function port(q, ty) {
   ctx.strokeStyle = '#14171c'; ctx.lineWidth = 1; ctx.stroke();
 }
 
+// Frame arrays (occ[n], flow[i], fired[n]) line up with the applied draft's
+// node/wire indices. This signature captures exactly what must match for
+// that alignment to hold — node kinds + leg counts, wire endpoints, port
+// counts — and nothing that doesn't (positions, labels, latency, markings).
+// The live overlay only draws while the current draft still matches it.
+function alignSig(d) {
+  return JSON.stringify([
+    d.nodes.map(n => [n.kind, legsIn(n).length, legsOut(n).length]),
+    d.wires.map(w => [w.from, w.to]),
+    d.inputs.length, d.outputs.length,
+  ]);
+}
+
+// The live animation drawn on top of the editor at the top level: items
+// flowing on wires, firing glow and queue depth on machines — all from the
+// same O(1) frame reads the run view uses. It appears only while the draft
+// still matches what the server last compiled (so indices are aligned).
+function drawLiveOverlay() {
+  if (E.path.length) return;                    // inside a sealed module: no data
+  const sc = S.scene;
+  if (!sc || alignSig(E.draft) !== S.appliedSig) return;
+  const T = Math.floor(S.t), phase = S.t - T;
+  const cur = S.frames.get(T), nxt = S.frames.get(T + 1);
+  const d = E.draft;
+  d.wires.forEach((w, i) => {
+    const p = editWirePath(w);
+    const lat = sc.lats ? sc.lats[i] : 0;
+    const transit = cur && cur.transit ? cur.transit[i] : 0;
+    const flow = nxt ? nxt.flow[i] : 0;
+    drawWireItems(p, sinkType(w.to), lat, transit, flow, phase);
+  });
+  if (!cur) return;
+  d.nodes.forEach((node, n) => {
+    const ep = E.pos.nodes[n]; if (!ep) return;
+    const p = withSize(ep, node);
+    const fired = nxt ? nxt.fired[n] : 0;
+    if (fired > 0) {
+      roundRect(p.x, p.y, p.w, p.h, 9);
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = `rgba(244,185,66,${0.35 + 0.65 * Math.sin(Math.PI * phase)})`;
+      ctx.stroke();
+      ctx.fillStyle = '#f4b942'; ctx.font = '10px system-ui'; ctx.textAlign = 'right';
+      ctx.fillText('⚙×' + fired, p.x + p.w - 6, p.y - 4); ctx.textAlign = 'left';
+    }
+    const occ = cur.occ[n]; if (!occ) return;
+    legsIn(node).forEach((ty, l) => {
+      const val = occ[l];
+      if (val === null || val === undefined || val === 0) return;
+      const pp = inPortPos(p, l);
+      ctx.fillStyle = tyColor(ty); ctx.font = '9px system-ui'; ctx.textAlign = 'right';
+      ctx.fillText(val, pp.x - 10, pp.y + 3); ctx.textAlign = 'left';
+    });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // chrome
 // ---------------------------------------------------------------------------
@@ -1126,6 +1238,7 @@ function toast(msg, isErr) {
 }
 
 function setMode(m) {
+  const leavingEdit = S.mode === 'edit' && m === 'run';
   S.mode = m;
   document.body.classList.toggle('editing', m === 'edit');
   document.getElementById('modebtn').innerHTML =
@@ -1136,6 +1249,10 @@ function setMode(m) {
   if (m === 'edit' && !E.pos.nodes.length && (E.draft.nodes.length || E.draft.inputs.length)) {
     loadPos();
   }
+  // Entering edit: apply the current draft so the animation lights up right
+  // away. Going to watch: flush any pending edit so the run view is current.
+  if (m === 'edit') scheduleLive();
+  if (leavingEdit) { clearTimeout(liveTimer); runLive(); }
 }
 
 function setTool(t) {
@@ -1192,7 +1309,10 @@ function loop(now) {
     if (document.activeElement !== scrub && S.t <= +scrub.max)
       scrub.value = Math.floor(S.t);
   } else {
+    if (S.playing) S.t += dt * S.tps;   // the line keeps running while you edit
+    ensure(S.t);
     drawEdit();
+    drawLiveOverlay();
   }
   requestAnimationFrame(loop);
 }
