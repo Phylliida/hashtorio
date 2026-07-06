@@ -76,6 +76,10 @@ struct App {
     goal_achieved: bool,
     /// Where the economy persists (None in tests).
     save_path: Option<std::path::PathBuf>,
+    /// Cached drilled interior for the module path the editor is viewing,
+    /// so /api/subframes can animate a sealed module from the inside. The
+    /// sub-draft is fed the parent's real per-leg flows, not declared rates.
+    subview: Option<(Vec<usize>, Compiled)>,
 }
 
 const KINDS: [&str; 7] = ["weld", "rot", "split", "belt", "recipe", "priority", "module"];
@@ -139,6 +143,7 @@ impl App {
             clock: 0,
             goal_achieved: false,
             save_path,
+            subview: None,
         };
         // The pre-deployed demo consumed its preloads like any compile.
         let demo_draft = app.current.draft.clone();
@@ -208,6 +213,7 @@ impl App {
                 .map(|g| matches!(g, Json::Bool(true)))
                 .unwrap_or(false),
             save_path,
+            subview: None,
         })
     }
 
@@ -353,6 +359,7 @@ impl App {
         }
         self.pay_markings(&draft);
         self.current = compiled; // clock intentionally preserved
+        self.subview = None; // the interior cache is stale after a retool
         let grant = self.maybe_goal_grant();
         self.save();
         Ok(format!(
@@ -360,6 +367,71 @@ impl App {
             scene_json(self),
             state_json(self)
         ))
+    }
+
+    /// Compile the sub-draft the editor is viewing (a module path from the
+    /// top), feeding each level the *actual* flows its parent delivers to
+    /// that module's ports — so the interior animates as it really runs,
+    /// not at its declared design rates. Nesting is handled by drilling one
+    /// module at a time, carrying the real per-leg supplies down.
+    fn drill(&mut self, path: &[usize]) -> Result<Compiled, String> {
+        let mut draft = self.current.draft.clone();
+        let mut comp = compile_with_flows(&mut self.lib, &mut self.structs, draft.clone(), None)?;
+        for &idx in path {
+            let sub = match draft.nodes.get(idx) {
+                Some(DraftNode::Module { draft, .. }) => (**draft).clone(),
+                _ => return Err("that path does not point at a module".into()),
+            };
+            let flows = comp
+                .supplies
+                .get(idx)
+                .cloned()
+                .ok_or("module index out of range")?;
+            comp = compile_with_flows(&mut self.lib, &mut self.structs, sub.clone(), Some(flows))?;
+            draft = sub;
+        }
+        Ok(comp)
+    }
+
+    /// Ensure `self.subview` holds the drilled interior for `path`, drilling
+    /// (and caching) on a miss. Returns false for the empty path or a drill
+    /// failure, so callers serve an empty interior rather than an error.
+    fn ensure_subview(&mut self, path: &[usize]) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        let hit = matches!(&self.subview, Some((p, _)) if p == path);
+        if !hit {
+            match self.drill(path) {
+                Ok(c) => self.subview = Some((path.to_vec(), c)),
+                Err(_) => {
+                    self.subview = None;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Per-tick interior data for the module at `path`, aligned to that
+    /// sub-draft's own node/wire indices.
+    fn subframes(&mut self, path: &[usize], from: u64, n: u64) -> String {
+        if !self.ensure_subview(path) {
+            return format!("{{\"from\":{from},\"frames\":[]}}");
+        }
+        frames_json(&self.subview.as_ref().unwrap().1, from, n)
+    }
+
+    /// The interior scene for the module at `path` — chiefly its `types`
+    /// (items that live only inside the seal) and per-wire `lats`.
+    fn subscene(&mut self, path: &[usize]) -> String {
+        if !self.ensure_subview(path) {
+            return "{\"types\":[],\"inputs\":[],\"outputs\":[],\"nodes\":[],\"edges\":[],\
+                    \"lats\":[],\"pos\":{\"inputs\":[],\"nodes\":[],\"outputs\":[]},\
+                    \"spec\":[],\"audit\":[],\"goal\":null}"
+                .into();
+        }
+        scene_json_for(self, &self.subview.as_ref().unwrap().1)
     }
 }
 
@@ -393,9 +465,21 @@ fn compile(
     structs: &mut StructLib,
     draft: Draft,
 ) -> Result<Compiled, String> {
+    compile_with_flows(lib, structs, draft, None)
+}
+
+/// Like [`compile`], but the input flows can be overridden. Drilling into a
+/// sealed module compiles its sub-draft with the parent's *actual* per-leg
+/// supply flows (`None` = use the draft's own declared input rates).
+fn compile_with_flows(
+    lib: &mut Library,
+    structs: &mut StructLib,
+    draft: Draft,
+    override_flows: Option<Vec<Counting>>,
+) -> Result<Compiled, String> {
     let built = draft.build(lib, structs)?;
-    let (id, input_flows, node_types, wire_lats) =
-        (built.id, built.flows, built.node_types, built.wire_lats);
+    let (id, node_types, wire_lats) = (built.id, built.node_types, built.wire_lats);
+    let input_flows = override_flows.unwrap_or(built.flows);
     let mut ev = Evaluator::new(lib);
     ev.horizon = GUI_HORIZON;
     let detail = ev
@@ -645,7 +729,13 @@ fn draft_json(d: &Draft) -> String {
 }
 
 fn scene_json(app: &App) -> String {
-    let c = &app.current;
+    scene_json_for(app, &app.current)
+}
+
+/// Render any [`Compiled`] as a scene (topology + spec + audit + types).
+/// `scene_json` uses the live factory; drilling uses a sealed module's
+/// interior, so its `types`/`lats` cover items that live only inside.
+fn scene_json_for(app: &App, c: &Compiled) -> String {
     let structs = &app.structs;
     let d = &c.draft;
     let marking_of = |to: DraftTo| -> u64 {
@@ -1124,6 +1214,15 @@ fn parse_draft(body: &str, structs: &StructLib) -> Result<Draft, String> {
 // HTTP
 // ---------------------------------------------------------------------------
 
+/// A `path=0,1,2` query into module indices (empty/absent = top level).
+fn parse_path(query: &str) -> Vec<usize> {
+    query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("path="))
+        .map(|v| v.split(',').filter_map(|s| s.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
 fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'static str, String) {
     let (route, query) = path.split_once('?').unwrap_or((path, ""));
     let param = |key: &str| -> Option<u64> {
@@ -1141,6 +1240,17 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
             let from = param("from").unwrap_or(0);
             let n = param("n").unwrap_or(32);
             ("200 OK".into(), "application/json", frames_json(&app.current, from, n))
+        }
+        // Interior of the sealed module at ?path=i,j,… — animated from the
+        // inside, fed the flows its parent really delivers.
+        ("GET", "/api/subframes") => {
+            let path = parse_path(query);
+            let from = param("from").unwrap_or(0);
+            let n = param("n").unwrap_or(32);
+            ("200 OK".into(), "application/json", app.subframes(&path, from, n))
+        }
+        ("GET", "/api/subscene") => {
+            ("200 OK".into(), "application/json", app.subscene(&parse_path(query)))
         }
         ("GET", "/api/state") => ("200 OK".into(), "application/json", state_json(app)),
         ("POST", "/api/harvest") => {
@@ -1166,6 +1276,7 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
             match result {
                 Ok(compiled) => {
                     app.current = compiled;
+                    app.subview = None; // interior cache stale after a retool
                     app.clock = 0; // retooling: the line starts cold
                     let paid = app.current.draft.clone();
                     app.pay_markings(&paid); // preloads are real items
@@ -1331,6 +1442,32 @@ mod tests {
             iron_before - 30,
             "a refused live edit leaves inventory (and the line) intact"
         );
+    }
+
+    #[test]
+    fn drilling_animates_a_sealed_module_interior() {
+        let mut app = test_app();
+        // Node 5 is the demo's "chassis store" module.
+        let (_, _, scene) = route(&mut app, "GET", "/api/subscene?path=5", "");
+        assert!(scene.contains("\"tap\""), "interior recipe present: {scene}");
+        assert!(scene.contains("\"gate\""), "interior gate present: {scene}");
+        // The interior genuinely animates: at a settled tick both the tap
+        // recipe and the gate have fired (deterministic — exact maps).
+        let (_, _, f) = route(&mut app, "GET", "/api/subframes?path=5&from=100&n=1", "");
+        assert!(f.contains("\"fired\":[1,1]"), "interior machines fire: {f}");
+        // A path that isn't a module degrades to an empty interior, not an error.
+        let (_, _, empty) = route(&mut app, "GET", "/api/subframes?path=0&from=0&n=1", "");
+        assert!(empty.contains("\"frames\":[]"), "{empty}");
+        // A retool invalidates the interior cache (next drill is fresh).
+        let (_, _, _) = route(&mut app, "GET", "/api/subframes?path=5&from=0&n=1", "");
+        assert!(app.subview.is_some(), "interior cached after a drill");
+        let drip = r#"{"inputs":[],"outputs":[{"ty":0,"label":"o"}],
+            "nodes":[{"kind":"recipe","label":"drip","consume":[[0,1]],
+                      "produce":[[0,1]],"latency":1}],
+            "wires":[{"from":["node",0,0],"to":["out",0]}],"markings":[],
+            "pos":{"inputs":[],"nodes":[[4,4]],"outputs":[[10,4]]}}"#;
+        route(&mut app, "POST", "/api/live", drip);
+        assert!(app.subview.is_none(), "retool clears the interior cache");
     }
 
     #[test]
