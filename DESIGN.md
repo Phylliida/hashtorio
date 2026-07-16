@@ -304,7 +304,19 @@ degrades as they use more of it.
   Amusingly, the E2E initially "failed" because persistence worked too
   well: a test server restored a previous test's edited save.
 
-**Beyond M12 (future):** input-regime-parametric summaries (deferred from
+- **M13** ✅ (G0 of DESIGN-motion.md): placed belts are semantic. Every
+  wire routes through the grid at compile (`route.rs`: deterministic,
+  translation-covariant A* around chassis footprints, turn penalty,
+  L-path fallback when hemmed); the routed length *is* the latency and
+  the belt cost, and the scene carries the paths so the GUI draws exactly
+  what the player paid for. Repricing immediately re-taught the M10
+  lesson twice: the demo's demand clock self-loop must round its own
+  chassis (5 cells = the whole 1/2 period — recipe latency dropped to 0),
+  and the train's return track wraps its unload dock (cycle 24 → 25).
+  Saves whose loops were tuned to Manhattan fictions may refuse on
+  restore (preserved as `.bad`, economy intact) — space got truer.
+
+**Beyond M13 (future):** input-regime-parametric summaries (deferred from
 M5); richer constructor algebra (transmutation rules, 3D cells); goal
 ladders and progression; multiple save slots; WASM build.
 

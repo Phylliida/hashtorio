@@ -96,13 +96,16 @@ pub fn draft(structs: &mut StructLib) -> Draft {
         op: BuildOp::Weld { dx: 0, dy: 2 },
         latency: 2,
     });
-    // In factory-space the clock's feedback wire has physical length
-    // (+1 tick), so recipe latency 1 gives the intended 1/2 period.
+    // In factory-space the clock's feedback loop must round its own
+    // chassis — 5 cells of placed belt, 2 ticks. That alone is the whole
+    // period: recipe latency 0 gives the intended 1/2 demand beat. (Under
+    // the old Manhattan rule this loop pretended to be 1 tick; routed
+    // belts repriced it, exactly the "space is semantic" lesson of M10.)
     d.nodes.push(DraftNode::Recipe {
         label: "demand clock (1/2)".into(),
         consume: vec![(TOK, 1)],
         produce: vec![(TOK, 1), (DEMAND, 1)],
-        latency: 1,
+        latency: 0,
     });
     d.nodes.push(DraftNode::Module {
         label: "chassis store".into(),

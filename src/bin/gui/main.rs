@@ -48,6 +48,8 @@ struct Compiled {
     node_types: Vec<(Vec<ItemType>, Vec<ItemType>)>,
     /// Geometric latency per wire; arrivals = departures shifted by it.
     wire_lats: Vec<u64>,
+    /// Routed belt path per wire — the placed cells the latency measures.
+    wire_routes: Vec<Vec<(i32, i32)>>,
     /// Per wire: the arrival counting map at the sink end.
     arrivals: Vec<Counting>,
     summary: Summary,
@@ -478,7 +480,8 @@ fn compile_with_flows(
     override_flows: Option<Vec<Counting>>,
 ) -> Result<Compiled, String> {
     let built = draft.build(lib, structs)?;
-    let (id, node_types, wire_lats) = (built.id, built.node_types, built.wire_lats);
+    let (id, node_types, wire_lats, wire_routes) =
+        (built.id, built.node_types, built.wire_lats, built.wire_routes);
     let input_flows = override_flows.unwrap_or(built.flows);
     let mut ev = Evaluator::new(lib);
     ev.horizon = GUI_HORIZON;
@@ -565,6 +568,7 @@ fn compile_with_flows(
         consumed,
         node_types,
         wire_lats,
+        wire_routes,
         arrivals,
         summary,
         audit,
@@ -822,12 +826,18 @@ fn scene_json_for(app: &App, c: &Compiled) -> String {
     let edges: Vec<String> = d
         .wires
         .iter()
-        .map(|(from, to)| {
+        .enumerate()
+        .map(|(w, (from, to))| {
+            let cells: Vec<String> = c.wire_routes[w]
+                .iter()
+                .map(|(x, y)| format!("[{x},{y}]"))
+                .collect();
             format!(
-                "{{\"from\":{},\"to\":{},\"ty\":{}}}",
+                "{{\"from\":{},\"to\":{},\"ty\":{},\"route\":[{}]}}",
                 from_json(from),
                 to_json(to),
-                edge_ty(to).0
+                edge_ty(to).0,
+                cells.join(",")
             )
         })
         .collect();
@@ -1473,8 +1483,10 @@ mod tests {
     /// DESIGN-motion.md V1: a train, from existing primitives only.
     /// Track = loop of wires; vehicle = a token circulating it; stations =
     /// recipes. The timetable is the critical circuit: cycle = load(2) +
-    /// outbound(8) + unload(2) + return(12) = 24 ticks, so one train
-    /// delivers 1 ore / 24 ticks — and doubling the fleet doubles the rate.
+    /// outbound(8) + unload(2) + return(13) = 25 ticks, so one train
+    /// delivers 1 ore / 25 ticks — and doubling the fleet doubles the rate.
+    /// (The return leg is 13, not the Manhattan 12: placed belts are
+    /// semantic, and the track physically wraps around the unload dock.)
     #[test]
     fn a_train_circulates_and_delivers() {
         let mut app = test_app();
@@ -1498,7 +1510,7 @@ mod tests {
         };
         let (_, _, body) = route(&mut app, "POST", "/api/live", &draft(1));
         assert!(body.contains("\"ok\":true"), "{body}");
-        assert!(body.contains("\"rate\":[1,24]"), "one train: 1/24: {body}");
+        assert!(body.contains("\"rate\":[1,25]"), "one train: 1/25: {body}");
 
         // The train is physically on the track: over one cycle, both track
         // segments (wires 1 and 2) carry it in transit at some phase.
@@ -1520,7 +1532,7 @@ mod tests {
         // same cycle, twice the throughput.
         let (_, _, body) = route(&mut app, "POST", "/api/live", &draft(2));
         assert!(body.contains("\"ok\":true"), "{body}");
-        assert!(body.contains("\"rate\":[1,12]"), "two trains: 1/12: {body}");
+        assert!(body.contains("\"rate\":[2,25]"), "two trains: 2/25: {body}");
     }
 
     #[test]

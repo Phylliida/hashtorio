@@ -277,14 +277,50 @@ impl Draft {
         }
     }
 
-    /// Wire latency from geometry: Manhattan distance over belt speed.
-    fn wire_latency(&self, structs: &mut StructLib, from: &DraftFrom, to: &DraftTo) -> u64 {
-        if !self.spatial() {
-            return 0;
+    /// The obstacle set for belt routing — exactly the cells that
+    /// [`Draft::check_footprints`] claims: machine chassis, source tiles,
+    /// output tiles. Port cells sit just outside footprints and stay free.
+    fn obstacle_cells(&self, structs: &mut StructLib) -> std::collections::HashSet<(i32, i32)> {
+        let mut obs = std::collections::HashSet::new();
+        for (i, _) in self.inputs.iter().enumerate() {
+            obs.insert(self.input_pos[i]);
         }
-        let a = self.out_port_cell(structs, from);
-        let b = self.in_port_cell(to);
-        (((a.0 - b.0).abs() + (a.1 - b.1).abs()) / BELT_SPEED) as u64
+        for (n, node) in self.nodes.iter().enumerate() {
+            let p = self.node_pos[n];
+            let ch = crate::structure::chassis(structs, kind_str(node));
+            for &(x, y, _) in structs.cells(ch).iter() {
+                obs.insert((p.0 + x, p.1 + y));
+            }
+        }
+        for (o, _) in self.outputs.iter().enumerate() {
+            let p = self.output_pos[o];
+            obs.insert(p);
+            obs.insert((p.0, p.1 + 1));
+        }
+        obs
+    }
+
+    /// Route every wire through the grid. The path is *semantic*: its
+    /// length is the wire's latency and its belt cost (placed belts, G0).
+    /// Abstract drafts (no positions) get empty paths — latency 0, as ever.
+    pub fn wire_routes(&self, structs: &mut StructLib) -> Vec<Vec<(i32, i32)>> {
+        if !self.spatial() {
+            return vec![Vec::new(); self.wires.len()];
+        }
+        let obs = self.obstacle_cells(structs);
+        self.wires
+            .iter()
+            .map(|(from, to)| {
+                let a = self.out_port_cell(structs, from);
+                let b = self.in_port_cell(to);
+                crate::route::route(a, b, &obs)
+            })
+            .collect()
+    }
+
+    /// Wire latency from geometry: routed path length over belt speed.
+    fn route_latency(path: &[(i32, i32)]) -> u64 {
+        crate::route::steps(path) / BELT_SPEED as u64
     }
 
     /// Machines are their chassis: footprints must not overlap.
@@ -443,8 +479,8 @@ impl Draft {
                 draft.cost_into(structs, report)?;
             }
         }
-        for (from, to) in &self.wires {
-            report.belts += self.wire_latency(structs, from, to);
+        for path in self.wire_routes(structs) {
+            report.belts += Self::route_latency(&path);
         }
         for (to, n) in &self.markings {
             let ty = self
@@ -522,9 +558,10 @@ impl Draft {
         // Distance is time: each wire with geometric latency compiles into
         // an identity belt recipe. Belt nodes are appended after user nodes,
         // so user indices stay 1:1 with the draft.
+        let wire_routes = self.wire_routes(structs);
         let mut wire_lats = Vec::with_capacity(self.wires.len());
-        for (from, to) in &self.wires {
-            let lat = self.wire_latency(structs, from, to);
+        for (wi, (from, to)) in self.wires.iter().enumerate() {
+            let lat = Self::route_latency(&wire_routes[wi]);
             wire_lats.push(lat);
             let src = match *from {
                 DraftFrom::Input(i) => ins[i],
@@ -566,7 +603,7 @@ impl Draft {
                 }
             })
             .collect();
-        Ok(Built { id, flows, node_types, wire_lats })
+        Ok(Built { id, flows, node_types, wire_lats, wire_routes })
     }
 }
 
@@ -591,6 +628,9 @@ pub struct Built {
     pub node_types: Vec<(Vec<ItemType>, Vec<ItemType>)>,
     /// Geometric latency per draft wire (0 = instant/abstract).
     pub wire_lats: Vec<u64>,
+    /// The routed belt path per wire (cells, endpoints included; empty in
+    /// abstract mode). Semantic: `wire_lats[i] = steps(routes[i]) / SPEED`.
+    pub wire_routes: Vec<Vec<(i32, i32)>>,
 }
 
 fn friendly_net_error(e: &NetError, draft: &Draft) -> String {

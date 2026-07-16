@@ -177,6 +177,7 @@ const shortName = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
 const S = { mode:'edit', t:0, playing:true, tps:10, scene:null, frames:new Map(),
             fetching:new Set(), pos:null, customPos:null, last:performance.now(),
             subFrames:new Map(), subFetching:new Set(), subLats:null, subNodes:null,
+            subEdges:null,
             cam:{ scale:1, x:0, y:0 }, pan:null, view:'world', mouseScr:null };
 try { S.view = localStorage.getItem('hashtorio.view') || 'world'; } catch (_) {}
 const E = { draft:{ inputs:[], outputs:[], nodes:[], wires:[], markings:[] },
@@ -455,7 +456,7 @@ function mergeTypes(list) {
 // and drop any stale interior frames.
 async function refreshSub() {
   S.subFrames.clear(); S.subFetching.clear();
-  if (!E.path.length) { S.subLats = null; S.subNodes = null; return; }
+  if (!E.path.length) { S.subLats = null; S.subNodes = null; S.subEdges = null; return; }
   const pathq = E.path.join(',');
   try {
     const sc = await (await fetch('/api/subscene?path=' + pathq)).json();
@@ -463,7 +464,8 @@ async function refreshSub() {
     mergeTypes(sc.types); harvestChassis(sc.nodes);
     S.subLats = sc.lats || [];
     S.subNodes = sc.nodes || null;   // resolved port types for editor labels
-  } catch (_) { S.subLats = null; S.subNodes = null; }
+    S.subEdges = sc.edges || null;   // routed belt paths for the interior
+  } catch (_) { S.subLats = null; S.subNodes = null; S.subEdges = null; }
 }
 
 // Interior per-tick frames for the module the editor is inside (mirrors
@@ -1415,23 +1417,47 @@ function editorHit(x, y) {
       return { kind:'output', idx:o };
   }
   for (let w = 0; w < d.wires.length; w++) {
-    const mid = pointAt(editWirePath(d.wires[w]), 0.5);
+    const mid = pointAt(editWirePath(d.wires[w], w), 0.5);
     if (near(mid, 10)) return { kind:'wire', idx:w };
   }
   return null;
 }
 const withSize = (p, node) => ({ ...p, ...nodeSize(node) });
-const editWirePath = w => wirePath(
-  { nodes: E.pos.nodes.map((p, i) => withSize(p, D().nodes[i])),
-    inputs: E.pos.inputs, outputs: E.pos.outputs },
-  D().nodes, w.from, w.to);
+// Placed belts are semantic: when the draft matches what the server last
+// compiled, draw the server's routed path — the exact cells the latency
+// and belt cost measure. The local A* is only the live preview while a
+// drag or edit is in flight (the apply lands ~260ms later).
+let ALIGNED = false;   // refreshed each frame by drawEdit
+function serverRoute(i, a, b) {
+  if (!ALIGNED || S.view !== 'world' || i === undefined) return null;
+  const edges = E.path.length ? S.subEdges : (S.scene && S.scene.edges);
+  const e = edges && edges[i];
+  if (!e || !e.route || e.route.length < 2) return null;
+  // Stale guard: the route must still start and end at the current ports.
+  const cell = q => [Math.round((q.x - GRID / 2) / GRID),
+                     Math.round((q.y - GRID / 2) / GRID)];
+  const ca = cell(a), cb = cell(b), last = e.route[e.route.length - 1];
+  if (e.route[0][0] !== ca[0] || e.route[0][1] !== ca[1]) return null;
+  if (last[0] !== cb[0] || last[1] !== cb[1]) return null;
+  return polyFromCells(e.route);
+}
+const editWirePath = (w, i) => {
+  const pos = { nodes: E.pos.nodes.map((p, j) => withSize(p, D().nodes[j])),
+                inputs: E.pos.inputs, outputs: E.pos.outputs };
+  if (S.view === 'world' && ALIGNED && i !== undefined) {
+    const sr = serverRoute(i, endpointPos(pos, D().nodes, w.from, true),
+                              endpointPos(pos, D().nodes, w.to, false));
+    if (sr) return sr;
+  }
+  return wirePath(pos, D().nodes, w.from, w.to);
+};
 // Hover in the editor: everything editorHit sees, plus whole belts.
 function editHover(x, y) {
   const hit = editorHit(x, y);
   if (hit) return hit;
   const d = D();
   for (let i = 0; i < d.wires.length; i++)
-    if (distToPath(editWirePath(d.wires[i]), x, y) < 9)
+    if (distToPath(editWirePath(d.wires[i], i), x, y) < 9)
       return { kind: 'wire', idx: i };
   return null;
 }
@@ -1537,10 +1563,12 @@ function drawEdit() {
     buildObstacles(d.nodes, E.pos.nodes, E.pos.inputs, E.pos.outputs);
 
   d.wires.forEach((w, i) => {
-    const p = editWirePath(w);
+    const p = editWirePath(w, i);
     if (S.view === 'world') strokeBelt(p, tyColor(sinkType(w.to)));
     else strokePath(p, tyColor(sinkType(w.to)) + '88', 2);
-    const lat = wireLatencyPreview(w.from, w.to);
+    // The label states the drawn path's own length — what you pay.
+    const lat = p.poly ? Math.floor(Math.round(p.len / GRID) / BELT_SPEED)
+                       : wireLatencyPreview(w.from, w.to);
     if (lat > 0) {
       const mid = pointAt(p, 0.5);
       ctx.fillStyle = '#5d6875'; ctx.font = '9.5px system-ui';
@@ -1585,6 +1613,7 @@ function drawEdit() {
   // show their *inferred* concrete pieces instead of "any".
   const resolved = E.path.length ? S.subNodes : (S.scene && S.scene.nodes);
   const aligned = resolved && S.appliedSig && alignSig(E.draft) === S.appliedSig;
+  ALIGNED = !!aligned && !E.drag;   // mid-drag, belts preview locally
   const mw = S.mouseScr && !E.drag && !S.pan
     ? toWorld(S.mouseScr.x, S.mouseScr.y) : null;
   const hovE = mw ? editHover(mw.x, mw.y) : null;
@@ -1773,8 +1802,11 @@ function drawEdit() {
       rows = [{ text: out.label, bold: true }, shapeRow(out.ty, tyName(out.ty))];
     } else if (hovE.kind === 'wire') {
       const w2 = d.wires[hovE.idx], ty = sinkType(w2.to);
+      const p2 = editWirePath(w2, hovE.idx);
+      const lat2 = p2.poly ? Math.floor(Math.round(p2.len / GRID) / BELT_SPEED)
+                           : wireLatencyPreview(w2.from, w2.to);
       rows = [{ text: 'belt', bold: true }, shapeRow(ty, tyName(ty)),
-              { text: `latency ${wireLatencyPreview(w2.from, w2.to)}t`,
+              { text: `latency ${lat2}t · ${lat2} belt segments`,
                 color: '#9aa5b1' }];
     }
     drawHoverCard(rows, S.mouseScr.x, S.mouseScr.y);
@@ -1826,7 +1858,7 @@ function drawLiveOverlay() {
   const d = D();                                 // the level being edited
   camApply();
   d.wires.forEach((w, i) => {
-    const p = editWirePath(w);
+    const p = editWirePath(w, i);
     const transit = cur && cur.transit ? cur.transit[i] : 0;
     const flow = nxt ? nxt.flow[i] : 0;
     drawWireItems(p, sinkType(w.to), latOf(i), transit, flow, phase);
