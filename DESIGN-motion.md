@@ -158,9 +158,13 @@ as it handles aperiodic flows. The caching-tier motto extends cleanly:
 
 - **V0** ✅: pin translation-invariance
   (`draft.rs::translation_yields_the_same_net_id`).
-- **V1**: the train — built from existing primitives in the live game
-  (track loop, two stations, cargo cycle), proof by working machine. Then,
-  optionally, the editor vehicle/track sugar that compiles to exactly that.
+- **V1** ✅: the train — built from existing primitives only (track loop,
+  two station recipes, one circulating token; `demos/train/`). The
+  timetable held on first contact: cycle 24 ⇒ 1 ore per 24 ticks, first
+  delivery t=13, audit closes with the train conserved; two trains ⇒ 1/12
+  (fleet scaling = the (max,+) theorem). Regression:
+  `gui::tests::a_train_circulates_and_delivers`. Still open: the editor
+  vehicle/track sugar that compiles to exactly this.
 - **V2**: mobile factories — soul/body idiom (module + clock-windowed ports),
   plus GUI rendering of the body token as the module's chassis moving along
   its track.
