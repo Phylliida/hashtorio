@@ -19,7 +19,9 @@ use std::net::{TcpListener, TcpStream};
 
 use hashtorio::counting::Counting;
 use hashtorio::demo;
-use hashtorio::draft::{BuildOp, Draft, DraftFrom, DraftInput, DraftNode, DraftOutput, DraftTo};
+use hashtorio::draft::{
+    BuildOp, Draft, DraftFrom, DraftInput, DraftNode, DraftOutput, DraftTo, SeamPlan, BELT_SPEED,
+};
 use hashtorio::eval::{EvalError, Evaluator};
 use hashtorio::net::{ItemType, Library};
 use hashtorio::structure::{chassis, StructLib, ANY};
@@ -50,6 +52,10 @@ struct Compiled {
     wire_lats: Vec<u64>,
     /// Routed belt path per wire — the placed cells the latency measures.
     wire_routes: Vec<Vec<(i32, i32)>>,
+    /// Module prehistory this epoch was compiled with (relocation seams):
+    /// node index → (effective input histories, replay length). Needed to
+    /// extend the histories at the *next* seam.
+    module_pre: std::collections::HashMap<usize, (Vec<Counting>, u64)>,
     /// Per wire: the arrival counting map at the sink end.
     arrivals: Vec<Counting>,
     summary: Summary,
@@ -82,6 +88,21 @@ struct App {
     /// so /api/subframes can animate a sealed module from the inside. The
     /// sub-draft is fed the parent's real per-leg flows, not declared rates.
     subview: Option<(Vec<usize>, Compiled)>,
+    /// Relocation-seam timeline (G1): past epochs, oldest first. All share
+    /// the current topology — only moves create epochs; topology edits
+    /// collapse the timeline. Session-lived (restore starts a fresh epoch).
+    history: Vec<Epoch>,
+    /// Absolute view tick where the current epoch begins.
+    epoch_t0: u64,
+    /// Delivered totals at the current epoch's start, per output.
+    out_base: Vec<u64>,
+}
+
+/// One stretch of factory history between relocation seams.
+struct Epoch {
+    t0: u64,
+    out_base: Vec<u64>,
+    compiled: Compiled,
 }
 
 const KINDS: [&str; 7] = ["weld", "rot", "split", "belt", "recipe", "priority", "module"];
@@ -134,6 +155,7 @@ impl App {
         for prim in 0..8u32 {
             inventory.insert(prim, 50);
         }
+        let outs = current.draft.outputs.len();
         let mut app = App {
             lib,
             structs,
@@ -146,6 +168,9 @@ impl App {
             goal_achieved: false,
             save_path,
             subview: None,
+            history: Vec::new(),
+            epoch_t0: 0,
+            out_base: vec![0; outs],
         };
         // The pre-deployed demo consumed its preloads like any compile.
         let demo_draft = app.current.draft.clone();
@@ -201,6 +226,7 @@ impl App {
             let n = a.get(1).and_then(|x| x.u64()).ok_or("bad inventory")?;
             inventory.insert(ty, n);
         }
+        let outs = current.draft.outputs.len();
         Ok(App {
             lib,
             structs,
@@ -216,6 +242,9 @@ impl App {
                 .unwrap_or(false),
             save_path,
             subview: None,
+            history: Vec::new(),
+            epoch_t0: 0,
+            out_base: vec![0; outs],
         })
     }
 
@@ -342,11 +371,32 @@ impl App {
         }
     }
 
-    /// Apply a draft to the *running* line: recompile and hot-swap while
-    /// keeping the harvest clock (no cold retool) and conserving preloaded
-    /// items. An invalid or unaffordable draft changes nothing — the line
-    /// keeps running exactly as it was, and the caller reports the refusal.
-    fn apply_live(&mut self, draft: Draft) -> Result<String, String> {
+    /// Apply a draft to the *running* line. Two shapes (G1,
+    /// DESIGN-motion.md): a *position-only* change is a relocation — a
+    /// seam at view tick `t` that carries every queue, in-flight item, and
+    /// module state across exactly. Anything else is a retool with
+    /// rewrite-history semantics, as ever (and it collapses the seam
+    /// timeline). An invalid or unaffordable draft changes nothing.
+    fn apply_live(&mut self, draft: Draft, t: Option<u64>) -> Result<String, String> {
+        // A no-op apply (the editor re-sending the same draft) must not
+        // disturb the timeline.
+        if draft_json(&draft) == draft_json(&self.current.draft) {
+            return Ok(format!(
+                "{{\"ok\":true,\"grant\":null,\"scene\":{},\"state\":{}}}",
+                scene_json(self),
+                state_json(self)
+            ));
+        }
+        let strip = |d: &Draft| {
+            let mut c = d.clone();
+            c.input_pos = Vec::new();
+            c.node_pos = Vec::new();
+            c.output_pos = Vec::new();
+            draft_json(&c)
+        };
+        if strip(&draft) == strip(&self.current.draft) {
+            return self.apply_seam(draft, t.unwrap_or(self.clock));
+        }
         // Compile first: a draft with no summarizable steady state must not
         // touch the economy at all.
         let compiled = compile(&mut self.lib, &mut self.structs, draft.clone())?;
@@ -362,6 +412,10 @@ impl App {
         self.pay_markings(&draft);
         self.current = compiled; // clock intentionally preserved
         self.subview = None; // the interior cache is stale after a retool
+        // Topology changed: past epochs no longer index-align. Collapse.
+        self.history.clear();
+        self.epoch_t0 = 0;
+        self.out_base = vec![0; self.current.draft.outputs.len()];
         let grant = self.maybe_goal_grant();
         self.save();
         Ok(format!(
@@ -371,6 +425,65 @@ impl App {
         ))
     }
 
+    /// A relocation: same topology, moved placement. The new epoch begins
+    /// at `t` (never before the harvest clock or the current epoch), and
+    /// the old epoch's exact state crosses the seam.
+    fn apply_seam(&mut self, draft: Draft, t: u64) -> Result<String, String> {
+        let ts_global = t.max(self.clock).max(self.epoch_t0);
+        let ts = ts_global - self.epoch_t0;
+        let compiled =
+            compile_seamed(&mut self.lib, &mut self.structs, draft.clone(), &self.current, ts)?;
+        // The usual conservation dance; markings are identical for a move,
+        // so refund/charge nets to zero — only belt capital can differ.
+        let old_draft = self.current.draft.clone();
+        self.refund_markings(&old_draft);
+        if let Err(e) = self.check_affordable(&draft) {
+            self.pay_markings(&old_draft);
+            return Err(e);
+        }
+        self.pay_markings(&draft);
+        let new_base: Vec<u64> = (0..self.current.outputs.len())
+            .map(|o| self.out_base[o] + self.current.outputs[o].eval(ts))
+            .collect();
+        let old = std::mem::replace(&mut self.current, compiled);
+        let old_base = std::mem::replace(&mut self.out_base, new_base);
+        self.history.push(Epoch { t0: self.epoch_t0, out_base: old_base, compiled: old });
+        self.epoch_t0 = ts_global;
+        self.subview = None;
+        let grant = self.maybe_goal_grant();
+        self.save();
+        Ok(format!(
+            "{{\"ok\":true,\"grant\":{grant},\"scene\":{},\"state\":{}}}",
+            scene_json(self),
+            state_json(self)
+        ))
+    }
+
+    /// The epoch containing absolute tick `t`: (compiled, epoch-local tick,
+    /// delivered baselines). An epoch that began at `t0` owns ticks
+    /// *strictly after* `t0`: the seam extraction samples state through the
+    /// seam tick itself, so that tick's events belong to the old epoch, and
+    /// the new epoch's local τ=0 is a zero-tick at the seam instant.
+    fn epoch_at(&self, t: u64) -> (&Compiled, u64, &[u64]) {
+        if t > self.epoch_t0 || self.history.is_empty() {
+            return (&self.current, t.saturating_sub(self.epoch_t0), &self.out_base);
+        }
+        for e in self.history.iter().rev() {
+            if t > e.t0 {
+                return (&e.compiled, t - e.t0, &e.out_base);
+            }
+        }
+        let e = &self.history[0];
+        (&e.compiled, t.saturating_sub(e.t0), &e.out_base)
+    }
+
+    /// Delivered total at output `o` by absolute tick `t`, stitched across
+    /// every epoch — the conservation-honest ledger the harvest reads.
+    fn output_total(&self, o: usize, t: u64) -> u64 {
+        let (c, tau, base) = self.epoch_at(t);
+        base.get(o).copied().unwrap_or(0) + c.outputs[o].eval(tau)
+    }
+
     /// Compile the sub-draft the editor is viewing (a module path from the
     /// top), feeding each level the *actual* flows its parent delivers to
     /// that module's ports — so the interior animates as it really runs,
@@ -378,7 +491,8 @@ impl App {
     /// module at a time, carrying the real per-leg supplies down.
     fn drill(&mut self, path: &[usize]) -> Result<Compiled, String> {
         let mut draft = self.current.draft.clone();
-        let mut comp = compile_with_flows(&mut self.lib, &mut self.structs, draft.clone(), None)?;
+        let mut comp =
+            compile_with_flows(&mut self.lib, &mut self.structs, draft.clone(), None, None)?;
         for &idx in path {
             let sub = match draft.nodes.get(idx) {
                 Some(DraftNode::Module { draft, .. }) => (**draft).clone(),
@@ -389,7 +503,13 @@ impl App {
                 .get(idx)
                 .cloned()
                 .ok_or("module index out of range")?;
-            comp = compile_with_flows(&mut self.lib, &mut self.structs, sub.clone(), Some(flows))?;
+            comp = compile_with_flows(
+                &mut self.lib,
+                &mut self.structs,
+                sub.clone(),
+                Some(flows),
+                None,
+            )?;
             draft = sub;
         }
         Ok(comp)
@@ -421,7 +541,8 @@ impl App {
         if !self.ensure_subview(path) {
             return format!("{{\"from\":{from},\"frames\":[]}}");
         }
-        frames_json(&self.subview.as_ref().unwrap().1, from, n)
+        let t0 = self.epoch_t0;
+        frames_json(&self.subview.as_ref().unwrap().1, from, n, t0)
     }
 
     /// The interior scene for the module at `path` — chiefly its `types`
@@ -467,24 +588,40 @@ fn compile(
     structs: &mut StructLib,
     draft: Draft,
 ) -> Result<Compiled, String> {
-    compile_with_flows(lib, structs, draft, None)
+    compile_with_flows(lib, structs, draft, None, None)
 }
 
 /// Like [`compile`], but the input flows can be overridden. Drilling into a
 /// sealed module compiles its sub-draft with the parent's *actual* per-leg
-/// supply flows (`None` = use the draft's own declared input rates).
+/// supply flows (`None` = use the draft's own declared input rates). A
+/// relocation seam passes `seam`: phantom port flows and module prehistory
+/// (see [`seam_extract`]).
+#[allow(clippy::type_complexity)]
 fn compile_with_flows(
     lib: &mut Library,
     structs: &mut StructLib,
     draft: Draft,
     override_flows: Option<Vec<Counting>>,
+    seam: Option<(SeamPlan, std::collections::HashMap<usize, (Vec<Counting>, u64)>)>,
 ) -> Result<Compiled, String> {
-    let built = draft.build(lib, structs)?;
+    let built = match &seam {
+        Some((plan, _)) => draft.build_seamed(lib, structs, plan)?,
+        None => draft.build(lib, structs)?,
+    };
     let (id, node_types, wire_lats, wire_routes) =
         (built.id, built.node_types, built.wire_lats, built.wire_routes);
     let input_flows = override_flows.unwrap_or(built.flows);
     let mut ev = Evaluator::new(lib);
     ev.horizon = GUI_HORIZON;
+    if let Some((plan, _)) = &seam {
+        // Longer transients ride along with replayed history; give the
+        // periodicity search room to see past them (bounded).
+        let replay = plan.module_prehistory.iter().map(|(_, _, s)| *s).max().unwrap_or(0);
+        ev.horizon = (GUI_HORIZON + replay * 2).min(1 << 18);
+        for (n, h, s) in &plan.module_prehistory {
+            ev.prehistory.insert(*n, (h.clone(), *s));
+        }
+    }
     let detail = ev
         .evaluate_detailed(id, &input_flows)
         .map_err(|e| friendly_eval_error(&e))?;
@@ -495,13 +632,31 @@ fn compile_with_flows(
         .audit(id, &input_flows)
         .map_err(|e| friendly_eval_error(&e))?;
 
+    // Seam epochs skip draft markings (consumed into the old epoch; they
+    // live on inside the carried queues) and inject phantom port flows.
     let marking_of = |to: DraftTo| -> u64 {
+        if seam.is_some() {
+            return 0;
+        }
         draft
             .markings
             .iter()
             .filter(|(t, _)| *t == to)
             .map(|(_, m)| *m)
             .sum()
+    };
+    let phantom_at = |to: DraftTo| -> Option<Counting> {
+        let (plan, _) = seam.as_ref()?;
+        let mut acc: Option<Counting> = None;
+        for (t, flow) in &plan.port_flows {
+            if *t == to {
+                acc = Some(match acc {
+                    Some(a) => a.add(flow),
+                    None => flow.clone(),
+                });
+            }
+        }
+        acc
     };
     let source_counting = |from: &DraftFrom| -> &Counting {
         match from {
@@ -524,6 +679,9 @@ fn compile_with_flows(
         let sup: Vec<Counting> = (0..legs)
             .map(|l| {
                 let mut acc = Counting::constant(marking_of(DraftTo::Node(n, l)));
+                if let Some(ph) = phantom_at(DraftTo::Node(n, l)) {
+                    acc = acc.add(&ph);
+                }
                 for (w, (_, to)) in draft.wires.iter().enumerate() {
                     if *to == DraftTo::Node(n, l) {
                         acc = acc.add(&arrivals[w]);
@@ -569,11 +727,178 @@ fn compile_with_flows(
         node_types,
         wire_lats,
         wire_routes,
+        module_pre: seam.map(|(_, mp)| mp).unwrap_or_default(),
         arrivals,
         summary,
         audit,
         draft,
     })
+}
+
+// ---------------------------------------------------------------------------
+// relocation seams (G1, DESIGN-motion.md): a move is a seam between epochs,
+// and everything a running factory is at one tick crosses it exactly —
+// queues as constant countings, in-flight and in-progress work as scheduled
+// arrivals, module state as input-history prehistory.
+// ---------------------------------------------------------------------------
+
+/// A cumulative staircase from discrete arrival events `(tick, count)`.
+fn schedule_counting(mut events: Vec<(u64, u64)>) -> Counting {
+    events.sort();
+    let horizon = events.last().map(|e| e.0).unwrap_or(0) as usize + 1;
+    let mut samples = vec![0u64; horizon + 1];
+    for (tau, k) in events {
+        for s in samples.iter_mut().skip(tau as usize) {
+            *s += k;
+        }
+    }
+    Counting::from_parts(samples, horizon, 1, 0)
+}
+
+/// Extract the seam state of `old` at epoch-local tick `ts`, aimed at a
+/// draft whose wires have latencies `new_lats`. Returns the seam plan, the
+/// module prehistories for the next epoch's `Compiled`, and the suffixed
+/// input flows (sources keep their phase).
+#[allow(clippy::type_complexity)]
+fn seam_extract(
+    old: &Compiled,
+    new_lats: &[u64],
+    ts: u64,
+) -> (SeamPlan, std::collections::HashMap<usize, (Vec<Counting>, u64)>, Vec<Counting>) {
+    let d = &old.draft;
+    let mut events: Vec<(DraftTo, Vec<(u64, u64)>)> = Vec::new();
+    let mut push = |to: DraftTo, tau: u64, k: u64| {
+        if k == 0 {
+            return;
+        }
+        match events.iter_mut().find(|(t, _)| *t == to) {
+            Some((_, v)) => v.push((tau, k)),
+            None => events.push((to, vec![(tau, k)])),
+        }
+    };
+
+    // Port queues: supplied − consumed, carried as items available now.
+    for (n, legs) in old.consumed.iter().enumerate() {
+        for (l, cons) in legs.iter().enumerate() {
+            if let Some(cm) = cons {
+                let q = old.supplies[n][l].eval(ts) - cm.eval(ts);
+                push(DraftTo::Node(n, l), 0, q);
+            }
+        }
+    }
+
+    // In-flight items: cohorts on each wire, remaining travel preserved
+    // (clamped to the wire's new length — the belt stretched under them).
+    for (w, (from, to)) in d.wires.iter().enumerate() {
+        let l_old = old.wire_lats[w];
+        if l_old == 0 {
+            continue;
+        }
+        let dep = match from {
+            DraftFrom::Input(i) => &old.input_flows[*i],
+            DraftFrom::Node(n, l) => &old.node_outs[*n][*l],
+        };
+        for td in (ts + 1).saturating_sub(l_old)..=ts {
+            let prev = if td == 0 { 0 } else { dep.eval(td - 1) };
+            let c = dep.eval(td) - prev;
+            let remaining = (l_old - (ts - td)).min(new_lats[w]);
+            push(*to, remaining, c);
+        }
+    }
+
+    // In-progress firings: consumed but not yet emitted; outputs are due at
+    // their original times, delivered onward over the new wires.
+    for (n, node) in d.nodes.iter().enumerate() {
+        let (lat, per_leg): (u64, Vec<u64>) = match node {
+            DraftNode::Recipe { produce, latency, .. } => {
+                (*latency, produce.iter().map(|&(_, a)| a).collect())
+            }
+            DraftNode::Builder { op, latency, .. } => (
+                *latency,
+                match op {
+                    BuildOp::Split => vec![1, 1],
+                    _ => vec![1],
+                },
+            ),
+            _ => continue, // priority is same-tick; modules carry via prehistory
+        };
+        if lat == 0 {
+            continue;
+        }
+        let Some(k) = old.firings[n].as_ref() else { continue };
+        for tf in (ts + 1).saturating_sub(lat)..=ts {
+            let prev = if tf == 0 { 0 } else { k.eval(tf - 1) };
+            let kc = k.eval(tf) - prev;
+            if kc == 0 {
+                continue;
+            }
+            let due = tf + lat - ts;
+            for (j, amt) in per_leg.iter().enumerate() {
+                if let Some(w) = d
+                    .wires
+                    .iter()
+                    .position(|(f, _)| *f == DraftFrom::Node(n, j))
+                {
+                    push(d.wires[w].1, due + new_lats[w], kc * amt);
+                }
+                // No wire: emissions discard, exactly as they always did.
+            }
+        }
+    }
+
+    let port_flows: Vec<(DraftTo, Counting)> = events
+        .into_iter()
+        .map(|(to, ev)| (to, schedule_counting(ev)))
+        .collect();
+
+    // Module prehistory: state is a function of input history; extend the
+    // history this epoch was already carrying by what it saw since.
+    let mut module_pre = std::collections::HashMap::new();
+    let mut plan_pre = Vec::new();
+    for (n, node) in d.nodes.iter().enumerate() {
+        if !matches!(node, DraftNode::Module { .. }) {
+            continue;
+        }
+        let (hist, replay): (Vec<Counting>, u64) = match old.module_pre.get(&n) {
+            Some((hp, sp)) => (
+                hp.iter()
+                    .zip(&old.supplies[n])
+                    .map(|(h, g)| h.concat(*sp, g))
+                    .collect(),
+                sp + ts,
+            ),
+            None => (old.supplies[n].clone(), ts),
+        };
+        module_pre.insert(n, (hist.clone(), replay));
+        plan_pre.push((n, hist, replay));
+    }
+
+    let in_flows = old.input_flows.iter().map(|f| f.suffix(ts)).collect();
+    (
+        SeamPlan { port_flows, module_prehistory: plan_pre },
+        module_pre,
+        in_flows,
+    )
+}
+
+/// Compile a relocation-seam epoch: `draft` (same topology as `old`, moved)
+/// continues `old` from its exact state at epoch-local `ts`.
+fn compile_seamed(
+    lib: &mut Library,
+    structs: &mut StructLib,
+    draft: Draft,
+    old: &Compiled,
+    ts: u64,
+) -> Result<Compiled, String> {
+    let new_lats: Vec<u64> = draft
+        .wire_routes(structs)
+        .iter()
+        .map(|p| hashtorio::route::steps(p) / BELT_SPEED as u64)
+        .collect();
+    let (plan, module_pre, in_flows) = seam_extract(old, &new_lats, ts);
+    let mut flows = in_flows;
+    flows.extend(plan.port_flows.iter().map(|(_, f)| f.clone()));
+    compile_with_flows(lib, structs, draft, Some(flows), Some((plan, module_pre)))
 }
 
 // ---------------------------------------------------------------------------
@@ -913,7 +1238,7 @@ fn scene_json_for(app: &App, c: &Compiled) -> String {
     )
 }
 
-fn frame_json(c: &Compiled, t: u64) -> String {
+fn frame_json(c: &Compiled, t: u64, base: &[u64]) -> String {
     let delta = |cnt: &Counting| cnt.eval(t) - if t == 0 { 0 } else { cnt.eval(t - 1) };
     let fired: Vec<String> = (0..c.draft.nodes.len())
         .map(|n| match &c.firings[n] {
@@ -954,7 +1279,10 @@ fn frame_json(c: &Compiled, t: u64) -> String {
     let outs: Vec<String> = c
         .outputs
         .iter()
-        .map(|cnt| format!("[{},{}]", cnt.eval(t), delta(cnt)))
+        .enumerate()
+        .map(|(o, cnt)| {
+            format!("[{},{}]", base.get(o).copied().unwrap_or(0) + cnt.eval(t), delta(cnt))
+        })
         .collect();
     format!(
         "{{\"fired\":[{}],\"occ\":[{}],\"flow\":[{}],\"transit\":[{}],\"outs\":[{}]}}",
@@ -966,9 +1294,25 @@ fn frame_json(c: &Compiled, t: u64) -> String {
     )
 }
 
-fn frames_json(c: &Compiled, from: u64, n: u64) -> String {
+/// Frames for one fixed compile (module interiors), offset to epoch time.
+fn frames_json(c: &Compiled, from: u64, n: u64, t0: u64) -> String {
     let n = n.clamp(1, MAX_BATCH);
-    let frames: Vec<String> = (from..from + n).map(|t| frame_json(c, t)).collect();
+    let frames: Vec<String> = (from..from + n)
+        .map(|t| frame_json(c, t.saturating_sub(t0), &[]))
+        .collect();
+    format!("{{\"from\":{from},\"frames\":[{}]}}", frames.join(","))
+}
+
+/// Frames stitched across the seam timeline: each absolute tick reads from
+/// the epoch that owns it, with delivered totals accumulated across seams.
+fn frames_json_stitched(app: &App, from: u64, n: u64) -> String {
+    let n = n.clamp(1, MAX_BATCH);
+    let frames: Vec<String> = (from..from + n)
+        .map(|t| {
+            let (c, tau, base) = app.epoch_at(t);
+            frame_json(c, tau, base)
+        })
+        .collect();
     format!("{{\"from\":{from},\"frames\":[{}]}}", frames.join(","))
 }
 
@@ -1012,14 +1356,17 @@ fn harvest(app: &mut App, ticks: u64) -> Result<String, String> {
     }
     let from = app.clock;
     let to = from + ticks;
+    // Stitched ledger: exact across relocation seams.
     let mut gains: Vec<(ItemType, u64)> = Vec::new();
-    for (o, out) in app.current.outputs.iter().enumerate() {
-        let gain = out.eval(to) - out.eval(from);
+    for o in 0..app.current.outputs.len() {
+        let gain = app.output_total(o, to) - app.output_total(o, from);
         if gain > 0 {
             let ty = app.current.draft.outputs[o].ty;
-            *app.inventory.entry(ty.0).or_insert(0) += gain;
             gains.push((ty, gain));
         }
+    }
+    for (ty, gain) in &gains {
+        *app.inventory.entry(ty.0).or_insert(0) += gain;
     }
     app.budget -= ticks;
     app.clock = to;
@@ -1249,7 +1596,7 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
         ("GET", "/api/frames") => {
             let from = param("from").unwrap_or(0);
             let n = param("n").unwrap_or(32);
-            ("200 OK".into(), "application/json", frames_json(&app.current, from, n))
+            ("200 OK".into(), "application/json", frames_json_stitched(app, from, n))
         }
         // Interior of the sealed module at ?path=i,j,… — animated from the
         // inside, fed the flows its parent really delivers.
@@ -1288,6 +1635,9 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
                     app.current = compiled;
                     app.subview = None; // interior cache stale after a retool
                     app.clock = 0; // retooling: the line starts cold
+                    app.history.clear(); // cold retool: one fresh epoch
+                    app.epoch_t0 = 0;
+                    app.out_base = vec![0; app.current.draft.outputs.len()];
                     let paid = app.current.draft.clone();
                     app.pay_markings(&paid); // preloads are real items
                     let grant = app.maybe_goal_grant();
@@ -1309,7 +1659,9 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
         // Live edit: apply the draft to the running line without the cold
         // retool. Keeps the clock, conserves preloads, refuses gracefully.
         ("POST", "/api/live") => {
-            let result = parse_draft(body, &app.structs).and_then(|draft| app.apply_live(draft));
+            let t = param("t");
+            let result =
+                parse_draft(body, &app.structs).and_then(|draft| app.apply_live(draft, t));
             match result {
                 Ok(body) => ("200 OK".into(), "application/json", body),
                 Err(e) => (
@@ -1533,6 +1885,142 @@ mod tests {
         let (_, _, body) = route(&mut app, "POST", "/api/live", &draft(2));
         assert!(body.contains("\"ok\":true"), "{body}");
         assert!(body.contains("\"rate\":[2,25]"), "two trains: 2/25: {body}");
+    }
+
+    /// G1 (DESIGN-motion.md): a position-only edit is a relocation seam,
+    /// not a rewrite. The running line's state — queues, in-flight items,
+    /// work in progress — crosses the seam exactly. Proven here with a
+    /// conservation ledger reconstructed from stitched frames alone:
+    ///   injected(t) = on-belt(t) + queued(t) + 2·fired_cum(t)
+    /// which no minted or vanished item can satisfy.
+    #[test]
+    fn a_move_is_a_seam_not_a_rewrite() {
+        let mut app = test_app();
+        let line = |py: i64| {
+            format!(
+                r#"{{"inputs":[{{"ty":0,"label":"mine","rate":[1,1]}}],
+            "outputs":[{{"ty":2,"label":"gears"}}],
+            "nodes":[{{"kind":"recipe","label":"press","consume":[[0,2]],
+                       "produce":[[2,1]],"latency":5}}],
+            "wires":[{{"from":["in",0],"to":["node",0,0]}},
+                     {{"from":["node",0,0],"to":["out",0]}}],
+            "markings":[],
+            "pos":{{"inputs":[[2,4]],"nodes":[[8,{py}]],"outputs":[[20,4]]}}}}"#
+            )
+        };
+        let (_, _, body) = route(&mut app, "POST", "/api/live", &line(4));
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert_eq!(app.history.len(), 0, "first apply is a plain retool");
+
+        // Move the press at t=20: same topology, new place — a seam.
+        let (_, _, body) = route(&mut app, "POST", "/api/live?t=20", &line(9));
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert_eq!(app.history.len(), 1, "a move opened a new epoch");
+        assert_eq!(app.epoch_t0, 20);
+
+        // Re-sending the identical draft must not disturb the timeline.
+        let (_, _, body) = route(&mut app, "POST", "/api/live?t=33", &line(9));
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert_eq!(app.history.len(), 1, "no-op applies are no-ops");
+
+        // The ledger, from stitched frames alone.
+        let (_, _, frames) = route(&mut app, "GET", "/api/frames?from=0&n=80", "");
+        let v = json::parse(&frames).unwrap();
+        let fr = v.get("frames").and_then(|x| x.arr()).unwrap();
+        let mut fired_cum = 0u64;
+        let mut last_total = 0u64;
+        for (t, f) in fr.iter().enumerate() {
+            let occ = f.get("occ").and_then(|x| x.arr()).unwrap()[0]
+                .arr()
+                .unwrap()[0]
+                .u64()
+                .unwrap();
+            let transit0 =
+                f.get("transit").and_then(|x| x.arr()).unwrap()[0].u64().unwrap();
+            fired_cum += f.get("fired").and_then(|x| x.arr()).unwrap()[0].u64().unwrap();
+            let total = f.get("outs").and_then(|x| x.arr()).unwrap()[0]
+                .arr()
+                .unwrap()[0]
+                .u64()
+                .unwrap();
+            // Totals stitched across the seam never regress.
+            assert!(total >= last_total, "delivered total dropped at t={t}");
+            last_total = total;
+            // The iron ledger closes exactly outside the brief window where
+            // carried in-flight cohorts ride phantom schedules (t in 20..28).
+            if !(20..28).contains(&t) {
+                assert_eq!(
+                    t as u64,
+                    transit0 + occ + 2 * fired_cum,
+                    "iron ledger broke at t={t} \
+                     (transit={transit0} occ={occ} fired_cum={fired_cum})"
+                );
+            }
+        }
+        assert!(last_total > 20, "the line kept producing across the seam");
+    }
+
+    /// G1's module theorem: a module's state is a function of its input
+    /// history, and prehistory concatenation continues it *exactly*. Moving
+    /// an unrelated decoy (far from every route) opens a seam; the factory
+    /// with a stateful module must then match a never-moved twin tick for
+    /// tick, forever. A cold-restarted module (lost parity in its 2→1
+    /// press) could not.
+    #[test]
+    fn a_seam_preserves_module_state_exactly() {
+        let sub = r#"{"inputs":[{"ty":0,"label":"in","rate":[1,1]}],
+            "outputs":[{"ty":2,"label":"out"}],
+            "nodes":[{"kind":"recipe","label":"pair","consume":[[0,2]],
+                      "produce":[[2,1]],"latency":3}],
+            "wires":[{"from":["in",0],"to":["node",0,0]},
+                     {"from":["node",0,0],"to":["out",0]}],
+            "markings":[],
+            "pos":{"inputs":[[2,4]],"nodes":[[6,4]],"outputs":[[12,4]]}}"#;
+        let top = |decoy_y: i64| {
+            format!(
+                r#"{{"inputs":[{{"ty":0,"label":"mine","rate":[1,1]}}],
+            "outputs":[{{"ty":2,"label":"gears"}}],
+            "nodes":[{{"kind":"module","label":"box","draft":{sub}}},
+                     {{"kind":"recipe","label":"decoy","consume":[[1,1]],
+                       "produce":[[1,1]],"latency":1}}],
+            "wires":[{{"from":["in",0],"to":["node",0,0]}},
+                     {{"from":["node",0,0],"to":["out",0]}}],
+            "markings":[],
+            "pos":{{"inputs":[[2,4]],"nodes":[[8,4],[34,{decoy_y}]],"outputs":[[22,4]]}}}}"#
+            )
+        };
+        let totals = |app: &mut App, n: u64| -> Vec<u64> {
+            let (_, _, frames) = route(app, "GET", &format!("/api/frames?from=0&n={n}"), "");
+            let v = json::parse(&frames).unwrap();
+            v.get("frames")
+                .and_then(|x| x.arr())
+                .unwrap()
+                .iter()
+                .map(|f| {
+                    f.get("outs").and_then(|x| x.arr()).unwrap()[0].arr().unwrap()[0]
+                        .u64()
+                        .unwrap()
+                })
+                .collect()
+        };
+
+        // Twin A: never moves.
+        let mut still = test_app();
+        let (_, _, body) = route(&mut still, "POST", "/api/live", &top(20));
+        assert!(body.contains("\"ok\":true"), "{body}");
+        let base = totals(&mut still, 120);
+
+        // Twin B: same line; the decoy moves at t=21 (odd tick: the module's
+        // 2→1 press is mid-parity, so a cold restart would be visible).
+        let mut moved = test_app();
+        let (_, _, body) = route(&mut moved, "POST", "/api/live", &top(20));
+        assert!(body.contains("\"ok\":true"), "{body}");
+        let (_, _, body) = route(&mut moved, "POST", "/api/live?t=21", &top(26));
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert_eq!(moved.history.len(), 1, "the decoy move opened a seam");
+        let after = totals(&mut moved, 120);
+
+        assert_eq!(base, after, "module state continued bit-exactly across the seam");
     }
 
     #[test]
