@@ -60,6 +60,19 @@ pub struct Evaluator<'l> {
     pub horizon: u64,
     /// Number of actual (non-memoized) net evaluations performed.
     pub interior_evals: u64,
+    /// Module prehistory for relocation seams (DESIGN-motion.md): top-level
+    /// node index → (input histories, seam tick). A module's state is a
+    /// function of its input history (Kahn), so an epoch that begins at a
+    /// seam evaluates the module on `history.concat(ts, new_flows)` and
+    /// takes the `.suffix(ts)` of its outputs — exact continuation, no
+    /// microstate surgery. Applied only at depth 0 (the parent-level walk
+    /// of [`Evaluator::evaluate_detailed`]); steady-state rates are
+    /// prehistory-independent, so summaries and audits stay on the plain
+    /// path. Memoization stays sound: the memo keys on the concatenated
+    /// inputs themselves.
+    pub prehistory: HashMap<usize, (Vec<Counting>, u64)>,
+    /// Module recursion depth; prehistory applies at the top level only.
+    depth: usize,
 }
 
 /// The result of one net evaluation, including per-node detail for tracing.
@@ -101,7 +114,14 @@ pub struct Trace {
 
 impl<'l> Evaluator<'l> {
     pub fn new(lib: &'l Library) -> Self {
-        Evaluator { lib, memo: HashMap::new(), horizon: 1 << 14, interior_evals: 0 }
+        Evaluator {
+            lib,
+            memo: HashMap::new(),
+            horizon: 1 << 14,
+            interior_evals: 0,
+            prehistory: HashMap::new(),
+            depth: 0,
+        }
     }
 
     pub fn lib(&self) -> &'l Library {
@@ -120,7 +140,10 @@ impl<'l> Evaluator<'l> {
         }
         let net = self.lib.get(id).clone();
         self.interior_evals += 1;
-        let outs = self.evaluate_net(&net, inputs)?;
+        self.depth += 1;
+        let outs = self.evaluate_net(&net, inputs);
+        self.depth -= 1;
+        let outs = outs?;
         self.memo.insert(key, outs.clone());
         Ok(outs)
     }
@@ -250,7 +273,23 @@ impl<'l> Evaluator<'l> {
                         firings[g] = Some(k);
                         outs
                     }
-                    Node::Module(mid) => self.evaluate(*mid, &ins)?,
+                    Node::Module(mid) => {
+                        match if self.depth == 0 { self.prehistory.get(&g).cloned() } else { None } {
+                            Some((hist, ts)) => {
+                                // Relocation seam: continue the module from
+                                // its exact pre-seam state by replaying its
+                                // input history in front of the new flows.
+                                let cat: Vec<Counting> = ins
+                                    .iter()
+                                    .zip(&hist)
+                                    .map(|(g_new, h)| h.concat(ts, g_new))
+                                    .collect();
+                                let full = self.evaluate(*mid, &cat)?;
+                                full.iter().map(|o| o.suffix(ts)).collect()
+                            }
+                            None => self.evaluate(*mid, &ins)?,
+                        }
+                    }
                     Node::Priority { .. } => {
                         let (granted, fallback) =
                             priority_apply_growing(&ins[0], &ins[1], self.horizon)?;
