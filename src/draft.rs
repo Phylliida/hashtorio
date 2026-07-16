@@ -651,6 +651,48 @@ mod tests {
         assert_eq!(s.outputs[0].first, Some(5));
     }
 
+    /// Absolute position never enters the compiled net: wire latencies are
+    /// Manhattan *differences* and footprint collision is relative, so a
+    /// translated factory interns to the same NetId and shares every cache
+    /// entry. This is the spatial half of the motion story (DESIGN-motion.md):
+    /// summaries are already quotiented by translation, and a uniformly
+    /// moving structure is finite modulo (translate ∘ time-shift).
+    #[test]
+    fn translation_yields_the_same_net_id() {
+        let mk = |dx: i32, dy: i32| {
+            let mut d = Draft {
+                types: vec![(iron(), "iron".into()), (gear(), "gear".into())],
+                ..Default::default()
+            };
+            d.inputs.push(DraftInput { ty: iron(), label: "mine".into(), rate: (1, 1) });
+            d.nodes.push(DraftNode::Recipe {
+                label: "gears".into(),
+                consume: vec![(iron(), 2)],
+                produce: vec![(gear(), 1)],
+                latency: 3,
+            });
+            d.outputs.push(DraftOutput { ty: gear(), label: "out".into() });
+            d.wires.push((DraftFrom::Input(0), DraftTo::Node(0, 0)));
+            d.wires.push((DraftFrom::Node(0, 0), DraftTo::Output(0)));
+            d.markings.push((DraftTo::Node(0, 0), 4));
+            d.input_pos = vec![(2 + dx, 3 + dy)];
+            d.node_pos = vec![(8 + dx, 3 + dy)];
+            d.output_pos = vec![(16 + dx, 5 + dy)];
+            d
+        };
+        let mut lib = Library::new();
+        let mut structs = crate::structure::StructLib::new();
+        let here = mk(0, 0).build(&mut lib, &mut structs).unwrap();
+        let there = mk(7, 13).build(&mut lib, &mut structs).unwrap();
+        assert_eq!(here.id, there.id, "translated factory is the same net");
+        assert_eq!(here.wire_lats, there.wire_lats, "latencies are relative");
+        // And a *non*-translation (stretching a wire) is a different net.
+        let mut far = mk(0, 0);
+        far.output_pos = vec![(30, 5)];
+        let far = far.build(&mut lib, &mut structs).unwrap();
+        assert_ne!(here.id, far.id, "stretching a wire changes the net");
+    }
+
     #[test]
     fn friendly_errors_teach_the_rules() {
         // Copying: one source, two wires.
