@@ -49,6 +49,7 @@
 <header>
   <span class="title">hashtorio</span>
   <button id="modebtn">&#9998; edit</button>
+  <button id="viewbtn" title="toggle world / schematic (v)">graph view</button>
   <span class="sep"></span>
   <button id="zoomout" title="zoom out (− / wheel)">&#8722;</button>
   <span id="zoompct" style="min-width:40px;text-align:center;color:#8fd3ff;font-variant-numeric:tabular-nums">100%</span>
@@ -180,7 +181,8 @@ const shortName = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
 const S = { mode:'run', t:0, playing:true, tps:10, scene:null, frames:new Map(),
             fetching:new Set(), pos:null, customPos:null, last:performance.now(),
             subFrames:new Map(), subFetching:new Set(), subLats:null, subNodes:null,
-            cam:{ scale:1, x:0, y:0 }, pan:null };
+            cam:{ scale:1, x:0, y:0 }, pan:null, view:'world' };
+try { S.view = localStorage.getItem('hashtorio.view') || 'world'; } catch (_) {}
 const E = { draft:{ inputs:[], outputs:[], nodes:[], wires:[], markings:[] },
             pos:{ inputs:[], nodes:[], outputs:[] },
             path:[],   // module indices: [] = top level; the editor can go inside
@@ -280,8 +282,23 @@ const kindTag = n => ({ priority:'else-gate', module:'sealed module',
 const nodeH = n =>
   36 + Math.max(legsIn(n).length, legsOut(n).length, 1) * 14 + 4
      + (n.kind === 'recipe' ? 22 : 0);   // room for the recipe strip
-const inPortPos = (p, leg) => ({ x: p.x, y: p.y + 42 + leg * 14 });
-const outPortPos = (p, leg) => ({ x: p.x + p.w, y: p.y + 42 + leg * 14 });
+// World view: a node is its chassis footprint on the grid, and its ports
+// live in the cells just outside it — exactly the cells the latency rule
+// measures, so the picture and the semantics agree.
+function nodeSize(node) {
+  if (S.view === 'world') {
+    const [fw, fh] = footOf(node);
+    return { w: fw * GRID,
+             h: Math.max(fh, legsIn(node).length, legsOut(node).length, 1) * GRID };
+  }
+  return { w: NODE_W, h: nodeH(node) };
+}
+const inPortPos = (p, leg) => S.view === 'world'
+  ? { x: p.x - GRID / 2, y: p.y + (leg + 0.5) * GRID }
+  : { x: p.x, y: p.y + 42 + leg * 14 };
+const outPortPos = (p, leg) => S.view === 'world'
+  ? { x: p.x + (p.w || NODE_W) + GRID / 2, y: p.y + (leg + 0.5) * GRID }
+  : { x: p.x + p.w, y: p.y + 42 + leg * 14 };
 
 function bez(p0, p1, p2, p3, u) {
   const v = 1 - u;
@@ -296,15 +313,35 @@ function pathBetween(a, b, selfLoop) {
   const sag = back ? 70 : 0;
   return { a, b, c1:{x:a.x+bend, y:a.y+sag}, c2:{x:b.x-bend, y:b.y+sag} };
 }
-const pointAt = (p, s) => ({
+// Arc-length interpolation along an orthogonal polyline path.
+function polyPointAt(p, s) {
+  const d = Math.max(0, Math.min(1, s)) * p.len;
+  const pts = p.poly, cum = p.cum;
+  for (let i = 1; i < pts.length; i++) {
+    if (d <= cum[i] || i === pts.length - 1) {
+      const seg = cum[i] - cum[i - 1] || 1;
+      const u = (d - cum[i - 1]) / seg;
+      return { x: pts[i - 1].x + (pts[i].x - pts[i - 1].x) * u,
+               y: pts[i - 1].y + (pts[i].y - pts[i - 1].y) * u };
+    }
+  }
+  return pts[0];
+}
+const pointAt = (p, s) => p.poly ? polyPointAt(p, s) : ({
   x: bez(p.a.x, p.c1.x, p.c2.x, p.b.x, s),
   y: bez(p.a.y, p.c1.y, p.c2.y, p.b.y, s),
 });
 function strokePath(p, style, width, dashed) {
   ctx.strokeStyle = style; ctx.lineWidth = width;
   ctx.setLineDash(dashed ? [5, 4] : []);
-  ctx.beginPath(); ctx.moveTo(p.a.x, p.a.y);
-  ctx.bezierCurveTo(p.c1.x, p.c1.y, p.c2.x, p.c2.y, p.b.x, p.b.y);
+  ctx.beginPath();
+  if (p.poly) {
+    ctx.moveTo(p.poly[0].x, p.poly[0].y);
+    for (let i = 1; i < p.poly.length; i++) ctx.lineTo(p.poly[i].x, p.poly[i].y);
+  } else {
+    ctx.moveTo(p.a.x, p.a.y);
+    ctx.bezierCurveTo(p.c1.x, p.c1.y, p.c2.x, p.c2.y, p.b.x, p.b.y);
+  }
   ctx.stroke(); ctx.setLineDash([]);
 }
 function roundRect(x, y, w, h, r) {
@@ -344,22 +381,36 @@ function layout() {
   sc.outputs.forEach((_, o) => {
     pos.outputs[o] = { x: W - 150, y: H * (o + 1) / (sc.outputs.length + 1) };
   });
+  const snap = q => ({ x: Math.round(q.x / GRID) * GRID,
+                       y: Math.round(q.y / GRID) * GRID });
+  pos.nodes = pos.nodes.map(snap);
+  pos.inputs = pos.inputs.map(snap);
+  pos.outputs = pos.outputs.map(snap);
   sizeNodes(pos, sc.nodes);
   S.pos = pos;
 }
 function sizeNodes(pos, nodes) {
   nodes.forEach((node, i) => {
-    if (pos.nodes[i]) { pos.nodes[i].w = NODE_W; pos.nodes[i].h = nodeH(node); }
+    if (pos.nodes[i]) Object.assign(pos.nodes[i], nodeSize(node));
   });
 }
 
 function endpointPos(pos, nodes, ep, isFrom) {
-  if (ep[0] === 'in') { const p = pos.inputs[ep[1]]; return { x: p.x + 14, y: p.y }; }
-  if (ep[0] === 'out') { const p = pos.outputs[ep[1]]; return { x: p.x, y: p.y }; }
+  if (ep[0] === 'in') {
+    const p = pos.inputs[ep[1]];
+    return S.view === 'world' ? { x: p.x + GRID * 1.5, y: p.y + GRID / 2 }
+                              : { x: p.x + 14, y: p.y };
+  }
+  if (ep[0] === 'out') {
+    const p = pos.outputs[ep[1]];
+    return S.view === 'world' ? { x: p.x - GRID / 2, y: p.y + GRID / 2 }
+                              : { x: p.x, y: p.y };
+  }
   const p = pos.nodes[ep[1]];
   return isFrom ? outPortPos(p, ep[2]) : inPortPos(p, ep[2]);
 }
 function wirePath(pos, nodes, from, to) {
+  if (S.view === 'world') return worldRoute(pos, nodes, from, to);
   const selfLoop = from[0] === 'node' && to[0] === 'node' && from[1] === to[1];
   return pathBetween(
     endpointPos(pos, nodes, from, true),
@@ -410,7 +461,7 @@ async function refreshSub() {
   try {
     const sc = await (await fetch('/api/subscene?path=' + pathq)).json();
     if (E.path.join(',') !== pathq) return;      // navigated away meanwhile
-    mergeTypes(sc.types);
+    mergeTypes(sc.types); harvestChassis(sc.nodes);
     S.subLats = sc.lats || [];
     S.subNodes = sc.nodes || null;   // resolved port types for editor labels
   } catch (_) { S.subLats = null; S.subNodes = null; }
@@ -478,7 +529,8 @@ function zoomToFit() {
   if (S.mode === 'edit') {
     const d = D();
     d.nodes.forEach((nd, i) => {
-      const p = E.pos.nodes[i]; if (p) rect(p.x, p.y, NODE_W, nodeH(nd));
+      const p = E.pos.nodes[i];
+      if (p) { const s = nodeSize(nd); rect(p.x, p.y, s.w, s.h); }
     });
     E.pos.inputs.forEach(p => rect(p.x - 16, p.y - 16, 32, 50));
     E.pos.outputs.forEach(p => rect(p.x, p.y - 22, 140, 44));
@@ -498,6 +550,272 @@ function zoomToFit() {
   S.cam.y = (r.height - (y0 + y1) * s) / 2;
 }
 
+// ---------------------------------------------------------------------------
+// world view: belts routed through the grid, machines at chassis scale.
+// The netlist stays the truth — latency is still Manhattan/BELT_SPEED as the
+// server computes it; routes are presentation. (P2 makes placed belts
+// semantic; until then a detour around a machine draws longer than it costs.)
+// ---------------------------------------------------------------------------
+const KCH = {};   // kind -> chassis cells, harvested from every scene we see
+function harvestChassis(nodes) {
+  for (const n of nodes || []) if (n.chassis) KCH[n.kind] = n.chassis;
+}
+
+// Router state: obstacle cells + cached routes, invalidated whenever the
+// layout signature changes (drags, adds, deletes).
+const ROUTES = { sig: '', map: new Map(), obs: new Set(),
+                 bounds: { x0: -4, y0: -4, x1: 4, y1: 4 } };
+const cellKey = (x, y) => x + ',' + y;
+function buildObstacles(nodes, posNodes, posIns, posOuts) {
+  const parts = [];
+  const obs = new Set();
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const mark = (gx, gy) => {
+    obs.add(cellKey(gx, gy));
+    x0 = Math.min(x0, gx); y0 = Math.min(y0, gy);
+    x1 = Math.max(x1, gx); y1 = Math.max(y1, gy);
+  };
+  nodes.forEach((nd, i) => {
+    const p = posNodes[i]; if (!p) return;
+    const g = toGrid(p), sz = nodeSize(nd);
+    const fw = Math.round(sz.w / GRID), fh = Math.round(sz.h / GRID);
+    for (let dx = 0; dx < fw; dx++)
+      for (let dy = 0; dy < fh; dy++) mark(g[0] + dx, g[1] + dy);
+    parts.push(g[0], g[1], fw, fh);
+  });
+  for (const p of posIns) { const g = toGrid(p); mark(g[0], g[1]); parts.push(g[0], g[1]); }
+  for (const p of posOuts) { const g = toGrid(p); mark(g[0], g[1]); parts.push(g[0], g[1]); }
+  const sig = parts.join('|');
+  if (sig !== ROUTES.sig) {
+    ROUTES.sig = sig; ROUTES.map.clear(); ROUTES.obs = obs;
+    ROUTES.bounds = x1 < x0 ? { x0: -4, y0: -4, x1: 4, y1: 4 }
+      : { x0: x0 - 5, y0: y0 - 5, x1: x1 + 5, y1: y1 + 5 };
+  }
+}
+
+// 4-dir A* over grid cells with a turn penalty, so belts prefer long
+// straight runs and dodge machine footprints. Falls back to an L-path.
+function astar(ax, ay, bx, by) {
+  if (ax === bx && ay === by) return [[ax, ay]];
+  const B = ROUTES.bounds, obs = ROUTES.obs;
+  const x0 = Math.min(B.x0, ax - 2, bx - 2), y0 = Math.min(B.y0, ay - 2, by - 2);
+  const x1 = Math.max(B.x1, ax + 2, bx + 2), y1 = Math.max(B.y1, ay + 2, by + 2);
+  const W = x1 - x0 + 1;
+  const DX = [1, 0, -1, 0], DY = [0, 1, 0, -1];
+  const skey = (x, y, d) => ((y - y0) * W + (x - x0)) * 4 + d;
+  const h = (x, y) => Math.abs(x - bx) + Math.abs(y - by);
+  const gsc = new Map(), par = new Map();
+  const heap = [];
+  const push = it => {
+    heap.push(it); let i = heap.length - 1;
+    while (i > 0) {
+      const j = (i - 1) >> 1;
+      if (heap[j][0] <= heap[i][0]) break;
+      [heap[i], heap[j]] = [heap[j], heap[i]]; i = j;
+    }
+  };
+  const pop = () => {
+    const top = heap[0], last = heap.pop();
+    if (heap.length) {
+      heap[0] = last; let i = 0;
+      for (;;) {
+        let m = i; const l = 2 * i + 1, r = l + 1;
+        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+        if (m === i) break;
+        [heap[i], heap[m]] = [heap[m], heap[i]]; i = m;
+      }
+    }
+    return top;
+  };
+  gsc.set(skey(ax, ay, 0), 0);        // out-ports face east: start dir 0
+  push([h(ax, ay), ax, ay, 0]);
+  let goal = null, pops = 0;
+  while (heap.length && pops++ < 6000) {
+    const [f, x, y, d] = pop();
+    const k = skey(x, y, d);
+    if (f > gsc.get(k) + h(x, y) + 1e-9) continue;    // stale heap entry
+    if (x === bx && y === by) { goal = k; break; }
+    for (let nd = 0; nd < 4; nd++) {
+      if (nd === (d + 2) % 4) continue;               // no U-turns
+      const nx = x + DX[nd], ny = y + DY[nd];
+      if (nx < x0 || nx > x1 || ny < y0 || ny > y1) continue;
+      if (obs.has(cellKey(nx, ny)) && !(nx === bx && ny === by)) continue;
+      const ng = gsc.get(k) + 1 + (nd === d ? 0 : 0.4);
+      const nk = skey(nx, ny, nd);
+      if (ng < (gsc.has(nk) ? gsc.get(nk) : Infinity)) {
+        gsc.set(nk, ng); par.set(nk, k);
+        push([ng + h(nx, ny), nx, ny, nd]);
+      }
+    }
+  }
+  if (goal === null) return [[ax, ay], [bx, ay], [bx, by]];   // hemmed in: L
+  const cells = [];
+  for (let k = goal; k !== undefined; k = par.get(k)) {
+    const c = Math.floor(k / 4), x = c % W + x0, y = Math.floor(c / W) + y0;
+    if (!cells.length || cells[0][0] !== x || cells[0][1] !== y)
+      cells.unshift([x, y]);
+  }
+  return cells;
+}
+
+function polyFromCells(cells) {
+  const pts = cells.map(([x, y]) => ({ x: (x + 0.5) * GRID, y: (y + 0.5) * GRID }));
+  const keep = pts.filter((q, i) => {
+    if (i === 0 || i === pts.length - 1) return true;
+    const a = pts[i - 1], b = pts[i + 1];
+    return !((a.x === q.x && q.x === b.x) || (a.y === q.y && q.y === b.y));
+  });
+  const cum = [0];
+  for (let i = 1; i < keep.length; i++)
+    cum.push(cum[i - 1] + Math.abs(keep[i].x - keep[i - 1].x)
+                        + Math.abs(keep[i].y - keep[i - 1].y));
+  return { poly: keep, cum, len: cum[cum.length - 1] || 1 };
+}
+
+function worldRoute(pos, nodes, from, to) {
+  const a = endpointPos(pos, nodes, from, true);
+  const b = endpointPos(pos, nodes, to, false);
+  const cx = v => Math.round((v - GRID / 2) / GRID);   // px center -> cell
+  const ax = cx(a.x), ay = cx(a.y), bx = cx(b.x), by = cx(b.y);
+  const key = ax + ',' + ay + '|' + bx + ',' + by;
+  let r = ROUTES.map.get(key);
+  if (!r) { r = polyFromCells(astar(ax, ay, bx, by)); ROUTES.map.set(key, r); }
+  return r;
+}
+
+// A belt lane with marching chevrons — the wire made physical. Chevrons
+// advance at BELT_SPEED, so motion on screen is motion in the semantics.
+function strokeBelt(p, color) {
+  ctx.lineJoin = 'round'; ctx.lineCap = 'butt';
+  strokePath(p, '#1d222b', GRID * 0.62);
+  strokePath(p, color + '2e', GRID * 0.62 - 5);
+  if (S.cam.scale < 0.5) return;
+  const step = GRID * 0.8;
+  const off = ((S.t * BELT_SPEED * GRID) % step + step) % step;
+  ctx.strokeStyle = '#4a5566'; ctx.lineWidth = 1.5;
+  for (let d = off; d < p.len; d += step) {
+    const q = polyPointAt(p, d / p.len);
+    const q2 = polyPointAt(p, Math.min(1, (d + 3) / p.len));
+    const dx = Math.sign(q2.x - q.x), dy = Math.sign(q2.y - q.y);
+    if (!dx && !dy) continue;
+    const px = -dy, py = dx;
+    ctx.beginPath();
+    ctx.moveTo(q.x - dx * 2 + px * 3.2, q.y - dy * 2 + py * 3.2);
+    ctx.lineTo(q.x + dx * 3, q.y + dy * 3);
+    ctx.lineTo(q.x - dx * 2 - px * 3.2, q.y - dy * 2 - py * 3.2);
+    ctx.stroke();
+  }
+}
+
+function drawGridDots(W, H) {
+  if (S.cam.scale <= 0.5) return;
+  ctx.fillStyle = '#1a1e25';
+  const tl = toWorld(0, 0), br = toWorld(W, H);
+  for (let gx = Math.floor(tl.x / GRID) * GRID; gx < br.x; gx += GRID)
+    for (let gy = Math.floor(tl.y / GRID) * GRID; gy < br.y; gy += GRID)
+      ctx.fillRect(gx, gy, 1.5, 1.5);
+}
+
+// ---- world renderers (shared by run and edit) ------------------------------
+function drawSourceWorld(inp, p, sub) {
+  roundRect(p.x + 1, p.y + 1, GRID - 2, GRID - 2, 4);
+  ctx.fillStyle = '#39414f'; ctx.fill();
+  ctx.strokeStyle = tyColor(inp.ty); ctx.lineWidth = 1.5; ctx.stroke();
+  const cells = tyCells(inp.ty);
+  if (cells)
+    drawThumb(cells, p.x + GRID / 2, p.y + GRID / 2, thumbDims(cells, GRID - 9, 6).cell);
+  port({ x: p.x + GRID * 1.5, y: p.y + GRID / 2 }, inp.ty);
+  if (S.cam.scale >= 0.65) {
+    ctx.fillStyle = '#9aa5b1'; ctx.font = '10px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText(sub, p.x + GRID / 2, p.y + GRID + 12);
+    ctx.textAlign = 'left';
+  }
+}
+function drawOutputWorld(out, p, counts) {
+  roundRect(p.x + 1, p.y + 1, GRID - 2, GRID - 2, 4);
+  ctx.fillStyle = '#20262f'; ctx.fill();
+  ctx.strokeStyle = '#39414f'; ctx.lineWidth = 1; ctx.stroke();
+  const cells = tyCells(out.ty);
+  if (cells)
+    drawThumb(cells, p.x + GRID / 2, p.y + GRID / 2, thumbDims(cells, GRID - 9, 6).cell);
+  port({ x: p.x - GRID / 2, y: p.y + GRID / 2 }, out.ty);
+  if (S.cam.scale >= 0.65) {
+    ctx.fillStyle = '#7d8a99'; ctx.font = '10px system-ui';
+    ctx.fillText(out.label, p.x + GRID + 6, p.y + 9);
+  }
+  if (counts) {
+    const [total, delta] = counts;
+    ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 12px system-ui';
+    ctx.fillText(total.toLocaleString(), p.x + GRID + 6, p.y + 22);
+    if (delta > 0) {
+      ctx.fillStyle = '#7bd88f'; ctx.font = '10px system-ui';
+      ctx.fillText('+' + delta, p.x + GRID + 64, p.y + 22);
+    }
+  }
+}
+const KIND_FILL = { priority: '#2b2433', module: '#1f2a33' };
+function drawMachineWorld(node, p, o) {
+  roundRect(p.x + 1.5, p.y + 1.5, p.w - 3, p.h - 3, 4);
+  ctx.fillStyle = KIND_FILL[node.kind] || '#232a35';
+  ctx.fill();
+  ctx.lineWidth = (o.sel || o.fired > 0) ? 2.5 : 1;
+  ctx.strokeStyle = o.sel ? '#8fd3ff'
+    : o.fired > 0 ? `rgba(244,185,66,${0.35 + 0.65 * Math.sin(Math.PI * o.phase)})`
+    : '#39414f';
+  ctx.stroke();
+  if (node.kind === 'module') {          // the seal, visible
+    roundRect(p.x + 4.5, p.y + 4.5, p.w - 9, p.h - 9, 3);
+    ctx.strokeStyle = '#8fd3ff55'; ctx.lineWidth = 1; ctx.stroke();
+  }
+  // The machine IS its chassis: draw its cells at world scale.
+  const ch = node.chassis || KCH[node.kind];
+  if (ch) {
+    let maxy = 0;
+    for (const c of ch) maxy = Math.max(maxy, c[1]);
+    for (const [gx, gy, m] of ch) {
+      ctx.fillStyle = (MAT_COLORS[m] || '#c792ea') + '2a';
+      ctx.fillRect(p.x + gx * GRID + 3, p.y + (maxy - gy) * GRID + 3,
+                   GRID - 6, GRID - 6);
+    }
+  }
+  o.ins.forEach((ty, l) => port(inPortPos(p, l), ty));
+  o.outs.forEach((ty, l) => port(outPortPos(p, l), ty));
+  if (o.fired > 0) {
+    ctx.fillStyle = '#f4b942'; ctx.font = '10px system-ui'; ctx.textAlign = 'right';
+    ctx.fillText('⚙×' + o.fired, p.x + p.w, p.y - 4);
+    ctx.textAlign = 'left';
+  }
+  const z = S.cam.scale;
+  if (z >= 0.65) {
+    ctx.fillStyle = '#e6edf3'; ctx.font = '11px system-ui';
+    ctx.fillText(node.label.slice(0, 24), p.x, p.y + p.h + 12);
+    ctx.fillStyle = node.kind === 'module' ? '#8fd3ff'
+      : node.kind === 'priority' ? '#c792ea' : '#7d8a99';
+    ctx.font = '9px system-ui';
+    ctx.fillText(kindTag(node), p.x, p.y + p.h + 23);
+    if (node.kind === 'recipe') drawRecipeStrip(node, p.x, p.y + p.h + 36);
+  }
+  if (z >= 1.1) {   // piece names float over the docks
+    ctx.font = '8.5px system-ui'; ctx.textAlign = 'center';
+    o.ins.forEach((ty, l) => {
+      const q = inPortPos(p, l);
+      const amt = node.kind === 'recipe' && node.consume ? node.consume[l][1] : null;
+      ctx.fillStyle = '#8b98a8';
+      ctx.fillText((amt && amt !== 1 ? amt + '× ' : '') + shortName(tyName(ty), 10),
+                   q.x, q.y - 10);
+    });
+    o.outs.forEach((ty, l) => {
+      const q = outPortPos(p, l);
+      const amt = node.kind === 'recipe' && node.produce ? node.produce[l][1] : null;
+      ctx.fillStyle = '#8b98a8';
+      ctx.fillText((amt && amt !== 1 ? amt + '× ' : '') + shortName(tyName(ty), 10),
+                   q.x, q.y - 10);
+    });
+    ctx.textAlign = 'left';
+  }
+}
+
 // Items on a wire at the current sub-tick, shared by the run and live-edit
 // views. On a belt (lat>0) they spread along the wire and drift; on a
 // zero-latency hop they pulse across. Structured items draw as their real
@@ -505,12 +823,15 @@ function zoomToFit() {
 function drawWireItems(p, ty, lat, transit, flow, phase) {
   // Zoomed out, items grow in world units so they stay visible on screen.
   const boost = 1 / Math.max(0.4, Math.min(1, S.cam.scale));
+  const world = S.view === 'world';
   const cells = tyCells(ty);
   const drawItem = q => {
-    if (cells && cells.length > 1) drawThumb(cells, q.x, q.y, 3 * boost);
+    if (cells && cells.length > 1)
+      drawThumb(cells, q.x, q.y,
+                (world ? thumbDims(cells, GRID * 0.7, 6).cell : 3) * boost);
     else {
       ctx.fillStyle = tyColor(ty);
-      ctx.beginPath(); ctx.arc(q.x, q.y, 4 * boost, 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.arc(q.x, q.y, (world ? 6 : 4) * boost, 0, 7); ctx.fill();
     }
   };
   if (lat > 0) {
@@ -539,9 +860,8 @@ function drawWireItems(p, ty, lat, transit, flow, phase) {
 
 // The recipe as the pieces themselves: n× shape + … → m× shape, drawn at
 // the bottom of recipe nodes in both views. Zoom in and the shapes read.
-function drawRecipeStrip(node, p) {
-  const y = p.y + p.h - 12;
-  let x = p.x + 9;
+function drawRecipeStrip(node, x0, y) {
+  let x = x0;
   ctx.font = '9.5px system-ui';
   const side = pairs => pairs.forEach(([ty, amt], k) => {
     if (k) { ctx.fillStyle = '#5d6875'; ctx.fillText('+', x, y + 3); x += 9; }
@@ -565,10 +885,15 @@ function draw() {
   const T = Math.floor(S.t), phase = S.t - T;
   const cur = S.frames.get(T), nxt = S.frames.get(T + 1);
   camApply();
+  if (S.view === 'world') {
+    buildObstacles(sc.nodes, S.pos.nodes, S.pos.inputs, S.pos.outputs);
+    drawGridDots(W, H);
+  }
 
   sc.edges.forEach((e, i) => {
     const p = wirePath(S.pos, sc.nodes, e.from, e.to);
-    strokePath(p, tyColor(e.ty) + '44', 2);
+    if (S.view === 'world') strokeBelt(p, tyColor(e.ty));
+    else strokePath(p, tyColor(e.ty) + '44', 2);
     const lat = sc.lats ? sc.lats[i] : 0;
     const transit = cur && cur.transit ? cur.transit[i] : 0;
     const flow = nxt ? nxt.flow[i] : 0;
@@ -582,6 +907,7 @@ function draw() {
 
   sc.inputs.forEach((inp, i) => {
     const p = S.pos.inputs[i];
+    if (S.view === 'world') { drawSourceWorld(inp, p, inp.label); return; }
     ctx.fillStyle = '#39414f';
     ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, 7); ctx.fill();
     ctx.strokeStyle = tyColor(inp.ty); ctx.lineWidth = 1.5; ctx.stroke();
@@ -596,6 +922,19 @@ function draw() {
   sc.nodes.forEach((node, n) => {
     const p = S.pos.nodes[n];
     const fired = nxt ? nxt.fired[n] : 0;
+    if (S.view === 'world') {
+      drawMachineWorld(node, p, { sel: false, fired, phase,
+                                  ins: node.legs, outs: node.outs || [] });
+      if (cur) node.legs.forEach((ty, l) => {
+        const occ = cur.occ[n][l];
+        if (occ === null || occ === 0) return;   // sealed or empty queue
+        const q = inPortPos(p, l);
+        ctx.font = '9px system-ui'; ctx.fillStyle = '#9aa5b1'; ctx.textAlign = 'right';
+        ctx.fillText('×' + occ, q.x - 9, q.y + 3);
+        ctx.textAlign = 'left';
+      });
+      return;
+    }
     roundRect(p.x, p.y, p.w, p.h, 9);
     ctx.fillStyle = node.kind === 'priority' ? '#2b2433'
       : node.kind === 'module' ? '#1f2a33' : '#232a35';
@@ -644,11 +983,12 @@ function draw() {
       ctx.fillText(shortName(tyName(ty), 9), p.x + p.w - 8, q.y + 3);
       ctx.textAlign = 'left';
     });
-    if (node.kind === 'recipe') drawRecipeStrip(node, p);
+    if (node.kind === 'recipe') drawRecipeStrip(node, p.x + 9, p.y + p.h - 12);
   });
 
   sc.outputs.forEach((out, o) => {
     const p = S.pos.outputs[o];
+    if (S.view === 'world') { drawOutputWorld(out, p, cur ? cur.outs[o] : null); return; }
     roundRect(p.x, p.y - 22, 140, 44, 9);
     ctx.fillStyle = '#20262f'; ctx.fill();
     ctx.strokeStyle = '#39414f'; ctx.lineWidth = 1; ctx.stroke();
@@ -1043,7 +1383,7 @@ document.getElementById('harvest').onclick = async () => {
 };
 
 function applyScene(scene, customPos) {
-  S.scene = scene; mergeTypes(scene.types);
+  S.scene = scene; mergeTypes(scene.types); harvestChassis(scene.nodes);
   S.frames.clear(); S.fetching.clear(); S.t = 0;
   if (scene.pos && scene.pos.nodes.length === scene.nodes.length
       && (scene.pos.nodes.length + scene.pos.inputs.length) > 0) {
@@ -1066,7 +1406,7 @@ function applyScene(scene, customPos) {
 let liveTimer = null, liveInFlight = false, livePending = false, liveErrAt = 0;
 
 function hotSwap(scene) {
-  S.scene = scene; mergeTypes(scene.types);
+  S.scene = scene; mergeTypes(scene.types); harvestChassis(scene.nodes);
   S.frames.clear(); S.fetching.clear();      // frames now describe the new line
   const px = ps => ps.map(([x, y]) => ({ x: x * GRID, y: y * GRID }));
   if (scene.pos && scene.pos.nodes.length === scene.nodes.length)
@@ -1112,26 +1452,35 @@ async function runLive() {
 // ---------------------------------------------------------------------------
 function editorHit(x, y) {
   const d = D();
+  const world = S.view === 'world';
+  const pr = world ? 11 : 8;   // port hit radius: docks are chunkier
   const near = (p, r) => (x - p.x) ** 2 + (y - p.y) ** 2 <= r * r;
   for (let n = 0; n < d.nodes.length; n++) {
     const p = withSize(E.pos.nodes[n], d.nodes[n]);
     const ins = legsIn(d.nodes[n]), outs = legsOut(d.nodes[n]);
     for (let l = 0; l < ins.length; l++)
-      if (near(inPortPos(p, l), 8)) return { kind:'inport', to:['node', n, l] };
+      if (near(inPortPos(p, l), pr)) return { kind:'inport', to:['node', n, l] };
     for (let l = 0; l < outs.length; l++)
-      if (near(outPortPos(p, l), 8)) return { kind:'outport', from:['node', n, l] };
+      if (near(outPortPos(p, l), pr)) return { kind:'outport', from:['node', n, l] };
     if (x >= p.x && x <= p.x + p.w && y >= p.y && y <= p.y + p.h)
       return { kind:'node', idx:n };
   }
   for (let i = 0; i < d.inputs.length; i++) {
     const p = E.pos.inputs[i];
-    if (near({ x: p.x + 14, y: p.y }, 8)) return { kind:'outport', from:['in', i] };
-    if (near(p, 16)) return { kind:'input', idx:i };
+    const op = world ? { x: p.x + GRID * 1.5, y: p.y + GRID / 2 }
+                     : { x: p.x + 14, y: p.y };
+    if (near(op, pr)) return { kind:'outport', from:['in', i] };
+    if (world ? (x >= p.x && x <= p.x + GRID && y >= p.y && y <= p.y + GRID)
+              : near(p, 16))
+      return { kind:'input', idx:i };
   }
   for (let o = 0; o < d.outputs.length; o++) {
     const p = E.pos.outputs[o];
-    if (near({ x: p.x, y: p.y }, 8)) return { kind:'inport', to:['out', o] };
-    if (x >= p.x && x <= p.x + 140 && y >= p.y - 22 && y <= p.y + 22)
+    const ip = world ? { x: p.x - GRID / 2, y: p.y + GRID / 2 }
+                     : { x: p.x, y: p.y };
+    if (near(ip, pr)) return { kind:'inport', to:['out', o] };
+    if (world ? (x >= p.x && x <= p.x + GRID && y >= p.y && y <= p.y + GRID)
+              : (x >= p.x && x <= p.x + 140 && y >= p.y - 22 && y <= p.y + 22))
       return { kind:'output', idx:o };
   }
   for (let w = 0; w < d.wires.length; w++) {
@@ -1232,18 +1581,14 @@ function drawEdit() {
   const W = cv.getBoundingClientRect().width, H = cv.getBoundingClientRect().height;
   ctx.clearRect(0, 0, W, H);
   camApply();
-  // Grid dots across the visible world region, so they pan/zoom with it.
-  if (S.cam.scale > 0.5) {
-    ctx.fillStyle = '#1a1e25';
-    const tl = toWorld(0, 0), br = toWorld(W, H);
-    for (let gx = Math.floor(tl.x / GRID) * GRID; gx < br.x; gx += GRID)
-      for (let gy = Math.floor(tl.y / GRID) * GRID; gy < br.y; gy += GRID)
-        ctx.fillRect(gx, gy, 1.5, 1.5);
-  }
+  drawGridDots(W, H);
+  if (S.view === 'world')
+    buildObstacles(d.nodes, E.pos.nodes, E.pos.inputs, E.pos.outputs);
 
   d.wires.forEach((w, i) => {
     const p = editWirePath(w);
-    strokePath(p, tyColor(sinkType(w.to)) + '88', 2);
+    if (S.view === 'world') strokeBelt(p, tyColor(sinkType(w.to)));
+    else strokePath(p, tyColor(sinkType(w.to)) + '88', 2);
     const lat = wireLatencyPreview(w.from, w.to);
     if (lat > 0) {
       const mid = pointAt(p, 0.5);
@@ -1268,6 +1613,10 @@ function drawEdit() {
 
   d.inputs.forEach((inp, i) => {
     const p = E.pos.inputs[i];
+    if (S.view === 'world') {
+      drawSourceWorld(inp, p, `${inp.label} ${inp.rate[0]}/${inp.rate[1]}`);
+      return;
+    }
     ctx.fillStyle = '#39414f';
     ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, 7); ctx.fill();
     ctx.strokeStyle = tyColor(inp.ty); ctx.lineWidth = 1.5; ctx.stroke();
@@ -1288,6 +1637,23 @@ function drawEdit() {
 
   d.nodes.forEach((node, n) => {
     const p = withSize(E.pos.nodes[n], node);
+    if (S.view === 'world') {
+      const rnW = aligned && resolved[n];
+      drawMachineWorld(node, p, {
+        sel: E.sel.has(n), fired: 0, phase: 0,
+        ins: rnW && rnW.legs.length === legsIn(node).length ? rnW.legs : legsIn(node),
+        outs: rnW && rnW.outs.length === legsOut(node).length ? rnW.outs : legsOut(node),
+      });
+      legsIn(node).forEach((_, l) => {
+        const m = markingAt(['node', n, l]);
+        if (m > 0) {
+          const q = inPortPos(p, l);
+          ctx.fillStyle = '#f4b942'; ctx.font = 'bold 9px system-ui';
+          ctx.fillText('●' + m, p.x + 4, q.y + 3);
+        }
+      });
+      return;
+    }
     // The chassis footprint: the machine's real extent on the grid.
     const [fw, fh] = footOf(node);
     ctx.strokeStyle = '#39414f88'; ctx.lineWidth = 1;
@@ -1349,11 +1715,12 @@ function drawEdit() {
                     right - ctx.measureText(label).width - thumbDims(cells, 11, 3).w - 3,
                     q.y, 11, 3);
     });
-    if (node.kind === 'recipe') drawRecipeStrip(node, p);
+    if (node.kind === 'recipe') drawRecipeStrip(node, p.x + 9, p.y + p.h - 12);
   });
 
   d.outputs.forEach((out, o) => {
     const p = E.pos.outputs[o];
+    if (S.view === 'world') { drawOutputWorld(out, p, null); return; }
     roundRect(p.x, p.y - 22, 140, 44, 9);
     ctx.fillStyle = '#20262f'; ctx.fill();
     ctx.strokeStyle = '#39414f'; ctx.lineWidth = 1; ctx.stroke();
@@ -1384,6 +1751,13 @@ function drawEdit() {
   ctx.fillText(hints[E.tool], 16, H - 14);
 }
 function port(q, ty) {
+  if (S.view === 'world') {   // a dock: the cell where a belt ends
+    ctx.fillStyle = '#1d222b';
+    ctx.fillRect(q.x - 7, q.y - 7, 14, 14);
+    ctx.strokeStyle = tyColor(ty); ctx.lineWidth = 1.5;
+    ctx.strokeRect(q.x - 6.5, q.y - 6.5, 13, 13);
+    return;
+  }
   ctx.fillStyle = tyColor(ty);
   ctx.beginPath(); ctx.arc(q.x, q.y, 5, 0, 7); ctx.fill();
   ctx.strokeStyle = '#14171c'; ctx.lineWidth = 1; ctx.stroke();
@@ -1480,6 +1854,16 @@ function setMode(m) {
   if (leavingEdit) { clearTimeout(liveTimer); runLive(); }
 }
 
+function setView(v) {
+  S.view = v;
+  try { localStorage.setItem('hashtorio.view', v); } catch (_) {}
+  // The button names the view you'd switch TO.
+  document.getElementById('viewbtn').textContent =
+    v === 'world' ? 'graph view' : 'world view';
+  if (S.scene && S.pos) sizeNodes(S.pos, S.scene.nodes);
+  ROUTES.sig = '';   // routes rebuild lazily
+}
+
 function setTool(t) {
   E.tool = t; E.wireFrom = null;
   for (const id of ['move', 'wire', 'mark', 'del', 'sel']) {
@@ -1563,6 +1947,8 @@ document.getElementById('zoomin').onclick = () => zoomCenter(1.25);
 document.getElementById('zoomout').onclick = () => zoomCenter(0.8);
 document.getElementById('zoomreset').onclick = resetView;
 document.getElementById('zoomfit').onclick = zoomToFit;
+document.getElementById('viewbtn').onclick = () =>
+  setView(S.view === 'world' ? 'schematic' : 'world');
 window.addEventListener('keydown', e => {
   const tag = document.activeElement && document.activeElement.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -1570,6 +1956,7 @@ window.addEventListener('keydown', e => {
   else if (e.key === '-' || e.key === '_') zoomCenter(0.8);
   else if (e.key === '0') resetView();
   else if (e.key === 'f') zoomToFit();
+  else if (e.key === 'v') document.getElementById('viewbtn').click();
 });
 document.getElementById('speed').onchange = e => { S.tps = +e.target.value; };
 document.getElementById('go').onclick = () =>
@@ -1659,6 +2046,7 @@ document.getElementById('a-clear').onclick = () => {
   const scene = await (await fetch('/api/scene')).json();
   resize();
   applyScene(scene, null);
+  setView(S.view);
   fetchState();
   loadDraft();
   window.addEventListener('resize', layout);
