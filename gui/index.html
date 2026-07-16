@@ -181,7 +181,8 @@ const shortName = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
 const S = { mode:'run', t:0, playing:true, tps:10, scene:null, frames:new Map(),
             fetching:new Set(), pos:null, customPos:null, last:performance.now(),
             subFrames:new Map(), subFetching:new Set(), subLats:null, subNodes:null,
-            cam:{ scale:1, x:0, y:0 }, pan:null, view:'world' };
+            cam:{ scale:1, x:0, y:0 }, pan:null, view:'world',
+            mouseScr:null, drill:null, camStack:[] };
 try { S.view = localStorage.getItem('hashtorio.view') || 'world'; } catch (_) {}
 const E = { draft:{ inputs:[], outputs:[], nodes:[], wires:[], markings:[] },
             pos:{ inputs:[], nodes:[], outputs:[] },
@@ -354,6 +355,21 @@ function roundRect(x, y, w, h, r) {
 function layout() {
   const sc = S.scene;
   if (S.customPos) { S.pos = S.customPos; sizeNodes(S.pos, sc.nodes); return; }
+  S.pos = computeAutoLayout(sc);
+}
+// Positions for any scene: stored grid positions if present, else auto.
+function scenePos(sc) {
+  if (sc.pos && sc.pos.nodes.length === sc.nodes.length
+      && (sc.pos.nodes.length + sc.pos.inputs.length) > 0) {
+    const px = ps => ps.map(([x, y]) => ({ x: x * GRID, y: y * GRID }));
+    const pos = { inputs: px(sc.pos.inputs), nodes: px(sc.pos.nodes),
+                  outputs: px(sc.pos.outputs) };
+    sizeNodes(pos, sc.nodes);
+    return pos;
+  }
+  return computeAutoLayout(sc);
+}
+function computeAutoLayout(sc) {
   const n = sc.nodes.length;
   const depth = new Array(n).fill(1);
   for (let pass = 0; pass < n + 2; pass++) {
@@ -387,7 +403,7 @@ function layout() {
   pos.inputs = pos.inputs.map(snap);
   pos.outputs = pos.outputs.map(snap);
   sizeNodes(pos, sc.nodes);
-  S.pos = pos;
+  return pos;
 }
 function sizeNodes(pos, nodes) {
   nodes.forEach((node, i) => {
@@ -424,23 +440,47 @@ function wirePath(pos, nodes, from, to) {
 // ---------------------------------------------------------------------------
 async function ensure(t) {
   t = Math.max(0, Math.floor(t));
+  // When the run view is inside a sealed module, frames come from the
+  // drilled interior (same clock, same O(1) reads).
+  const v = S.drill;
+  const frames = v ? v.frames : S.frames;
+  const fetching = v ? v.fetching : S.fetching;
+  const base = v ? `/api/subframes?path=${v.path.join(',')}&` : '/api/frames?';
   for (let k = t; k < t + 8; k++) {
-    if (!S.frames.has(k)) {
-      const key = 'b' + k;
-      if (S.fetching.has(key)) return;
-      S.fetching.add(key);
+    if (!frames.has(k)) {
+      const key = (v ? 'd' + v.path.join('.') : 'b') + ':' + k;
+      if (fetching.has(key)) return;
+      fetching.add(key);
       try {
-        const r = await (await fetch(`/api/frames?from=${k}&n=64`)).json();
-        r.frames.forEach((f, i) => S.frames.set(r.from + i, f));
-        if (S.frames.size > 4096) {
+        const r = await (await fetch(`${base}from=${k}&n=64`)).json();
+        if (v && S.drill !== v) return;      // navigated away meanwhile
+        r.frames.forEach((f, i) => frames.set(r.from + i, f));
+        if (frames.size > 4096) {
           const keep = new Set();
           for (let j = Math.floor(S.t) - 64; j < Math.floor(S.t) + 256; j++) keep.add(j);
-          for (const kk of S.frames.keys()) if (!keep.has(kk)) S.frames.delete(kk);
+          for (const kk of frames.keys()) if (!keep.has(kk)) frames.delete(kk);
         }
-      } finally { S.fetching.delete(key); }
+      } finally { fetching.delete(key); }
       return;
     }
   }
+}
+
+// Run-mode drilling: descend into a sealed module and watch it run from the
+// inside, fed the flows its parent really delivers — the ladder of
+// abstraction with the seal kept honest (the interior is a fresh compile,
+// not data the parent view was hiding).
+async function runDrill(path, crumb) {
+  try {
+    const sc = await (await fetch('/api/subscene?path=' + path.join(','))).json();
+    if (S.mode !== 'run') return false;
+    mergeTypes(sc.types); harvestChassis(sc.nodes);
+    S.drill = { path, crumb, scene: sc, pos: scenePos(sc),
+                frames: new Map(), fetching: new Set() };
+    fillPanel(sc);
+    ensure(S.t);
+    return true;
+  } catch (_) { return false; }
 }
 
 // Type ids are globally unique and immutable (StructLib is append-only), so
@@ -534,12 +574,14 @@ function zoomToFit() {
     });
     E.pos.inputs.forEach(p => rect(p.x - 16, p.y - 16, 32, 50));
     E.pos.outputs.forEach(p => rect(p.x, p.y - 22, 140, 44));
-  } else if (S.scene && S.pos) {
-    S.scene.nodes.forEach((nd, i) => {
-      const p = S.pos.nodes[i]; if (p) rect(p.x, p.y, p.w, p.h);
+  } else {
+    const v = S.drill || S;
+    if (!v.scene || !v.pos) return;
+    v.scene.nodes.forEach((nd, i) => {
+      const p = v.pos.nodes[i]; if (p) rect(p.x, p.y, p.w, p.h);
     });
-    S.pos.inputs.forEach(p => rect(p.x - 16, p.y - 16, 32, 50));
-    S.pos.outputs.forEach(p => rect(p.x, p.y - 22, 140, 44));
+    v.pos.inputs.forEach(p => rect(p.x - 16, p.y - 16, 32, 50));
+    v.pos.outputs.forEach(p => rect(p.x, p.y - 22, 140, 44));
   }
   if (x1 < x0) return;
   const r = cv.getBoundingClientRect();
@@ -878,20 +920,182 @@ function drawRecipeStrip(node, x0, y) {
   side(node.produce);
 }
 
+// ---------------------------------------------------------------------------
+// hover: answer "what is this?" where the eye already is (Magic Ink).
+// A card near the cursor names the thing, draws its pieces at readable
+// size, and shows the live numbers — no clicking, no hunting.
+// ---------------------------------------------------------------------------
+function distToPath(p, x, y) {
+  let best = Infinity;
+  for (let k = 0; k <= 24; k++) {
+    const q = pointAt(p, k / 24);
+    best = Math.min(best, (q.x - x) ** 2 + (q.y - y) ** 2);
+  }
+  return Math.sqrt(best);
+}
+// Hit-test a run scene (ports in world view; nodes, ends, belts in both).
+function runHover(view, x, y) {
+  const sc = view.scene, pos = view.pos;
+  if (!sc || !pos) return null;
+  const near = (p, r) => (x - p.x) ** 2 + (y - p.y) ** 2 <= r * r;
+  if (S.view === 'world') {
+    for (let n = 0; n < sc.nodes.length; n++) {
+      const p = pos.nodes[n], node = sc.nodes[n];
+      if (!p) continue;
+      for (let l = 0; l < node.legs.length; l++)
+        if (near(inPortPos(p, l), 10)) return { kind: 'inport', n, l };
+      for (let l = 0; l < (node.outs || []).length; l++)
+        if (near(outPortPos(p, l), 10)) return { kind: 'outport', n, l };
+    }
+  }
+  for (let n = 0; n < sc.nodes.length; n++) {
+    const p = pos.nodes[n];
+    if (p && x >= p.x && x <= p.x + p.w && y >= p.y && y <= p.y + p.h)
+      return { kind: 'node', n };
+  }
+  for (let i = 0; i < sc.inputs.length; i++) {
+    const p = pos.inputs[i];
+    if (S.view === 'world'
+        ? (x >= p.x && x <= p.x + GRID && y >= p.y && y <= p.y + GRID)
+        : near(p, 16))
+      return { kind: 'input', i };
+  }
+  for (let o = 0; o < sc.outputs.length; o++) {
+    const p = pos.outputs[o];
+    if (S.view === 'world'
+        ? (x >= p.x && x <= p.x + GRID && y >= p.y && y <= p.y + GRID)
+        : (x >= p.x && x <= p.x + 140 && y >= p.y - 22 && y <= p.y + 22))
+      return { kind: 'output', o };
+  }
+  for (let i = 0; i < sc.edges.length; i++) {
+    const p = wirePath(pos, sc.nodes, sc.edges[i].from, sc.edges[i].to);
+    if (distToPath(p, x, y) < 9) return { kind: 'wire', i };
+  }
+  return null;
+}
+// A card row that shows the piece itself when it has a shape.
+const shapeRow = (ty, note) =>
+  tyCells(ty) ? { shape: ty, note } : { text: note, color: '#cdd6e0' };
+function nodeCardRows(node, ins, outs, occ) {
+  const rows = [{ text: node.label, bold: true }];
+  const lat = node.latency !== undefined ? ` · ${node.latency}t` : '';
+  rows.push({ text: kindTag(node) + lat, color: '#7d8a99' });
+  const queue = l => occ && occ[l] !== null && occ[l] !== undefined
+    ? `  (queue ${occ[l]})` : '';
+  if (node.kind === 'recipe') {
+    rows.push({ text: 'consumes', color: '#7d8a99' });
+    node.consume.forEach(([ty, a], l) =>
+      rows.push(shapeRow(ty, `${a}× ${tyName(ty)}` + queue(l))));
+    rows.push({ text: 'produces', color: '#7d8a99' });
+    node.produce.forEach(([ty, a]) =>
+      rows.push(shapeRow(ty, `${a}× ${tyName(ty)}`)));
+  } else {
+    ins.forEach((ty, l) => rows.push(shapeRow(ty, 'in · ' + tyName(ty) + queue(l))));
+    outs.forEach(ty => rows.push(shapeRow(ty, 'out · ' + tyName(ty))));
+  }
+  if (node.kind === 'module')
+    rows.push({ text: 'double-click to look inside', color: '#8fd3ff' });
+  return rows;
+}
+function runCardRows(view, hov, cur) {
+  const sc = view.scene;
+  if (hov.kind === 'node') {
+    const node = sc.nodes[hov.n];
+    return nodeCardRows(node, node.legs, node.outs || [],
+                        cur && cur.occ ? cur.occ[hov.n] : null);
+  }
+  if (hov.kind === 'inport') {
+    const node = sc.nodes[hov.n], ty = node.legs[hov.l];
+    const occ = cur && cur.occ ? cur.occ[hov.n][hov.l] : undefined;
+    const rows = [{ text: 'input dock', bold: true }, shapeRow(ty, tyName(ty))];
+    if (occ === null) rows.push({ text: 'queue: sealed inside', color: '#7d8a99' });
+    else if (occ !== undefined) rows.push({ text: `queue: ${occ}`, color: '#9aa5b1' });
+    return rows;
+  }
+  if (hov.kind === 'outport') {
+    const ty = (sc.nodes[hov.n].outs || [])[hov.l];
+    return [{ text: 'output dock', bold: true }, shapeRow(ty, tyName(ty))];
+  }
+  if (hov.kind === 'input') {
+    const inp = sc.inputs[hov.i];
+    return [{ text: inp.label, bold: true }, shapeRow(inp.ty, tyName(inp.ty)),
+            { text: `rate ${inp.rate[0]}/${inp.rate[1]} per tick`, color: '#9aa5b1' }];
+  }
+  if (hov.kind === 'output') {
+    const out = sc.outputs[hov.o];
+    const rows = [{ text: out.label, bold: true }, shapeRow(out.ty, tyName(out.ty))];
+    if (cur) rows.push({ text: `total ${cur.outs[hov.o][0].toLocaleString()}`,
+                         color: '#9aa5b1' });
+    return rows;
+  }
+  if (hov.kind === 'wire') {
+    const e = sc.edges[hov.i];
+    const lat = sc.lats ? sc.lats[hov.i] : 0;
+    const transit = cur && cur.transit ? cur.transit[hov.i] : 0;
+    return [{ text: 'belt', bold: true }, shapeRow(e.ty, tyName(e.ty)),
+            { text: `latency ${lat}t · ${transit} in transit`, color: '#9aa5b1' }];
+  }
+  return [];
+}
+// Render a card in screen space near the cursor, clamped to the canvas.
+function drawHoverCard(rows, sx, sy) {
+  if (!rows || !rows.length) return;
+  let w = 0, h = 6;
+  const meas = rows.map(r => {
+    if (r.shape !== undefined) {
+      const td = thumbDims(tyCells(r.shape), 26, 9);
+      ctx.font = '11px system-ui';
+      w = Math.max(w, td.w + 8 + ctx.measureText(r.note || '').width);
+      const rh = Math.max(td.h + 6, 18); h += rh; return rh;
+    }
+    ctx.font = r.bold ? 'bold 11.5px system-ui' : '11px system-ui';
+    w = Math.max(w, ctx.measureText(r.text).width);
+    h += 16; return 16;
+  });
+  w += 20; h += 6;
+  const r0 = cv.getBoundingClientRect();
+  let X = sx + 16, Y = sy + 16;
+  if (X + w > r0.width - 8) X = sx - w - 12;
+  if (Y + h > r0.height - 8) Y = r0.height - h - 8;
+  X = Math.max(8, X); Y = Math.max(8, Y);
+  roundRect(X, Y, w, h, 7);
+  ctx.fillStyle = 'rgba(24,28,35,0.94)'; ctx.fill();
+  ctx.strokeStyle = '#39414f'; ctx.lineWidth = 1; ctx.stroke();
+  let y = Y + 6;
+  rows.forEach((r, i) => {
+    const rh = meas[i];
+    if (r.shape !== undefined) {
+      let x2 = X + 10;
+      x2 += drawThumbAt(tyCells(r.shape), x2, y + rh / 2, 26, 9) + 8;
+      ctx.font = '11px system-ui'; ctx.fillStyle = r.color || '#cdd6e0';
+      ctx.fillText(r.note || '', x2, y + rh / 2 + 4);
+    } else {
+      ctx.font = r.bold ? 'bold 11.5px system-ui' : '11px system-ui';
+      ctx.fillStyle = r.color || (r.bold ? '#e6edf3' : '#9aa5b1');
+      ctx.fillText(r.text, X + 10, y + 12);
+    }
+    y += rh;
+  });
+}
+
 function draw() {
   const W = cv.getBoundingClientRect().width, H = cv.getBoundingClientRect().height;
   ctx.clearRect(0, 0, W, H);
-  const sc = S.scene; if (!sc || !S.pos) return;
+  const view = S.drill || S;
+  const sc = view.scene, pos = view.pos;
+  if (!sc || !pos) return;
   const T = Math.floor(S.t), phase = S.t - T;
-  const cur = S.frames.get(T), nxt = S.frames.get(T + 1);
+  const cur = view.frames.get(T), nxt = view.frames.get(T + 1);
+  const m = S.mouseScr && !S.pan ? toWorld(S.mouseScr.x, S.mouseScr.y) : null;
   camApply();
   if (S.view === 'world') {
-    buildObstacles(sc.nodes, S.pos.nodes, S.pos.inputs, S.pos.outputs);
+    buildObstacles(sc.nodes, pos.nodes, pos.inputs, pos.outputs);
     drawGridDots(W, H);
   }
+  const hov = m ? runHover(view, m.x, m.y) : null;
 
   sc.edges.forEach((e, i) => {
-    const p = wirePath(S.pos, sc.nodes, e.from, e.to);
+    const p = wirePath(pos, sc.nodes, e.from, e.to);
     if (S.view === 'world') strokeBelt(p, tyColor(e.ty));
     else strokePath(p, tyColor(e.ty) + '44', 2);
     const lat = sc.lats ? sc.lats[i] : 0;
@@ -906,7 +1110,7 @@ function draw() {
   });
 
   sc.inputs.forEach((inp, i) => {
-    const p = S.pos.inputs[i];
+    const p = pos.inputs[i];
     if (S.view === 'world') { drawSourceWorld(inp, p, inp.label); return; }
     ctx.fillStyle = '#39414f';
     ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, 7); ctx.fill();
@@ -920,7 +1124,7 @@ function draw() {
   });
 
   sc.nodes.forEach((node, n) => {
-    const p = S.pos.nodes[n];
+    const p = pos.nodes[n];
     const fired = nxt ? nxt.fired[n] : 0;
     if (S.view === 'world') {
       drawMachineWorld(node, p, { sel: false, fired, phase,
@@ -987,7 +1191,7 @@ function draw() {
   });
 
   sc.outputs.forEach((out, o) => {
-    const p = S.pos.outputs[o];
+    const p = pos.outputs[o];
     if (S.view === 'world') { drawOutputWorld(out, p, cur ? cur.outs[o] : null); return; }
     roundRect(p.x, p.y - 22, 140, 44, 9);
     ctx.fillStyle = '#20262f'; ctx.fill();
@@ -1008,7 +1212,22 @@ function draw() {
     }
   });
 
+  if (hov && hov.kind === 'node') {   // the thing under the cursor, affirmed
+    const p = pos.nodes[hov.n];
+    roundRect(p.x - 2.5, p.y - 2.5, p.w + 5, p.h + 5, 8);
+    ctx.strokeStyle = '#8fd3ff55'; ctx.lineWidth = 2; ctx.stroke();
+  }
   camReset();
+
+  if (S.drill) {
+    ctx.fillStyle = '#8fd3ff'; ctx.font = 'bold 13px system-ui';
+    ctx.fillText('factory ▸ ' + S.drill.crumb.join(' ▸ ')
+      + '   (double-click empty space to leave)', 16, 22);
+  } else {
+    ctx.fillStyle = '#5d6875'; ctx.font = '12px system-ui';
+    ctx.fillText('double-click a module to look inside', 16, H - 14);
+  }
+  if (hov && S.mouseScr) drawHoverCard(runCardRows(view, hov, cur), S.mouseScr.x, S.mouseScr.y);
 
   if (!cur) {
     ctx.fillStyle = '#7d8a99'; ctx.font = '13px system-ui';
@@ -1385,6 +1604,7 @@ document.getElementById('harvest').onclick = async () => {
 function applyScene(scene, customPos) {
   S.scene = scene; mergeTypes(scene.types); harvestChassis(scene.nodes);
   S.frames.clear(); S.fetching.clear(); S.t = 0;
+  S.drill = null; S.camStack = [];
   if (scene.pos && scene.pos.nodes.length === scene.nodes.length
       && (scene.pos.nodes.length + scene.pos.inputs.length) > 0) {
     const px = ps => ps.map(([x, y]) => ({ x: x * GRID, y: y * GRID }));
@@ -1408,6 +1628,7 @@ let liveTimer = null, liveInFlight = false, livePending = false, liveErrAt = 0;
 function hotSwap(scene) {
   S.scene = scene; mergeTypes(scene.types); harvestChassis(scene.nodes);
   S.frames.clear(); S.fetching.clear();      // frames now describe the new line
+  S.drill = null; S.camStack = [];           // and any drilled interior is stale
   const px = ps => ps.map(([x, y]) => ({ x: x * GRID, y: y * GRID }));
   if (scene.pos && scene.pos.nodes.length === scene.nodes.length)
     S.customPos = { inputs: px(scene.pos.inputs), nodes: px(scene.pos.nodes),
@@ -1489,11 +1710,21 @@ function editorHit(x, y) {
   }
   return null;
 }
-const withSize = (p, node) => ({ ...p, w: NODE_W, h: nodeH(node) });
+const withSize = (p, node) => ({ ...p, ...nodeSize(node) });
 const editWirePath = w => wirePath(
   { nodes: E.pos.nodes.map((p, i) => withSize(p, D().nodes[i])),
     inputs: E.pos.inputs, outputs: E.pos.outputs },
   D().nodes, w.from, w.to);
+// Hover in the editor: everything editorHit sees, plus whole belts.
+function editHover(x, y) {
+  const hit = editorHit(x, y);
+  if (hit) return hit;
+  const d = D();
+  for (let i = 0; i < d.wires.length; i++)
+    if (distToPath(editWirePath(d.wires[i]), x, y) < 9)
+      return { kind: 'wire', idx: i };
+  return null;
+}
 
 function editorDown(x, y) {
   const hit = editorHit(x, y);
@@ -1539,9 +1770,29 @@ cv.addEventListener('mousedown', e => {
   }
   if (S.mode === 'edit') { const w = toWorld(e.offsetX, e.offsetY); editorDown(w.x, w.y); }
 });
-cv.addEventListener('dblclick', e => {
-  if (S.mode !== 'edit') return;
+cv.addEventListener('dblclick', async e => {
   const w = toWorld(e.offsetX, e.offsetY);
+  if (S.mode === 'run') {
+    // Descend into a sealed module; empty space ascends. The camera is
+    // saved per level so coming back up restores your framing.
+    const view = S.drill || S;
+    const hit = runHover(view, w.x, w.y);
+    if (hit && hit.kind === 'node' && view.scene.nodes[hit.n].kind === 'module') {
+      const label = view.scene.nodes[hit.n].label;
+      S.camStack.push({ ...S.cam });
+      const ok = await runDrill(
+        [...(S.drill ? S.drill.path : []), hit.n],
+        [...(S.drill ? S.drill.crumb : []), label]);
+      if (ok) zoomToFit(); else S.camStack.pop();
+    } else if (!hit && S.drill) {
+      const cam = S.camStack.pop();
+      const path = S.drill.path.slice(0, -1), crumb = S.drill.crumb.slice(0, -1);
+      if (path.length) await runDrill(path, crumb);
+      else { S.drill = null; fillPanel(); ensure(S.t); }
+      if (cam) S.cam = cam;
+    }
+    return;
+  }
   const hit = editorHit(w.x, w.y);
   if (hit && hit.kind === 'node' && D().nodes[hit.idx].kind === 'module') {
     enterModule(hit.idx);
@@ -1550,14 +1801,33 @@ cv.addEventListener('dblclick', e => {
   }
 });
 cv.addEventListener('mousemove', e => {
-  if (S.pan) { S.cam.x = e.offsetX - S.pan.x; S.cam.y = e.offsetY - S.pan.y; return; }
+  S.mouseScr = { x: e.offsetX, y: e.offsetY };
+  if (S.pan) {
+    S.cam.x = e.offsetX - S.pan.x; S.cam.y = e.offsetY - S.pan.y;
+    cv.style.cursor = 'grabbing'; return;
+  }
   const w = toWorld(e.offsetX, e.offsetY);
   E.mouse = { x: w.x, y: w.y };
   if (S.mode === 'edit' && E.drag) {
     E.drag.arr[E.drag.idx].x = w.x + E.drag.dx;
     E.drag.arr[E.drag.idx].y = w.y + E.drag.dy;
+    cv.style.cursor = 'grabbing'; return;
   }
+  // Cursor names the affordance: pointer over things you can act on.
+  let cursor = 'default';
+  if (S.mode === 'run') {
+    const view = S.drill || S;
+    const hit = view.scene && view.pos ? runHover(view, w.x, w.y) : null;
+    if (hit && hit.kind === 'node' && view.scene.nodes[hit.n].kind === 'module')
+      cursor = 'pointer';
+  } else {
+    const hit = editorHit(w.x, w.y);
+    if (hit) cursor = E.tool === 'move' && ['node', 'input', 'output'].includes(hit.kind)
+      ? 'grab' : 'pointer';
+  }
+  cv.style.cursor = cursor;
 });
+cv.addEventListener('mouseleave', () => { S.mouseScr = null; });
 window.addEventListener('mouseup', () => {
   if (S.pan) { S.pan = null; return; }
   if (E.drag) {
@@ -1634,6 +1904,9 @@ function drawEdit() {
   // show their *inferred* concrete pieces instead of "any".
   const resolved = E.path.length ? S.subNodes : (S.scene && S.scene.nodes);
   const aligned = resolved && S.appliedSig && alignSig(E.draft) === S.appliedSig;
+  const mw = S.mouseScr && !E.drag && !S.pan
+    ? toWorld(S.mouseScr.x, S.mouseScr.y) : null;
+  const hovE = mw ? editHover(mw.x, mw.y) : null;
 
   d.nodes.forEach((node, n) => {
     const p = withSize(E.pos.nodes[n], node);
@@ -1730,6 +2003,35 @@ function drawEdit() {
     const ocells = tyCells(out.ty);
     if (ocells && ocells.length > 1) drawThumb(ocells, p.x + 120, p.y, 4);
   });
+
+  // Wiring affordance: while a wire is started, show which docks accept it
+  // (green pulse) and which would refuse (dim red) — the same rule the
+  // engine enforces, shown before you click.
+  if (E.tool === 'wire' && E.wireFrom) {
+    const ft = fromType(E.wireFrom);
+    const pulse = 10 + 1.5 * Math.sin(performance.now() / 180);
+    const takes = st => ft === ANY_TY || st === ANY_TY || ft === st;
+    const ring = (q, ok) => {
+      ctx.strokeStyle = ok ? '#7bd88f' : '#e05e7833';
+      ctx.lineWidth = ok ? 2 : 1;
+      ctx.beginPath(); ctx.arc(q.x, q.y, ok ? pulse : 8, 0, 7); ctx.stroke();
+    };
+    d.nodes.forEach((node, n) => {
+      const p = withSize(E.pos.nodes[n], node);
+      legsIn(node).forEach((ty, l) => ring(inPortPos(p, l), takes(ty)));
+    });
+    d.outputs.forEach((out, o) => {
+      const po = E.pos.outputs[o];
+      const q = S.view === 'world' ? { x: po.x - GRID / 2, y: po.y + GRID / 2 }
+                                   : { x: po.x, y: po.y };
+      ring(q, takes(out.ty));
+    });
+  }
+  if (hovE && hovE.kind === 'node') {
+    const p = withSize(E.pos.nodes[hovE.idx], d.nodes[hovE.idx]);
+    roundRect(p.x - 2.5, p.y - 2.5, p.w + 5, p.h + 5, 8);
+    ctx.strokeStyle = '#8fd3ff55'; ctx.lineWidth = 2; ctx.stroke();
+  }
   camReset();
 
   // Breadcrumb: where in the nesting we are.
@@ -1742,13 +2044,60 @@ function drawEdit() {
   ctx.fillStyle = '#5d6875'; ctx.font = '12px system-ui';
   const hints = {
     move: 'move: drag things around',
-    wire: E.wireFrom ? 'wire: click an input port to connect'
+    wire: E.wireFrom ? 'wire: click a glowing dock to connect'
                      : 'wire: click an output port to start a wire',
     mark: 'preload: click an input port to set initial items',
     del: 'delete: click a node, source, output, or wire ×',
     sel: `select: click nodes to toggle (${E.sel.size} selected) — then seal`,
   };
   ctx.fillText(hints[E.tool], 16, H - 14);
+
+  // Hover card: the same in-place answers the run view gives.
+  if (hovE && S.mouseScr) {
+    const frames = E.path.length ? S.subFrames : S.frames;
+    const fr = aligned ? frames.get(Math.floor(S.t)) : null;
+    const rports = n2 => {
+      const node = d.nodes[n2], rn2 = aligned && resolved[n2];
+      return {
+        ins: rn2 && rn2.legs.length === legsIn(node).length ? rn2.legs : legsIn(node),
+        outs: rn2 && rn2.outs.length === legsOut(node).length ? rn2.outs : legsOut(node),
+      };
+    };
+    let rows = [];
+    if (hovE.kind === 'node') {
+      const node = d.nodes[hovE.idx], rp = rports(hovE.idx);
+      rows = nodeCardRows(node, rp.ins, rp.outs,
+                          fr && fr.occ ? fr.occ[hovE.idx] : null);
+    } else if (hovE.kind === 'inport' && hovE.to[0] === 'node') {
+      const ty = rports(hovE.to[1]).ins[hovE.to[2]];
+      rows = [{ text: 'input dock', bold: true }, shapeRow(ty, tyName(ty))];
+      const mk = markingAt(hovE.to);
+      if (mk > 0) rows.push({ text: `preload ●${mk}`, color: '#f4b942' });
+    } else if (hovE.kind === 'inport') {
+      const out = d.outputs[hovE.to[1]];
+      rows = [{ text: out.label, bold: true }, shapeRow(out.ty, tyName(out.ty))];
+    } else if (hovE.kind === 'outport' && hovE.from[0] === 'node') {
+      const ty = rports(hovE.from[1]).outs[hovE.from[2]];
+      rows = [{ text: 'output dock', bold: true }, shapeRow(ty, tyName(ty))];
+    } else if (hovE.kind === 'outport') {
+      const inp = d.inputs[hovE.from[1]];
+      rows = [{ text: inp.label, bold: true }, shapeRow(inp.ty, tyName(inp.ty)),
+              { text: `rate ${inp.rate[0]}/${inp.rate[1]} per tick`, color: '#9aa5b1' }];
+    } else if (hovE.kind === 'input') {
+      const inp = d.inputs[hovE.idx];
+      rows = [{ text: inp.label, bold: true }, shapeRow(inp.ty, tyName(inp.ty)),
+              { text: `rate ${inp.rate[0]}/${inp.rate[1]} per tick`, color: '#9aa5b1' }];
+    } else if (hovE.kind === 'output') {
+      const out = d.outputs[hovE.idx];
+      rows = [{ text: out.label, bold: true }, shapeRow(out.ty, tyName(out.ty))];
+    } else if (hovE.kind === 'wire') {
+      const w2 = d.wires[hovE.idx], ty = sinkType(w2.to);
+      rows = [{ text: 'belt', bold: true }, shapeRow(ty, tyName(ty)),
+              { text: `latency ${wireLatencyPreview(w2.from, w2.to)}t`,
+                color: '#9aa5b1' }];
+    }
+    drawHoverCard(rows, S.mouseScr.x, S.mouseScr.y);
+  }
 }
 function port(q, ty) {
   if (S.view === 'world') {   // a dock: the cell where a belt ends
@@ -1848,6 +2197,17 @@ function setMode(m) {
   if (m === 'edit' && !E.pos.nodes.length && (E.draft.nodes.length || E.draft.inputs.length)) {
     loadPos();
   }
+  // Continuity: entering edit walks to wherever the run view was looking,
+  // if the draft still has that module chain.
+  if (m === 'edit' && S.drill && !E.path.length) {
+    let dd = E.draft, ok = true;
+    for (const i of S.drill.path) {
+      if (!dd.nodes[i] || dd.nodes[i].kind !== 'module') { ok = false; break; }
+      dd = dd.nodes[i].draft;
+    }
+    if (ok) { flushPos(); E.path = S.drill.path.slice(); loadPos(); refreshSub(); }
+  }
+  if (m === 'edit') { S.drill = null; S.camStack = []; }
   // Entering edit: apply the current draft so the animation lights up right
   // away. Going to watch: flush any pending edit so the run view is current.
   if (m === 'edit') scheduleLive();
@@ -1871,8 +2231,8 @@ function setTool(t) {
   }
 }
 
-function fillPanel() {
-  const sc = S.scene;
+function fillPanel(scOpt) {
+  const sc = scOpt || S.scene;
   const rate = r => r[1] === 1 ? `${r[0]}/tick` : `${r[0]}/${r[1]} per tick`;
   document.getElementById('spec').innerHTML =
     '<tr><th>port</th><th>rate</th><th>first</th></tr>' +
