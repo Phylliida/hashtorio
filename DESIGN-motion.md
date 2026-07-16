@@ -183,8 +183,24 @@ Relocation rungs (meet the V-ladder at V4):
   demo's demand clock (its self-loop rounds its own chassis: 5 cells =
   the whole 1/2 period, recipe latency now 0) and the train's return leg
   (24 → 25). Space got truer and the balance moved, same as M10.
-- **G1**: seam-preserving move, player-driven — drags become real history
-  (audit-balanced across the seam) instead of rewrites.
+- **G1** ✅: seam-preserving moves. A position-only edit is a relocation:
+  the server opens a new epoch at the view tick, and the old epoch's exact
+  state crosses the seam — queues as phantom constant inputs, in-flight and
+  in-progress cohorts as scheduled arrivals (all phantom net inputs; the
+  kernel is untouched), module state by prehistory concatenation
+  (`Counting::suffix`/`concat` + an evaluator hook that replays a module's
+  input history in front of its new flows — memo-sound because the memo
+  keys on the concatenated inputs). Frames and harvest stitch across the
+  epoch timeline; topology edits collapse it (rewrite semantics, as ever).
+  Proofs: `a_move_is_a_seam_not_a_rewrite` (an iron conservation ledger
+  reconstructed from stitched frames alone closes exactly across the seam)
+  and `a_seam_preserves_module_state_exactly` (a factory with a stateful
+  module matches its never-moved twin tick for tick, forever — the
+  prehistory theorem). Honest costs: prehistory replay length ≈ elapsed
+  ticks (late seams compile slower); carried in-flight cohorts ride
+  phantom schedules, invisible to per-wire transit for a few ticks
+  (cosmetic); interior drill views are epoch-local; the timeline is
+  session-lived (restore begins a fresh epoch).
 - **G2**: **movers** — machines that move machines. The one genuinely new
   interface in the whole motion design: a kernel token firing triggers a
   world-layer move (reflection, carefully fenced). Scheduled movers +
