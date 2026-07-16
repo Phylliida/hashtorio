@@ -175,8 +175,14 @@ Consequences:
 
 Relocation rungs (meet the V-ladder at V4):
 
-- **G0**: grid-primary world (= spatialization P2: placed belts, real
-  occupancy) — the prerequisite.
+- **G0** ✅: grid-primary world — placed belts are semantic. `route.rs`
+  (deterministic, translation-covariant A*; L-path fallback when hemmed)
+  routes every wire at compile; latency and belt cost are the *routed*
+  length; the scene carries the paths so the GUI draws exactly what you
+  paid for. Migration honesty: repricing broke two tuned loops — the
+  demo's demand clock (its self-loop rounds its own chassis: 5 cells =
+  the whole 1/2 period, recipe latency now 0) and the train's return leg
+  (24 → 25). Space got truer and the balance moved, same as M10.
 - **G1**: seam-preserving move, player-driven — drags become real history
   (audit-balanced across the seam) instead of rewrites.
 - **G2**: **movers** — machines that move machines. The one genuinely new
@@ -224,7 +230,8 @@ as it handles aperiodic flows. The caching-tier motto extends cleanly:
   delivery t=13, audit closes with the train conserved; two trains ⇒ 1/12
   (fleet scaling = the (max,+) theorem). Regression:
   `gui::tests::a_train_circulates_and_delivers`. Still open: the editor
-  vehicle/track sugar that compiles to exactly this.
+  vehicle/track sugar that compiles to exactly this. *(G0 postscript: the
+  cycle is now 25 — the return track physically wraps the unload dock.)*
 - **V2**: mobile factories — soul/body idiom (module + clock-windowed ports),
   plus GUI rendering of the body token as the module's chassis moving along
   its track.
