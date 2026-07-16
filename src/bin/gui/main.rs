@@ -1470,6 +1470,59 @@ mod tests {
         assert!(app.subview.is_none(), "retool clears the interior cache");
     }
 
+    /// DESIGN-motion.md V1: a train, from existing primitives only.
+    /// Track = loop of wires; vehicle = a token circulating it; stations =
+    /// recipes. The timetable is the critical circuit: cycle = load(2) +
+    /// outbound(8) + unload(2) + return(12) = 24 ticks, so one train
+    /// delivers 1 ore / 24 ticks — and doubling the fleet doubles the rate.
+    #[test]
+    fn a_train_circulates_and_delivers() {
+        let mut app = test_app();
+        // iron=0 cargo, pulse=7 the train token, plate=3 the loaded train.
+        let draft = |fleet: u64| {
+            format!(
+                r#"{{"inputs":[{{"ty":0,"label":"ore","rate":[1,6]}}],
+            "outputs":[{{"ty":0,"label":"delivered"}}],
+            "nodes":[
+              {{"kind":"recipe","label":"load dock","consume":[[0,1],[7,1]],
+                "produce":[[3,1]],"latency":2}},
+              {{"kind":"recipe","label":"unload dock","consume":[[3,1]],
+                "produce":[[7,1],[0,1]],"latency":2}}],
+            "wires":[{{"from":["in",0],"to":["node",0,0]}},
+                     {{"from":["node",0,0],"to":["node",1,0]}},
+                     {{"from":["node",1,0],"to":["node",0,1]}},
+                     {{"from":["node",1,1],"to":["out",0]}}],
+            "markings":[{{"to":["node",0,1],"n":{fleet}}}],
+            "pos":{{"inputs":[[2,4]],"nodes":[[6,3],[26,3]],"outputs":[[32,4]]}}}}"#
+            )
+        };
+        let (_, _, body) = route(&mut app, "POST", "/api/live", &draft(1));
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert!(body.contains("\"rate\":[1,24]"), "one train: 1/24: {body}");
+
+        // The train is physically on the track: over one cycle, both track
+        // segments (wires 1 and 2) carry it in transit at some phase.
+        let (_, _, frames) = route(&mut app, "GET", "/api/frames?from=30&n=24", "");
+        let v = json::parse(&frames).unwrap();
+        let mut seen = [false; 4];
+        for f in v.get("frames").and_then(|x| x.arr()).unwrap() {
+            let transit = f.get("transit").and_then(|x| x.arr()).unwrap();
+            for (w, t) in transit.iter().enumerate() {
+                if t.u64().unwrap() > 0 {
+                    seen[w] = true;
+                }
+            }
+        }
+        assert!(seen[1], "the loaded train rides the outbound track");
+        assert!(seen[2], "the empty train rides the return track");
+
+        // Fleet scaling, the (max,+) fact: two trains on the same track,
+        // same cycle, twice the throughput.
+        let (_, _, body) = route(&mut app, "POST", "/api/live", &draft(2));
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert!(body.contains("\"rate\":[1,12]"), "two trains: 1/12: {body}");
+    }
+
     #[test]
     fn module_draft_round_trips_through_compile() {
         let mut app = test_app();
