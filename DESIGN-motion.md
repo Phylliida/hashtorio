@@ -128,6 +128,66 @@ Sparse infinite space falls out of the Library; this is HashLife-with-economy,
 and it is the research-grade rung, not a feature rung: it needs lazy space
 and a real design pass of its own.
 
+## Relocation: machines moving on the grid, without stopping
+
+Distinct from tokens-on-tracks: here the *machinery itself* — including
+nested modules — gets shuffled around the grid, live. Each placement is a
+distinct compiled net (adjacency + distance = wiring + latency), so a move
+is a **seam** between nets. The design question is what crosses the seam,
+and the answer is: everything, exactly. A running machine has no hidden
+state — all of it derives from counting maps, and all of it transfers:
+
+| Seam state | Carried as |
+|---|---|
+| port queues (supplied − consumed) | markings of the new net (the state primitive, used as intended) |
+| items in flight on resized wires | scheduled arrivals — transient countings (positions are already exact; recompute remaining travel) |
+| work in progress (fired, due at t+d) | scheduled productions, same mechanism |
+| clock phases, priority reserves | special cases of the above |
+
+> **The relocation law.** Anything may move at any time; the seam is always
+> exact. Sealing doesn't *permit* moving — it shrinks the seam to the port
+> buffers (the summary is position-free, per the translation-invariance
+> pin). Boxes make moves cheap, never required.
+
+(A first draft of this design said "power down to move, or seal" — that was
+implementation caution misread as semantics, and it is retracted. The dual
+principle "power-down to open" in DESIGN.md still stands: opening is
+summary-to-microstate hydration; moving is not.)
+
+Consequences:
+
+- **The conservation audit must balance across seams** — a move can neither
+  mint nor destroy items, including the ones mid-air. That is the test
+  obligation that keeps relocation honest.
+- **Doppler falls out.** A machine receding from its supplier receives at a
+  slightly lower rate while in motion; approaching, higher. The piecewise
+  algebra produces this without being asked.
+- **Two deferred threads merge.** A periodic shuffle schedule is a mode
+  automaton over pre-compiled placements — the input-regime-parametric
+  summaries deferred since M5 and this document's motion-summary cache rule
+  are the *same evaluator feature*. O(1) frames survive: stretch location is
+  O(log seams), O(1) under a periodic schedule.
+- **The delta from today is one word.** Live editing already relocates
+  machinery with *rewrite-history* semantics (recompile from t=0, keep the
+  clock). Relocation-as-mechanic is the upgrade to *seam-preserving*
+  semantics: `evaluate_from(net, inputs, seam, t0)`, where a seam is just
+  markings + transient countings — plumbing into machinery that exists.
+
+Relocation rungs (meet the V-ladder at V4):
+
+- **G0**: grid-primary world (= spatialization P2: placed belts, real
+  occupancy) — the prerequisite.
+- **G1**: seam-preserving move, player-driven — drags become real history
+  (audit-balanced across the seam) instead of rewrites.
+- **G2**: **movers** — machines that move machines. The one genuinely new
+  interface in the whole motion design: a kernel token firing triggers a
+  world-layer move (reflection, carefully fenced). Scheduled movers +
+  recurrence detection = cachable self-rearrangement; since distance is
+  latency is semantics, a factory that defragments its own layout literally
+  improves its own throughput.
+- **G3**: gradual motion — cell-by-cell trundling as a chain of small seams,
+  rendered as a smooth slide, Doppler and all.
+
 ## The boundary (unchanged, sharpened)
 
 Aperiodic, data-dependent motion — a rover choosing turns from sensor
