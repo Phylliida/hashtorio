@@ -308,6 +308,10 @@ degrades as they use more of it.
 M5); richer constructor algebra (transmutation rules, 3D cells); goal
 ladders and progression; multiple save slots; WASM build.
 
+**Motion** — moving structures (vehicles, mobile factories, crawlers) cost
+zero new primitives: see `DESIGN-motion.md` (finite-modulo-symmetry
+principle, body/soul identity split, the motion-summary cache rule).
+
 ## Implementation decisions
 
 - Plain Rust for now, zero dependencies; the kernel algebra is kept pure and
