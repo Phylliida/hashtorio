@@ -129,6 +129,37 @@ impl Counting {
         }
     }
 
+    /// The tail from `t0` onward, re-based to zero: `C'(τ) = C(t0+τ) − C(t0)`.
+    /// Exact and closed: the suffix of an ultimately periodic staircase is
+    /// ultimately periodic (the transient shrinks by `t0`, floored at zero).
+    /// This is half of the relocation-seam algebra (DESIGN-motion.md).
+    pub fn suffix(&self, t0: u64) -> Counting {
+        let base = self.eval(t0);
+        let tail_transient = (self.transient as u64).saturating_sub(t0) as usize;
+        let len = tail_transient as u64 + self.period;
+        let samples = (0..len).map(|tau| self.eval(t0 + tau) - base).collect();
+        Counting { samples, transient: tail_transient, period: self.period, slope: self.slope }
+            .normalize()
+    }
+
+    /// This staircase up to `ts`, then `tail` re-based on top:
+    /// `D(t) = C(t)` for `t < ts`; `D(t) = C(ts) + tail(t−ts)` for `t ≥ ts`.
+    /// Exact; the transient is ~`ts` samples — the honest price of replaying
+    /// history. Used as module *prehistory* at relocation seams: a module's
+    /// state is a function of its input history (Kahn), so continuing it
+    /// across a seam means evaluating it on `concat` inputs and taking the
+    /// `suffix`. `c.concat(ts, &c.suffix(ts)) == c` for every `c, ts`.
+    pub fn concat(&self, ts: u64, tail: &Counting) -> Counting {
+        let base = self.eval(ts);
+        let t_len = ts as usize + tail.transient;
+        let len = t_len as u64 + tail.period;
+        let samples = (0..len)
+            .map(|t| if t < ts { self.eval(t) } else { addu(base, tail.eval(t - ts)) })
+            .collect();
+        Counting { samples, transient: t_len, period: tail.period, slope: tail.slope }
+            .normalize()
+    }
+
     /// Merge: pointwise sum of counts (deterministic union of two streams).
     pub fn add(&self, other: &Counting) -> Counting {
         let p = lcm(self.period, other.period);
@@ -364,6 +395,32 @@ mod tests {
 
     const WINDOW: u64 = 400;
     const CASES: usize = 300;
+
+    #[test]
+    fn suffix_and_concat_are_exact() {
+        let mut rng = Rng(0xfeed_beef_0451_cafe);
+        for _ in 0..CASES {
+            let c = random_counting(&mut rng);
+            let t0 = rng.below(60);
+            // suffix: pointwise re-based tail.
+            let s = c.suffix(t0);
+            assert!(s.validate(), "suffix invalid: {s:?}");
+            for tau in 0..WINDOW {
+                assert_eq!(s.eval(tau), c.eval(t0 + tau) - c.eval(t0),
+                    "suffix t0={t0} tau={tau} c={c:?}");
+            }
+            // concat: prefix then re-based tail, pointwise.
+            let g = random_counting(&mut rng);
+            let d = c.concat(t0, &g);
+            assert!(d.validate(), "concat invalid: {d:?}");
+            for t in 0..WINDOW {
+                let want = if t < t0 { c.eval(t) } else { c.eval(t0) + g.eval(t - t0) };
+                assert_eq!(d.eval(t), want, "concat t0={t0} t={t} c={c:?} g={g:?}");
+            }
+            // The seam round-trip law: replaying your own tail is a no-op.
+            assert_eq!(c.concat(t0, &c.suffix(t0)), c, "roundtrip t0={t0} c={c:?}");
+        }
+    }
 
     #[test]
     fn eval_matches_recurrence() {

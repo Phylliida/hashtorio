@@ -501,6 +501,31 @@ impl Draft {
     /// Compile: infer builder types, check footprints, build (inserting a
     /// belt per wire with geometric latency), intern.
     pub fn build(&self, lib: &mut Library, structs: &mut StructLib) -> Result<Built, String> {
+        self.build_inner(lib, structs, None)
+    }
+
+    /// Compile a relocation-seam epoch (G1, DESIGN-motion.md): the draft's
+    /// own markings are skipped — they were consumed into the old epoch and
+    /// live on inside the carried queues — and the seam plan's port flows
+    /// are injected as *phantom inputs* wired to their ports (the kernel is
+    /// untouched; a queue is a constant counting, an in-flight cohort a
+    /// scheduled arrival). `Built::flows` covers draft inputs then phantoms,
+    /// in order.
+    pub fn build_seamed(
+        &self,
+        lib: &mut Library,
+        structs: &mut StructLib,
+        seam: &SeamPlan,
+    ) -> Result<Built, String> {
+        self.build_inner(lib, structs, Some(seam))
+    }
+
+    fn build_inner(
+        &self,
+        lib: &mut Library,
+        structs: &mut StructLib,
+        seam: Option<&SeamPlan>,
+    ) -> Result<Built, String> {
         self.check()?;
         self.check_footprints(structs)?;
         let node_types = self.infer(structs)?;
@@ -583,16 +608,34 @@ impl Draft {
                 b.connect(belt.output(0), sink);
             }
         }
-        for (to, m) in &self.markings {
-            let sink = match *to {
-                DraftTo::Node(n, leg) => handles[n].input(leg as u32),
-                DraftTo::Output(o) => outs[o],
-            };
-            b.marking(sink, *m);
+        if seam.is_none() {
+            for (to, m) in &self.markings {
+                let sink = match *to {
+                    DraftTo::Node(n, leg) => handles[n].input(leg as u32),
+                    DraftTo::Output(o) => outs[o],
+                };
+                b.marking(sink, *m);
+            }
+        }
+        let mut phantom_flows = Vec::new();
+        if let Some(plan) = seam {
+            for (to, flow) in &plan.port_flows {
+                let ty = match *to {
+                    DraftTo::Node(n, leg) => node_types[n].0[leg],
+                    DraftTo::Output(o) => self.outputs[o].ty,
+                };
+                let ph = b.input(ty);
+                let sink = match *to {
+                    DraftTo::Node(n, leg) => handles[n].input(leg as u32),
+                    DraftTo::Output(o) => outs[o],
+                };
+                b.connect(ph, sink);
+                phantom_flows.push(flow.clone());
+            }
         }
 
         let id = lib.intern(b.build()).map_err(|e| friendly_net_error(&e, self))?;
-        let flows = self
+        let mut flows: Vec<Counting> = self
             .inputs
             .iter()
             .map(|i| {
@@ -603,8 +646,23 @@ impl Draft {
                 }
             })
             .collect();
+        flows.extend(phantom_flows);
         Ok(Built { id, flows, node_types, wire_lats, wire_routes })
     }
+}
+
+/// State carried across a relocation seam into a new epoch (G1 of
+/// DESIGN-motion.md). Everything a running factory "is" at one tick,
+/// expressed in the kernel's own vocabulary: countings.
+#[derive(Debug, Default, Clone)]
+pub struct SeamPlan {
+    /// Phantom injection per port: carried queues as constant countings,
+    /// in-flight items and in-progress work as scheduled arrivals.
+    pub port_flows: Vec<(DraftTo, Counting)>,
+    /// Module node index → (input histories, replay length): the module
+    /// continues from its exact pre-seam state by concatenation (its state
+    /// is a function of its input history).
+    pub module_prehistory: Vec<(usize, Vec<Counting>, u64)>,
 }
 
 /// What a blueprint costs to deploy.
