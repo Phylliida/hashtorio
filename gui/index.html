@@ -54,6 +54,7 @@
   <span id="zoompct" style="min-width:40px;text-align:center;color:#8fd3ff;font-variant-numeric:tabular-nums">100%</span>
   <button id="zoomin" title="zoom in (+ / wheel)">+</button>
   <button id="zoomreset" title="reset view (0)">&#9974;</button>
+  <button id="zoomfit" title="zoom to fit (f)">&#10530; fit</button>
   <span class="sep"></span>
   <span id="runtools" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <button id="play">&#10074;&#10074; pause</button>
@@ -153,13 +154,32 @@ function drawThumb(cells, cx, cy, cell) {
                  cell - 0.5, cell - 0.5);
   }
 }
+// Cell size / extent for a thumbnail capped at `maxh` px tall, `maxcell`
+// px per cell — so pieces of any size fit a fixed strip or label row.
+function thumbDims(cells, maxh, maxcell) {
+  let maxx = 0, maxy = 0;
+  for (const [x, y] of cells) { maxx = Math.max(maxx, x); maxy = Math.max(maxy, y); }
+  const cell = Math.min(maxcell, maxh / (maxy + 1));
+  return { cell, w: (maxx + 1) * cell, h: (maxy + 1) * cell };
+}
+// Left-aligned flowing thumbnail (drawThumb centers); returns drawn width.
+function drawThumbAt(cells, x, cy, maxh, maxcell) {
+  const t = thumbDims(cells, maxh, maxcell);
+  for (const [gx, gy, m] of cells) {
+    ctx.fillStyle = MAT_COLORS[m] || '#c792ea';
+    ctx.fillRect(x + gx * t.cell, cy + t.h / 2 - (gy + 1) * t.cell,
+                 t.cell - 0.5, t.cell - 0.5);
+  }
+  return t.w;
+}
+const shortName = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
 
 // ---------------------------------------------------------------------------
 // state
 // ---------------------------------------------------------------------------
 const S = { mode:'run', t:0, playing:true, tps:10, scene:null, frames:new Map(),
             fetching:new Set(), pos:null, customPos:null, last:performance.now(),
-            subFrames:new Map(), subFetching:new Set(), subLats:null,
+            subFrames:new Map(), subFetching:new Set(), subLats:null, subNodes:null,
             cam:{ scale:1, x:0, y:0 }, pan:null };
 const E = { draft:{ inputs:[], outputs:[], nodes:[], wires:[], markings:[] },
             pos:{ inputs:[], nodes:[], outputs:[] },
@@ -258,7 +278,8 @@ const kindTag = n => ({ priority:'else-gate', module:'sealed module',
   recipe:'recipe', weld:'welder', rot:'rotator', split:'splitter',
   belt:'belt' })[n.kind] || n.kind;
 const nodeH = n =>
-  36 + Math.max(legsIn(n).length, legsOut(n).length, 1) * 14 + 4;
+  36 + Math.max(legsIn(n).length, legsOut(n).length, 1) * 14 + 4
+     + (n.kind === 'recipe' ? 22 : 0);   // room for the recipe strip
 const inPortPos = (p, leg) => ({ x: p.x, y: p.y + 42 + leg * 14 });
 const outPortPos = (p, leg) => ({ x: p.x + p.w, y: p.y + 42 + leg * 14 });
 
@@ -384,14 +405,15 @@ function mergeTypes(list) {
 // and drop any stale interior frames.
 async function refreshSub() {
   S.subFrames.clear(); S.subFetching.clear();
-  if (!E.path.length) { S.subLats = null; return; }
+  if (!E.path.length) { S.subLats = null; S.subNodes = null; return; }
   const pathq = E.path.join(',');
   try {
     const sc = await (await fetch('/api/subscene?path=' + pathq)).json();
     if (E.path.join(',') !== pathq) return;      // navigated away meanwhile
     mergeTypes(sc.types);
     S.subLats = sc.lats || [];
-  } catch (_) { S.subLats = null; }
+    S.subNodes = sc.nodes || null;   // resolved port types for editor labels
+  } catch (_) { S.subLats = null; S.subNodes = null; }
 }
 
 // Interior per-tick frames for the module the editor is inside (mirrors
@@ -435,7 +457,7 @@ function toWorld(sx, sy) {
 }
 // Zoom keeping the world point under (sx, sy) pinned to that screen spot.
 function zoomAt(sx, sy, factor) {
-  const ns = Math.min(4, Math.max(0.15, S.cam.scale * factor));
+  const ns = Math.min(8, Math.max(0.15, S.cam.scale * factor));
   const k = ns / S.cam.scale;
   S.cam.x = sx - (sx - S.cam.x) * k;
   S.cam.y = sy - (sy - S.cam.y) * k;
@@ -446,18 +468,49 @@ function zoomCenter(factor) {
   zoomAt(r.width / 2, r.height / 2, factor);
 }
 function resetView() { S.cam = { scale: 1, x: 0, y: 0 }; }
+// Frame everything on the canvas (whichever mode is showing).
+function zoomToFit() {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const rect = (x, y, w, h) => {
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+    x1 = Math.max(x1, x + w); y1 = Math.max(y1, y + h);
+  };
+  if (S.mode === 'edit') {
+    const d = D();
+    d.nodes.forEach((nd, i) => {
+      const p = E.pos.nodes[i]; if (p) rect(p.x, p.y, NODE_W, nodeH(nd));
+    });
+    E.pos.inputs.forEach(p => rect(p.x - 16, p.y - 16, 32, 50));
+    E.pos.outputs.forEach(p => rect(p.x, p.y - 22, 140, 44));
+  } else if (S.scene && S.pos) {
+    S.scene.nodes.forEach((nd, i) => {
+      const p = S.pos.nodes[i]; if (p) rect(p.x, p.y, p.w, p.h);
+    });
+    S.pos.inputs.forEach(p => rect(p.x - 16, p.y - 16, 32, 50));
+    S.pos.outputs.forEach(p => rect(p.x, p.y - 22, 140, 44));
+  }
+  if (x1 < x0) return;
+  const r = cv.getBoundingClientRect();
+  const s = Math.min(2.5, 0.92 * Math.min(r.width / Math.max(60, x1 - x0),
+                                          r.height / Math.max(60, y1 - y0)));
+  S.cam.scale = s;
+  S.cam.x = (r.width - (x0 + x1) * s) / 2;
+  S.cam.y = (r.height - (y0 + y1) * s) / 2;
+}
 
 // Items on a wire at the current sub-tick, shared by the run and live-edit
 // views. On a belt (lat>0) they spread along the wire and drift; on a
 // zero-latency hop they pulse across. Structured items draw as their real
 // shape, primitives as a colored dot.
 function drawWireItems(p, ty, lat, transit, flow, phase) {
+  // Zoomed out, items grow in world units so they stay visible on screen.
+  const boost = 1 / Math.max(0.4, Math.min(1, S.cam.scale));
   const cells = tyCells(ty);
   const drawItem = q => {
-    if (cells && cells.length > 1) drawThumb(cells, q.x, q.y, 3);
+    if (cells && cells.length > 1) drawThumb(cells, q.x, q.y, 3 * boost);
     else {
       ctx.fillStyle = tyColor(ty);
-      ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.arc(q.x, q.y, 4 * boost, 0, 7); ctx.fill();
     }
   };
   if (lat > 0) {
@@ -466,7 +519,7 @@ function drawWireItems(p, ty, lat, transit, flow, phase) {
       drawItem(pointAt(p, ((j + phase) % dots) / dots * 0.9 + 0.05));
     if (transit > 8) {
       const q = pointAt(p, 0.5);
-      ctx.fillStyle = '#fff'; ctx.font = 'bold 11px system-ui';
+      ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.round(11 * boost)}px system-ui`;
       ctx.fillText('×' + transit, q.x + 6, q.y - 6);
     }
   } else if (flow > 0) {
@@ -478,10 +531,31 @@ function drawWireItems(p, ty, lat, transit, flow, phase) {
     }
     if (flow > 6) {
       const q = pointAt(p, Math.min(Math.max(phase, 0.05), 0.95));
-      ctx.fillStyle = '#fff'; ctx.font = 'bold 11px system-ui';
+      ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.round(11 * boost)}px system-ui`;
       ctx.fillText('×' + flow, q.x + 6, q.y - 6);
     }
   }
+}
+
+// The recipe as the pieces themselves: n× shape + … → m× shape, drawn at
+// the bottom of recipe nodes in both views. Zoom in and the shapes read.
+function drawRecipeStrip(node, p) {
+  const y = p.y + p.h - 12;
+  let x = p.x + 9;
+  ctx.font = '9.5px system-ui';
+  const side = pairs => pairs.forEach(([ty, amt], k) => {
+    if (k) { ctx.fillStyle = '#5d6875'; ctx.fillText('+', x, y + 3); x += 9; }
+    if (amt !== 1) {
+      ctx.fillStyle = '#9aa5b1';
+      const t = amt + '×'; ctx.fillText(t, x, y + 3);
+      x += ctx.measureText(t).width + 2;
+    }
+    const cells = tyCells(ty);
+    if (cells) x += drawThumbAt(cells, x, y, 16, 5) + 5;
+  });
+  side(node.consume);
+  ctx.fillStyle = '#f4b942'; ctx.fillText('→', x, y + 3); x += 14;
+  side(node.produce);
 }
 
 function draw() {
@@ -511,6 +585,9 @@ function draw() {
     ctx.fillStyle = '#39414f';
     ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, 7); ctx.fill();
     ctx.strokeStyle = tyColor(inp.ty); ctx.lineWidth = 1.5; ctx.stroke();
+    const icells = tyCells(inp.ty);
+    if (icells && icells.length > 1)
+      drawThumb(icells, p.x, p.y, thumbDims(icells, 20, 4).cell);
     ctx.fillStyle = '#9aa5b1'; ctx.font = '11px system-ui'; ctx.textAlign = 'center';
     ctx.fillText(inp.label, p.x + 6, p.y + 30);
     ctx.textAlign = 'left';
@@ -550,16 +627,24 @@ function draw() {
       const q = inPortPos(p, l);
       if (occ === null) {
         ctx.font = '9.5px system-ui'; ctx.fillStyle = '#5d6875';
-        ctx.fillText(`${tyName(ty)} ▸ sealed`, p.x + 8, q.y + 4);
+        ctx.fillText(`${shortName(tyName(ty), 8)} ▸ sealed`, p.x + 8, q.y + 4);
         return;
       }
       ctx.fillStyle = tyColor(ty) + '33';
-      ctx.fillRect(p.x + 8, q.y - 4, 76, 8);
+      ctx.fillRect(p.x + 8, q.y - 4, 48, 8);
       ctx.fillStyle = tyColor(ty);
-      ctx.fillRect(p.x + 8, q.y - 4, Math.min(occ, 25) * 3, 8);
+      ctx.fillRect(p.x + 8, q.y - 4, Math.min(occ, 24) * 2, 8);
       ctx.font = '9.5px system-ui'; ctx.fillStyle = '#9aa5b1';
-      ctx.fillText(`${tyName(ty)} ${occ}`, p.x + 88, q.y + 4);
+      ctx.fillText(`${shortName(tyName(ty), 8)} ${occ}`, p.x + 60, q.y + 4);
     });
+    // What each port emits, by name — the piece this node crafts.
+    (node.outs || []).forEach((ty, l) => {
+      const q = outPortPos(p, l);
+      ctx.font = '9.5px system-ui'; ctx.fillStyle = '#7d8a99'; ctx.textAlign = 'right';
+      ctx.fillText(shortName(tyName(ty), 9), p.x + p.w - 8, q.y + 3);
+      ctx.textAlign = 'left';
+    });
+    if (node.kind === 'recipe') drawRecipeStrip(node, p);
   });
 
   sc.outputs.forEach((out, o) => {
@@ -1186,11 +1271,20 @@ function drawEdit() {
     ctx.fillStyle = '#39414f';
     ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, 7); ctx.fill();
     ctx.strokeStyle = tyColor(inp.ty); ctx.lineWidth = 1.5; ctx.stroke();
+    const icells = tyCells(inp.ty);
+    if (icells && icells.length > 1)
+      drawThumb(icells, p.x, p.y, thumbDims(icells, 20, 4).cell);
     port({ x: p.x + 14, y: p.y }, inp.ty);
     ctx.fillStyle = '#9aa5b1'; ctx.font = '11px system-ui'; ctx.textAlign = 'center';
     ctx.fillText(`${inp.label} ${inp.rate[0]}/${inp.rate[1]}`, p.x + 6, p.y + 30);
     ctx.textAlign = 'left';
   });
+
+  // Resolved port types from the last successful compile: while the draft
+  // still matches what the server applied, builders (weld/rot/split/belt)
+  // show their *inferred* concrete pieces instead of "any".
+  const resolved = E.path.length ? S.subNodes : (S.scene && S.scene.nodes);
+  const aligned = resolved && S.appliedSig && alignSig(E.draft) === S.appliedSig;
 
   d.nodes.forEach((node, n) => {
     const p = withSize(E.pos.nodes[n], node);
@@ -1217,16 +1311,45 @@ function drawEdit() {
       : node.kind === 'module' ? '#8fd3ff' : '#7d8a99';
     ctx.font = '10px system-ui';
     ctx.fillText(kindTag(node), p.x + 9, p.y + 27);
-    legsIn(node).forEach((ty, l) => {
+    const rn = aligned && resolved[n];
+    const ins = rn && rn.legs.length === legsIn(node).length
+      ? rn.legs : legsIn(node);
+    const outs = rn && rn.outs.length === legsOut(node).length
+      ? rn.outs : legsOut(node);
+    ins.forEach((ty, l) => {
       const q = inPortPos(p, l);
       port(q, ty);
+      let x = p.x + 8;
+      const cells = tyCells(ty);
+      if (cells && cells.length > 1) x += drawThumbAt(cells, x, q.y, 11, 3) + 3;
+      const amt = node.kind === 'recipe' ? node.consume[l][1] : null;
+      const label = (amt !== null && amt !== 1 ? amt + '× ' : '')
+        + shortName(tyName(ty), 11);
+      ctx.font = '9px system-ui'; ctx.fillStyle = '#7d8a99';
+      ctx.fillText(label, x, q.y + 3);
       const m = markingAt(['node', n, l]);
       if (m > 0) {
-        ctx.fillStyle = '#f4b942'; ctx.font = 'bold 10px system-ui';
-        ctx.fillText('●' + m, q.x + 8, q.y + 4);
+        ctx.fillStyle = '#f4b942'; ctx.font = 'bold 9px system-ui';
+        ctx.fillText('●' + m, x + ctx.measureText(label).width + 4, q.y + 3);
       }
     });
-    legsOut(node).forEach((ty, l) => port(outPortPos(p, l), ty));
+    outs.forEach((ty, l) => {
+      const q = outPortPos(p, l);
+      port(q, ty);
+      const amt = node.kind === 'recipe' ? node.produce[l][1] : null;
+      const label = (amt !== null && amt !== 1 ? amt + '× ' : '')
+        + shortName(tyName(ty), 11);
+      ctx.font = '9px system-ui'; ctx.fillStyle = '#7d8a99'; ctx.textAlign = 'right';
+      const right = p.x + p.w - 8;
+      ctx.fillText(label, right, q.y + 3);
+      ctx.textAlign = 'left';
+      const cells = tyCells(ty);
+      if (cells && cells.length > 1)
+        drawThumbAt(cells,
+                    right - ctx.measureText(label).width - thumbDims(cells, 11, 3).w - 3,
+                    q.y, 11, 3);
+    });
+    if (node.kind === 'recipe') drawRecipeStrip(node, p);
   });
 
   d.outputs.forEach((out, o) => {
@@ -1237,6 +1360,8 @@ function drawEdit() {
     port({ x: p.x, y: p.y }, out.ty);
     ctx.fillStyle = '#7d8a99'; ctx.font = '11px system-ui';
     ctx.fillText(out.label, p.x + 12, p.y + 4);
+    const ocells = tyCells(out.ty);
+    if (ocells && ocells.length > 1) drawThumb(ocells, p.x + 120, p.y, 4);
   });
   camReset();
 
@@ -1437,12 +1562,14 @@ document.getElementById('e-play').onclick = () => setPlaying(!S.playing);
 document.getElementById('zoomin').onclick = () => zoomCenter(1.25);
 document.getElementById('zoomout').onclick = () => zoomCenter(0.8);
 document.getElementById('zoomreset').onclick = resetView;
+document.getElementById('zoomfit').onclick = zoomToFit;
 window.addEventListener('keydown', e => {
   const tag = document.activeElement && document.activeElement.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
   if (e.key === '+' || e.key === '=') zoomCenter(1.25);
   else if (e.key === '-' || e.key === '_') zoomCenter(0.8);
   else if (e.key === '0') resetView();
+  else if (e.key === 'f') zoomToFit();
 });
 document.getElementById('speed').onchange = e => { S.tps = +e.target.value; };
 document.getElementById('go').onclick = () =>
