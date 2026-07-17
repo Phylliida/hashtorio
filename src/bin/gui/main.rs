@@ -162,9 +162,98 @@ struct Fp {
     cursors: Vec<usize>,
     /// (node, dest, pace, due − epoch_t0), sorted.
     trundles: Vec<(usize, (i32, i32), u64, u64)>,
-    /// Sorted (node, histories, replay); present so a match is a *true*
-    /// state match even when modules are in play.
-    module_pre: Vec<(usize, Vec<Counting>, u64)>,
+    /// V4.1: per module node, a canonical *interior state snapshot* — the
+    /// recursive seam-extract (queues, in-flight, in-progress, nested),
+    /// used only for matching. The prehistory representation grows every
+    /// seam, but the state it reconstructs recurs; equal snapshots imply
+    /// equal futures by the same argument that makes G1 seams exact.
+    /// `None` (interior refused to summarize) carries a nonce so it never
+    /// matches — sound, just cycle-less.
+    modules: Vec<(usize, Option<StateFp>, u64)>,
+}
+
+/// V4.1: everything a module interior *is* at one tick, canonically.
+#[derive(PartialEq, Eq, Hash)]
+struct StateFp {
+    /// Port queues (supplied − consumed), in node/leg order.
+    queues: Vec<u64>,
+    /// Per wire: in-flight cohorts as (remaining travel, count).
+    inflight: Vec<Vec<(u64, u64)>>,
+    /// Per node: in-progress firings as (ticks until due, count).
+    inprogress: Vec<Vec<(u64, u64)>>,
+    /// Nested sealed modules, recursively.
+    nested: Vec<(usize, Option<StateFp>)>,
+}
+
+/// Compile a module interior on its full input history and snapshot its
+/// exact state at interior-time `at`.
+fn interior_state_fp(
+    lib: &mut Library,
+    structs: &mut StructLib,
+    sub: &Draft,
+    flows: Vec<Counting>,
+    at: u64,
+) -> Option<StateFp> {
+    let c = compile_with_flows(lib, structs, sub.clone(), Some(flows), None).ok()?;
+    let mut queues = Vec::new();
+    for (n, legs) in c.consumed.iter().enumerate() {
+        for (l, cons) in legs.iter().enumerate() {
+            if let Some(cm) = cons {
+                queues.push(c.supplies[n][l].eval(at) - cm.eval(at));
+            }
+        }
+    }
+    let mut inflight = Vec::new();
+    for (w, (from, _)) in c.draft.wires.iter().enumerate() {
+        let lat = c.wire_lats[w];
+        let mut v = Vec::new();
+        if lat > 0 {
+            let dep = match from {
+                DraftFrom::Input(i) => &c.input_flows[*i],
+                DraftFrom::Node(n, l) => &c.node_outs[*n][*l],
+            };
+            for td in (at + 1).saturating_sub(lat)..=at {
+                let prev = if td == 0 { 0 } else { dep.eval(td - 1) };
+                let cnt = dep.eval(td) - prev;
+                if cnt > 0 {
+                    v.push((lat - (at - td), cnt));
+                }
+            }
+        }
+        inflight.push(v);
+    }
+    let mut inprogress = Vec::new();
+    for (n, node) in c.draft.nodes.iter().enumerate() {
+        let lat = match node {
+            DraftNode::Recipe { latency, .. }
+            | DraftNode::Builder { latency, .. }
+            | DraftNode::Mover { latency, .. } => *latency,
+            _ => 0,
+        };
+        let mut v = Vec::new();
+        if lat > 0 {
+            if let Some(k) = c.firings[n].as_ref() {
+                for tf in (at + 1).saturating_sub(lat)..=at {
+                    let prev = if tf == 0 { 0 } else { k.eval(tf - 1) };
+                    let cnt = k.eval(tf) - prev;
+                    if cnt > 0 {
+                        v.push((tf + lat - at, cnt));
+                    }
+                }
+            }
+        }
+        inprogress.push(v);
+    }
+    let mut nested = Vec::new();
+    for (n, node) in c.draft.nodes.iter().enumerate() {
+        if let DraftNode::Module { draft, .. } = node {
+            nested.push((
+                n,
+                interior_state_fp(lib, structs, draft, c.supplies[n].clone(), at),
+            ));
+        }
+    }
+    Some(StateFp { queues, inflight, inprogress, nested })
 }
 
 /// V4: a closed loop. From `t_start`, the world repeats with `period`;
@@ -577,27 +666,42 @@ impl App {
     /// independent: the seam decisions depend only on per-epoch firing
     /// maps, never on how far each call happens to look.
     /// V4: the world's full frontier state, canonically ordered.
-    fn fingerprint(&self) -> Fp {
+    fn fingerprint(&mut self) -> Fp {
         let mut trundles: Vec<(usize, (i32, i32), u64, u64)> = self
             .trundles
             .iter()
             .map(|tr| (tr.node, tr.dest, tr.per_cell, tr.next_t - self.epoch_t0))
             .collect();
         trundles.sort();
-        let mut module_pre: Vec<(usize, Vec<Counting>, u64)> = self
-            .current
-            .module_pre
-            .iter()
-            .map(|(n, (h, s))| (*n, h.clone(), *s))
-            .collect();
-        module_pre.sort_by_key(|e| e.0);
+        // V4.1: modules match by interior state, not by the (growing)
+        // prehistory representation.
+        let mut modules: Vec<(usize, Option<StateFp>, u64)> = Vec::new();
+        for n in 0..self.current.draft.nodes.len() {
+            let DraftNode::Module { draft, .. } = &self.current.draft.nodes[n] else {
+                continue;
+            };
+            let sub = draft.as_ref().clone();
+            let (h, at): (Vec<Counting>, u64) = match self.current.module_pre.get(&n) {
+                Some((hp, sp)) => (
+                    hp.iter()
+                        .zip(&self.current.supplies[n])
+                        .map(|(h, g)| h.concat(*sp, g))
+                        .collect(),
+                    *sp,
+                ),
+                None => (self.current.supplies[n].clone(), 0),
+            };
+            let st = interior_state_fp(&mut self.lib, &mut self.structs, &sub, h, at);
+            let nonce = if st.is_none() { self.epoch_t0.max(1) } else { 0 };
+            modules.push((n, st, nonce));
+        }
         Fp {
             node_pos: self.current.draft.node_pos.clone(),
             net: self.current.id,
             flows: self.current.input_flows.clone(),
             cursors: self.mover_cursors.clone(),
             trundles,
-            module_pre,
+            modules,
         }
     }
 
@@ -2667,6 +2771,64 @@ mod tests {
         assert!(scene.contains("\"cycle\""), "the closed loop is served");
     }
 
+    /// V4.1: sealed-module worlds close their loops too. The prehistory
+    /// *representation* grows every seam, but the interior *state* it
+    /// reconstructs recurs — so the fingerprint matches on a recursive
+    /// interior snapshot instead. The commuting workshop becomes eternal.
+    #[test]
+    fn a_sealed_workshop_patrol_becomes_eternal() {
+        let mut app = test_app();
+        let sub = r#"{"inputs":[{"ty":0,"label":"in","rate":[1,1]}],
+            "outputs":[{"ty":2,"label":"out"}],
+            "nodes":[{"kind":"recipe","label":"press","consume":[[0,2]],
+                      "produce":[[2,1]],"latency":3}],
+            "wires":[{"from":["in",0],"to":["node",0,0]},
+                     {"from":["node",0,0],"to":["out",0]}],
+            "markings":[],
+            "pos":{"inputs":[[2,4]],"nodes":[[6,4]],"outputs":[[12,4]]}}"#;
+        let d = format!(
+            r#"{{"inputs":[{{"ty":0,"label":"mine","rate":[1,1]}},
+                           {{"ty":4,"label":"patrol","rate":[1,60]}}],
+            "outputs":[{{"ty":2,"label":"gears"}}],
+            "nodes":[{{"kind":"module","label":"workshop","draft":{sub}}},
+                     {{"kind":"mover","label":"carrier","token":4,"done":5,
+                       "target":0,"stops":[[18,4],[10,4]],"latency":1}}],
+            "wires":[{{"from":["in",0],"to":["node",0,0]}},
+                     {{"from":["node",0,0],"to":["out",0]}},
+                     {{"from":["in",1],"to":["node",1,0]}}],
+            "markings":[],
+            "pos":{{"inputs":[[2,4],[2,14]],"nodes":[[10,4],[10,14]],
+                    "outputs":[[30,4]]}}}}"#
+        );
+        let (_, _, body) = route(&mut app, "POST", "/api/live", &d);
+        assert!(body.contains("\"ok\":true"), "{body}");
+        for b in 0..8u64 {
+            route(&mut app, "GET", &format!("/api/frames?from={}&n=120", b * 120), "");
+            if app.cycle.is_some() {
+                break;
+            }
+        }
+        let Some(cy_period) = app.cycle.as_ref().map(|c| c.period) else {
+            panic!(
+                "no cycle for the sealed workshop in {} epochs",
+                app.history.len()
+            );
+        };
+        assert_eq!(cy_period % 120, 0, "whole patrol laps: {cy_period}");
+        let epochs = app.history.len();
+        route(&mut app, "GET", "/api/frames?from=2000000&n=4", "");
+        assert_eq!(app.history.len(), epochs, "eternal, with its box intact");
+        let near = app.output_total(0, 20_000 + cy_period) - app.output_total(0, 20_000);
+        let far =
+            app.output_total(0, 2_000_000 + cy_period) - app.output_total(0, 2_000_000);
+        assert_eq!(near, far, "the boxed loop delivers the same, forever");
+        let two_million = app.output_total(0, 2_000_000);
+        assert!(
+            (999_000..=1_000_001).contains(&two_million),
+            "two million ticks of gears at ~1/2: {two_million}"
+        );
+    }
+
     /// V2, realized the relocation way: a mobile factory is a sealed
     /// module carried by a crane. G1's prehistory theorem means its
     /// interior state rides along bit-exactly; G3 means it commutes cell
@@ -2721,16 +2883,15 @@ mod tests {
             }
         }
         assert!(app.stall.is_none(), "{:?}", app.stall);
+        // V4.1 postscript: the second lap's first footfall fingerprint-
+        // matched the first lap's — mid-walk! — so the loop closed after
+        // 17 epochs instead of materializing all 24. The workshop is
+        // eternal now; the two commutes it lived cover all the rest.
+        assert_eq!(app.history.len(), 17, "the loop closed mid-third-commute");
         assert_eq!(
-            app.history.len(),
-            24,
-            "three commutes, eight cells each; seams={:?} pos={:?}",
-            {
-                let mut s: Vec<u64> = app.history.iter().map(|e| e.t0).collect();
-                s.push(app.epoch_t0);
-                s
-            },
-            app.current.draft.node_pos
+            app.cycle.as_ref().map(|c| c.period),
+            Some(120),
+            "one patrol lap is the period"
         );
         assert!(
             last_total >= 100,
