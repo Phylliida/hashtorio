@@ -275,6 +275,35 @@ Relocation rungs (meet the V-ladder at V4):
   machines trundle) — kept on the ladder as V2-token, unbuilt until
   needed.
 
+## The minimality ledger (the arc's closing collapse)
+
+The standing discipline — "is X derivable? which fragment does it
+break?" — applied to the arc's own artifacts once they all existed:
+
+- **The Mover node kind is gone.** It always compiled to a plain recipe;
+  everything mover-specific was world-layer annotation. Motion is now a
+  draft-level **move rule** `{driver, target, stops, relative, pace}` in
+  a list parallel to markings: *any* node's firings can drive a move —
+  a press that walks as it works is one annotation away. The `token`/
+  `done` types vanished from the motion feature entirely (rules read
+  firings, which are type-agnostic), and the latency-as-pace double duty
+  resolved into an explicit `pace`. Draft node kinds: back to four
+  (Recipe, Priority, Module, Builder). The `"mover"` JSON kind survives
+  as parse-level sugar (M9's Belt precedent) — old saves and demos
+  desugar themselves on first load; the crab's fixture migrated itself
+  and re-found its cycle bit-identically.
+- **Kernel: unchanged at Recipe + Priority + Module + markings + wires.**
+  The whole motion arc — seams, cranes, trundles, eternal patrols,
+  gliders — added *zero* kernel primitives. One observed further
+  collapse, noted but not executed: markings ≡ constant phantom flows
+  (G1's phantom-input mechanism subsumes them); kept as a primitive for
+  save/economy ergonomics, not necessity.
+- **What motion actually cost**: two Counting operators (`suffix`,
+  `concat`), one evaluator hook (module prehistory), one world-layer
+  interpreter (epoch unrolling of move rules), one cache rule
+  (fingerprint recurrence, quotiented by translation). Everything else
+  was already here.
+
 ## The boundary (unchanged, sharpened)
 
 Aperiodic, data-dependent motion — a rover choosing turns from sensor
