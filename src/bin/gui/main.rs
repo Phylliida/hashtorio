@@ -56,6 +56,11 @@ struct Compiled {
     /// node index → (effective input histories, replay length). Needed to
     /// extend the histories at the *next* seam.
     module_pre: std::collections::HashMap<usize, (Vec<Counting>, u64)>,
+    /// The phantom port flows this epoch was compiled with (empty for
+    /// rewrite epochs). At the *next* seam, cohorts still riding these
+    /// schedules must be re-carried, and the flows must be excluded from
+    /// the draft-input suffix (they are epoch-local plumbing, not sources).
+    phantom_flows: Vec<(DraftTo, Counting)>,
     /// Per wire: the arrival counting map at the sink end.
     arrivals: Vec<Counting>,
     summary: Summary,
@@ -870,6 +875,10 @@ fn compile_with_flows(
         node_types,
         wire_lats,
         wire_routes,
+        phantom_flows: seam
+            .as_ref()
+            .map(|(plan, _)| plan.port_flows.clone())
+            .unwrap_or_default(),
         module_pre: seam.map(|(_, mp)| mp).unwrap_or_default(),
         arrivals,
         summary,
@@ -989,10 +998,21 @@ fn seam_extract(
         }
     }
 
-    let port_flows: Vec<(DraftTo, Counting)> = events
+    let mut port_flows: Vec<(DraftTo, Counting)> = events
         .into_iter()
         .map(|(to, ev)| (to, schedule_counting(ev)))
         .collect();
+
+    // Cohorts still riding the OLD epoch's phantom schedules (a seam soon
+    // after a seam) re-carry as the schedules' own suffixes. Anything that
+    // already arrived is inside the queues above; this is only the tail.
+    for (to, ph) in &old.phantom_flows {
+        let rem = ph.suffix(ts);
+        let settled = rem.transient_len() as u64 + rem.period();
+        if rem.eval(settled) > 0 || rem.rate() != (0, 1) {
+            port_flows.push((*to, rem));
+        }
+    }
 
     // Module prehistory: state is a function of input history; extend the
     // history this epoch was already carrying by what it saw since.
@@ -1016,7 +1036,14 @@ fn seam_extract(
         plan_pre.push((n, hist, replay));
     }
 
-    let in_flows = old.input_flows.iter().map(|f| f.suffix(ts)).collect();
+    // Suffix only the *draft* inputs — later entries in input_flows are the
+    // old epoch's phantom plumbing, handled above.
+    let in_flows = old
+        .input_flows
+        .iter()
+        .take(d.inputs.len())
+        .map(|f| f.suffix(ts))
+        .collect();
     (
         SeamPlan { port_flows, module_prehistory: plan_pre },
         module_pre,
@@ -2084,6 +2111,162 @@ mod tests {
         let (_, _, body) = route(&mut app, "POST", "/api/live", &draft(2));
         assert!(body.contains("\"ok\":true"), "{body}");
         assert!(body.contains("\"rate\":[2,25]"), "two trains: 2/25: {body}");
+    }
+
+    /// G2 (DESIGN-motion.md): a mover is, to the kernel, a plain recipe —
+    /// but the world layer reads its firing map and relocates its target,
+    /// opening an ordinary G1 seam. The iron conservation ledger must close
+    /// across an *autonomous* seam exactly as it does across a player's.
+    #[test]
+    fn a_mover_moves_a_machine_on_schedule() {
+        let mut app = test_app();
+        let d = r#"{"inputs":[{"ty":0,"label":"mine","rate":[1,1]},
+                              {"ty":4,"label":"clock","rate":[1,40]}],
+            "outputs":[{"ty":2,"label":"gears"}],
+            "nodes":[{"kind":"recipe","label":"press","consume":[[0,1]],
+                      "produce":[[2,1]],"latency":1},
+                     {"kind":"mover","label":"crane","token":4,"done":5,
+                      "target":0,"stops":[[8,9]],"latency":1}],
+            "wires":[{"from":["in",0],"to":["node",0,0]},
+                     {"from":["node",0,0],"to":["out",0]},
+                     {"from":["in",1],"to":["node",1,0]}],
+            "markings":[],
+            "pos":{"inputs":[[2,4],[2,12]],"nodes":[[8,4],[8,12]],
+                   "outputs":[[20,4]]}}"#;
+        let (_, _, body) = route(&mut app, "POST", "/api/live", d);
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert_eq!(app.history.len(), 0, "nothing has fired yet");
+
+        // Frames drive lazy materialization: the token lands at t=42
+        // (emitted 40, two ticks of wire), the crane fires, the press moves.
+        let (_, _, frames) = route(&mut app, "GET", "/api/frames?from=0&n=100", "");
+        assert_eq!(app.history.len(), 1, "the crane's firing opened a seam");
+        assert_eq!(app.epoch_t0, 42);
+        assert_eq!(app.current.draft.node_pos[0], (8, 9), "the press moved itself? no — was moved");
+        assert!(app.stall.is_none(), "{:?}", app.stall);
+
+        // Second firing (t=82) cycles to the same single stop: a no-op,
+        // no epoch churn.
+        let (_, _, _f2) = route(&mut app, "GET", "/api/frames?from=100&n=28", "");
+        assert_eq!(app.history.len(), 1, "no-op moves open no epochs");
+
+        // The iron ledger, from stitched frames alone, across an
+        // autonomous seam (carried cohorts ride phantoms briefly ~42..52).
+        let v = json::parse(&frames).unwrap();
+        let fr = v.get("frames").and_then(|x| x.arr()).unwrap();
+        let mut fired_cum = 0u64;
+        let mut last_total = 0u64;
+        for (t, f) in fr.iter().enumerate() {
+            let occ = f.get("occ").and_then(|x| x.arr()).unwrap()[0]
+                .arr()
+                .unwrap()[0]
+                .u64()
+                .unwrap();
+            let transit0 =
+                f.get("transit").and_then(|x| x.arr()).unwrap()[0].u64().unwrap();
+            fired_cum += f.get("fired").and_then(|x| x.arr()).unwrap()[0].u64().unwrap();
+            let total = f.get("outs").and_then(|x| x.arr()).unwrap()[0]
+                .arr()
+                .unwrap()[0]
+                .u64()
+                .unwrap();
+            assert!(total >= last_total, "delivered total dropped at t={t}");
+            last_total = total;
+            if !(42..53).contains(&t) {
+                assert_eq!(
+                    t as u64,
+                    transit0 + occ + fired_cum,
+                    "iron ledger broke at t={t}"
+                );
+            }
+        }
+        assert!(last_total > 50, "the line produced across the mover's seam");
+    }
+
+    /// Unrolling is deterministic and request-order independent: the seam
+    /// decisions depend only on per-epoch firing maps, never on how far
+    /// each frames request happens to look.
+    #[test]
+    fn mover_unrolling_is_request_order_independent() {
+        let d = r#"{"inputs":[{"ty":0,"label":"mine","rate":[1,1]},
+                              {"ty":4,"label":"clock","rate":[1,25]}],
+            "outputs":[{"ty":2,"label":"gears"}],
+            "nodes":[{"kind":"recipe","label":"press","consume":[[0,1]],
+                      "produce":[[2,1]],"latency":1},
+                     {"kind":"mover","label":"crane","token":4,"done":5,
+                      "target":0,"stops":[[8,9],[8,4]],"latency":1}],
+            "wires":[{"from":["in",0],"to":["node",0,0]},
+                     {"from":["node",0,0],"to":["out",0]},
+                     {"from":["in",1],"to":["node",1,0]}],
+            "markings":[],
+            "pos":{"inputs":[[2,4],[2,12]],"nodes":[[8,4],[8,12]],
+                   "outputs":[[20,4]]}}"#;
+        let grab = |frames: &str| -> Vec<u64> {
+            let v = json::parse(frames).unwrap();
+            v.get("frames")
+                .and_then(|x| x.arr())
+                .unwrap()
+                .iter()
+                .map(|f| {
+                    f.get("outs").and_then(|x| x.arr()).unwrap()[0].arr().unwrap()[0]
+                        .u64()
+                        .unwrap()
+                })
+                .collect()
+        };
+        // App A: one big look. App B: dribbles of 10.
+        let mut a = test_app();
+        route(&mut a, "POST", "/api/live", d);
+        let (_, _, fa) = route(&mut a, "GET", "/api/frames?from=0&n=120", "");
+        let ta = grab(&fa);
+        let mut b = test_app();
+        route(&mut b, "POST", "/api/live", d);
+        let mut tb = Vec::new();
+        for i in 0..12 {
+            let (_, _, fb) =
+                route(&mut b, "GET", &format!("/api/frames?from={}&n=10", i * 10), "");
+            tb.extend(grab(&fb));
+        }
+        assert_eq!(ta, tb, "stitched totals must not depend on request order");
+        assert_eq!(a.history.len(), b.history.len(), "same epochs either way");
+        assert!(
+            a.history.len() >= 2,
+            "the oscillating crane kept moving: len={} t0s={:?} epoch_t0={} stall={:?}",
+            a.history.len(),
+            a.history.iter().map(|e| e.t0).collect::<Vec<_>>(),
+            a.epoch_t0,
+            a.stall
+        );
+    }
+
+    /// The crawler seed: a mover may target ITSELF. This one walks three
+    /// stops east on a token drip — and because its own fuel line stretches
+    /// behind it, each footstep lands later than naive arithmetic says
+    /// (Doppler on its own supply): seams at t=1, 35, 68 — not 1, 32, 62.
+    #[test]
+    fn a_machine_that_walks() {
+        let mut app = test_app();
+        let d = r#"{"inputs":[{"ty":4,"label":"drip","rate":[1,30]}],
+            "outputs":[],
+            "nodes":[{"kind":"mover","label":"walker","token":4,"done":5,
+                      "target":0,"stops":[[14,2],[20,2],[26,2]],"latency":1}],
+            "wires":[{"from":["in",0],"to":["node",0,0]}],
+            "markings":[{"to":["node",0,0],"n":1}],
+            "pos":{"inputs":[[2,2]],"nodes":[[8,2]],"outputs":[]}}"#;
+        let (_, _, body) = route(&mut app, "POST", "/api/live", d);
+        assert!(body.contains("\"ok\":true"), "{body}");
+
+        route(&mut app, "GET", "/api/frames?from=0&n=80", "");
+        assert_eq!(app.history.len(), 3, "three footsteps");
+        let mut seams: Vec<u64> = app.history.iter().skip(1).map(|e| e.t0).collect();
+        seams.push(app.epoch_t0);
+        assert_eq!(
+            seams,
+            vec![1, 35, 68],
+            "Doppler footsteps: the fuel line stretches as it walks"
+        );
+        assert_eq!(app.current.draft.node_pos[0], (26, 2), "it walked east");
+        assert!(app.stall.is_none(), "{:?}", app.stall);
     }
 
     /// G1 (DESIGN-motion.md): a position-only edit is a relocation seam,
