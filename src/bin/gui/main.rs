@@ -610,7 +610,7 @@ impl App {
                 let tr = self.trundles[i].clone();
                 let cur = new_pos[tr.node];
                 let obs = self.dilated_obstacles(tr.node);
-                let path = hashtorio::route::route(cur, tr.dest, &obs);
+                let path = hashtorio::route::route_free(cur, tr.dest, &obs);
                 if path.len() < 2 || obs.contains(&path[1]) {
                     blocked.push(i); // hemmed in (L-fallback collides)
                     continue;
@@ -2469,6 +2469,77 @@ mod tests {
         assert_eq!(app.epoch_t0, 74, "last footfall");
         assert_eq!(app.current.draft.node_pos[0], (26, 2), "it walked east");
         assert!(app.stall.is_none(), "{:?}", app.stall);
+    }
+
+    /// V2, realized the relocation way: a mobile factory is a sealed
+    /// module carried by a crane. G1's prehistory theorem means its
+    /// interior state rides along bit-exactly; G3 means it commutes cell
+    /// by cell. The workshop works the whole way — its supply lines
+    /// stretch and shrink (Doppler), nothing spills, nothing resets, and
+    /// the books stay balanced through three full commutes.
+    #[test]
+    fn a_workshop_commutes_while_working() {
+        let mut app = test_app();
+        let sub = r#"{"inputs":[{"ty":0,"label":"in","rate":[1,1]}],
+            "outputs":[{"ty":2,"label":"out"}],
+            "nodes":[{"kind":"recipe","label":"press","consume":[[0,2]],
+                      "produce":[[2,1]],"latency":3}],
+            "wires":[{"from":["in",0],"to":["node",0,0]},
+                     {"from":["node",0,0],"to":["out",0]}],
+            "markings":[],
+            "pos":{"inputs":[[2,4]],"nodes":[[6,4]],"outputs":[[12,4]]}}"#;
+        let d = format!(
+            r#"{{"inputs":[{{"ty":0,"label":"mine","rate":[1,1]}},
+                           {{"ty":4,"label":"patrol","rate":[1,60]}}],
+            "outputs":[{{"ty":2,"label":"gears"}}],
+            "nodes":[{{"kind":"module","label":"workshop","draft":{sub}}},
+                     {{"kind":"mover","label":"carrier","token":4,"done":5,
+                       "target":0,"stops":[[18,4],[10,4]],"latency":1}}],
+            "wires":[{{"from":["in",0],"to":["node",0,0]}},
+                     {{"from":["node",0,0],"to":["out",0]}},
+                     {{"from":["in",1],"to":["node",1,0]}}],
+            "markings":[],
+            "pos":{{"inputs":[[2,4],[2,14]],"nodes":[[10,4],[10,14]],
+                    "outputs":[[30,4]]}}}}"#
+        );
+        let (_, _, body) = route(&mut app, "POST", "/api/live", &d);
+        assert!(body.contains("\"ok\":true"), "{body}");
+
+        let mut last_total = 0u64;
+        for batch in 0..8u64 {
+            let (_, _, frames) = route(
+                &mut app,
+                "GET",
+                &format!("/api/frames?from={}&n=30", batch * 30),
+                "",
+            );
+            let v = json::parse(&frames).unwrap();
+            for f in v.get("frames").and_then(|x| x.arr()).unwrap() {
+                let total = f.get("outs").and_then(|x| x.arr()).unwrap()[0]
+                    .arr()
+                    .unwrap()[0]
+                    .u64()
+                    .unwrap();
+                assert!(total >= last_total, "gears went missing mid-commute");
+                last_total = total;
+            }
+        }
+        assert!(app.stall.is_none(), "{:?}", app.stall);
+        assert_eq!(
+            app.history.len(),
+            24,
+            "three commutes, eight cells each; seams={:?} pos={:?}",
+            {
+                let mut s: Vec<u64> = app.history.iter().map(|e| e.t0).collect();
+                s.push(app.epoch_t0);
+                s
+            },
+            app.current.draft.node_pos
+        );
+        assert!(
+            last_total >= 100,
+            "the workshop kept its 1/2 rate through three commutes: {last_total}"
+        );
     }
 
     /// G1 (DESIGN-motion.md): a position-only edit is a relocation seam,

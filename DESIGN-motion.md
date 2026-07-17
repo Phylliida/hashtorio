@@ -251,8 +251,29 @@ Relocation rungs (meet the V-ladder at V4):
     gated (deploy-time gating checks the drafted placement; worst-case
     reserve across stop combinations is future polish); the timeline
     remains session-lived.
-- **G3**: gradual motion — cell-by-cell trundling as a chain of small seams,
-  rendered as a smooth slide, Doppler and all.
+- **G3** ✅: gradual motion. A mover firing no longer teleports its target —
+  it schedules a **trundle**: one cell per `latency` ticks (the crane's
+  pace knob; Zeno-guarded ≥1), each step an ordinary one-cell seam,
+  **re-pathed by the router every step** with obstacles dilated by the
+  machine's own bounding box, so it walks its whole body around whatever
+  stands there *today*. Blocked walks stall gracefully and the next firing
+  re-orders. Rendering is time-true: the scene carries a **placements
+  timeline** (per-epoch positions), and the client renders machines where
+  they *stood* at the view tick — belts re-route to match via the G0
+  endpoint guard. Two bugs earned their tests: the wire router's eastbound
+  seed + no-U-turn rule meant a walker could never take its first step
+  west (it spiraled at its own doorstep — `route_free` seeds all four
+  headings), and the walker's Doppler signature moved from footfalls to
+  walk-starts (t = 2, 36, 69). Honest cost: a walk is one epoch per cell.
+- **V2** ✅ *(realized the relocation way)*: mobile factories are **sealed
+  modules carried by cranes** — `demos/rover/`, a commuting workshop that
+  produces through three full commutes with the books balanced
+  (`a_workshop_commutes_while_working`). G1's prehistory theorem carries
+  the interior bit-exactly; G2 schedules; G3 makes the journey physical.
+  The original soul/body token idiom remains the right pattern for one
+  case only: fleets that must move at *belt speed* (tokens fly at c;
+  machines trundle) — kept on the ladder as V2-token, unbuilt until
+  needed.
 
 ## The boundary (unchanged, sharpened)
 
