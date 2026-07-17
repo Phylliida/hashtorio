@@ -334,11 +334,30 @@ as it handles aperiodic flows. The caching-tier motto extends cleanly:
   a few laps; a warp to t=1,000,000 materializes nothing and totals
   exactly ~t/2; the ledger delivers identically every period, forever.
   Player edits clear the cycle (the trajectory changed); it re-detects.
-  Honest scope: *exact-representation* recurrence — factories with sealed
-  modules never match (prehistory grows monotonically; canonicalizing
-  module state = V4.1), and recurrence *modulo translation* awaits
-  movable sources (nothing can currently move an input, so a pure
-  translate of the whole world cannot arise). The crawler-as-glider demo
-  belongs to that future rung.
+  Both original scope notes are now resolved:
+  - **V4.1** ✅: sealed-module worlds close their loops. The prehistory
+    *representation* grows every seam, but the state it reconstructs
+    recurs — so the fingerprint matches modules on a recursive interior
+    snapshot (`StateFp`: queues, in-flight, in-progress, nested), the
+    seam-extract used only for matching, sound by the same argument that
+    makes G1 seams exact. Interiors that refuse to summarize carry a
+    nonce and never match (cycle-less, not wrong). Pinned by
+    `a_sealed_workshop_patrol_becomes_eternal` — and pleasingly, the
+    workshop's loop closes *mid-walk* (lap two's first footfall matches
+    lap one's).
+  - **V4.2** ✅: recurrence *modulo translation* — the glider — needed no
+    movable sources after all. A mover with a **relative gait**
+    (`relative: true`: stops are offsets from where the target stands)
+    targeting *itself*, with its done-pulse looped into its own token
+    port, is its own clock: the engine rides onboard, so nothing anchors
+    it. Fingerprints are anchor-normalized (shape, not place); a match
+    at a shifted anchor closes a loop with a displacement
+    (`Cycle.shift`), and the client renders placements shifted by k·v
+    per folded period. `demos/crab/` + `the_crab_glides_forever`: one
+    node, one wire, one marking; east forever at a cell per four ticks;
+    loop closed by the third stride. (The specification was a gift: a
+    redstone flying machine crab, 2026-07-16.) Mixed worlds — a glider
+    beside anchored machinery — still have no global recurrence, which
+    is correct: their relative geometry genuinely never repeats.
 - **V5** (research): cell-lattice ground, lazy space, HashLife-with-economy;
   placement as slow flow.

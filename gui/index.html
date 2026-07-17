@@ -1435,13 +1435,19 @@ function placementNodesAt(t) {
   const pl = S.scene && S.scene.placements;
   if (!pl || pl.length < 2 || S.view !== 'world' || E.drag || E.path.length) return null;
   if (!(S.appliedSig && alignSig(E.draft) === S.appliedSig)) return null;
-  // V4: fold time into the closed loop, so eternal patrols render at any t.
+  // V4: fold time into the closed loop, so eternal patrols render at any
+  // t — and gliders (V4.2) shift by their displacement per period folded.
   const cy = S.scene.cycle;
-  if (cy && t > cy.t0) t = cy.t0 + ((t - cy.t0 - 1) % cy.period) + 1;
+  let sx = 0, sy = 0;
+  if (cy && t > cy.t0) {
+    const k = Math.floor((t - cy.t0 - 1) / cy.period);
+    t -= k * cy.period;
+    if (cy.shift) { sx = k * cy.shift[0]; sy = k * cy.shift[1]; }
+  }
   let cur = pl[0];
   for (const e of pl) { if (e.t0 < t) cur = e; else break; }
   if (!cy && cur === pl[pl.length - 1]) return null; // the present: no override
-  return cur.nodes.map(g => ({ x: g[0] * GRID, y: g[1] * GRID }));
+  return cur.nodes.map(g => ({ x: (g[0] + sx) * GRID, y: (g[1] + sy) * GRID }));
 }
 function inPlacement(fn) {
   const plc = placementNodesAt(Math.floor(S.t));

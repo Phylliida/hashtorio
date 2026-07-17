@@ -124,8 +124,9 @@ struct App {
     /// A mover materialization note (failed move, epoch cap). Life
     /// continues; the note surfaces in /api/state until the next edit.
     stall: Option<String>,
-    /// V4: fingerprints of every epoch birth since the last player edit.
-    seen: std::collections::HashMap<Fp, u64>,
+    /// V4: fingerprints of every epoch birth since the last player edit,
+    /// with the anchor each was observed at (V4.2).
+    seen: std::collections::HashMap<Fp, (u64, (i32, i32))>,
     /// V4: the detected recurrence, if any. Set ⇒ no more materialization;
     /// all later time folds into the loop. Cleared by any player edit.
     cycle: Option<Cycle>,
@@ -156,7 +157,13 @@ struct Trundle {
 /// match — canonicalizing module state is V4.1's work).
 #[derive(PartialEq, Eq, Hash)]
 struct Fp {
+    /// V4.2: positions are anchor-normalized (min corner subtracted) — a
+    /// glider's fingerprint is its *shape*, not its place. The anchor
+    /// rides alongside in `seen`; a match at a different anchor is a
+    /// cycle with a displacement.
     node_pos: Vec<(i32, i32)>,
+    input_pos: Vec<(i32, i32)>,
+    output_pos: Vec<(i32, i32)>,
     net: NetId,
     flows: Vec<Counting>,
     cursors: Vec<usize>,
@@ -264,6 +271,10 @@ struct Cycle {
     t_start: u64,
     period: u64,
     per_period: Vec<u64>,
+    /// V4.2: the world's displacement per period — (0,0) for patrols,
+    /// nonzero for gliders. Counting maps are translation-invariant, so
+    /// only *rendering* needs it: the client shifts placements by k·v.
+    shift: (i32, i32),
 }
 
 // Append-only: chassis intern in this order, so ids stay save-stable.
@@ -665,12 +676,29 @@ impl App {
     /// an ordinary G1 seam there. Deterministic and request-order
     /// independent: the seam decisions depend only on per-epoch firing
     /// maps, never on how far each call happens to look.
-    /// V4: the world's full frontier state, canonically ordered.
-    fn fingerprint(&mut self) -> Fp {
+    /// V4: the world's full frontier state, canonically ordered and
+    /// anchor-normalized (V4.2). Returns the anchor alongside.
+    fn fingerprint(&mut self) -> (Fp, (i32, i32)) {
+        let d = &self.current.draft;
+        let all = || d.node_pos.iter().chain(&d.input_pos).chain(&d.output_pos);
+        let anchor = (
+            all().map(|p| p.0).min().unwrap_or(0),
+            all().map(|p| p.1).min().unwrap_or(0),
+        );
+        let norm = |v: &[(i32, i32)]| -> Vec<(i32, i32)> {
+            v.iter().map(|p| (p.0 - anchor.0, p.1 - anchor.1)).collect()
+        };
         let mut trundles: Vec<(usize, (i32, i32), u64, u64)> = self
             .trundles
             .iter()
-            .map(|tr| (tr.node, tr.dest, tr.per_cell, tr.next_t - self.epoch_t0))
+            .map(|tr| {
+                (
+                    tr.node,
+                    (tr.dest.0 - anchor.0, tr.dest.1 - anchor.1),
+                    tr.per_cell,
+                    tr.next_t - self.epoch_t0,
+                )
+            })
             .collect();
         trundles.sort();
         // V4.1: modules match by interior state, not by the (growing)
@@ -695,14 +723,20 @@ impl App {
             let nonce = if st.is_none() { self.epoch_t0.max(1) } else { 0 };
             modules.push((n, st, nonce));
         }
-        Fp {
-            node_pos: self.current.draft.node_pos.clone(),
-            net: self.current.id,
-            flows: self.current.input_flows.clone(),
-            cursors: self.mover_cursors.clone(),
-            trundles,
-            modules,
-        }
+        let d = &self.current.draft;
+        (
+            Fp {
+                node_pos: norm(&d.node_pos),
+                input_pos: norm(&d.input_pos),
+                output_pos: norm(&d.output_pos),
+                net: self.current.id,
+                flows: self.current.input_flows.clone(),
+                cursors: self.mover_cursors.clone(),
+                trundles,
+                modules,
+            },
+            anchor,
+        )
     }
 
     /// V4: forget recurrence bookkeeping (any player edit perturbs the
@@ -710,8 +744,9 @@ impl App {
     fn reset_recurrence(&mut self) {
         self.seen.clear();
         self.cycle = None;
-        let fp = self.fingerprint();
-        self.seen.insert(fp, self.epoch_t0);
+        let (fp, anchor) = self.fingerprint();
+        let t0 = self.epoch_t0;
+        self.seen.insert(fp, (t0, anchor));
     }
 
     fn unroll_to(&mut self, t_target: u64) {
@@ -754,12 +789,13 @@ impl App {
             if fire_t == Some(next) {
                 let tau = next - self.epoch_t0;
                 for n in 0..self.current.draft.nodes.len() {
-                    let DraftNode::Mover { target, stops, latency, .. } =
+                    let DraftNode::Mover { target, stops, relative, latency, .. } =
                         &self.current.draft.nodes[n]
                     else {
                         continue;
                     };
-                    let (target, stops, latency) = (*target, stops.clone(), *latency);
+                    let (target, stops, relative, latency) =
+                        (*target, stops.clone(), *relative, *latency);
                     let Some(k) = self.current.firings[n].as_ref() else { continue };
                     let fired = k.eval(tau);
                     let delta = fired.saturating_sub(self.mover_consumed[n]);
@@ -768,7 +804,17 @@ impl App {
                     }
                     self.mover_consumed[n] = fired;
                     let cur = self.mover_cursors[n];
-                    let dest = stops[(cur + delta as usize - 1) % stops.len()];
+                    let dest = if relative {
+                        // A gait: offsets compound from where it stands.
+                        let mut p = self.current.draft.node_pos[target];
+                        for j in 0..delta as usize {
+                            let off = stops[(cur + j) % stops.len()];
+                            p = (p.0 + off.0, p.1 + off.1);
+                        }
+                        p
+                    } else {
+                        stops[(cur + delta as usize - 1) % stops.len()]
+                    };
                     self.mover_cursors[n] = (cur + delta as usize) % stops.len();
                     // A fresh order replaces any walk in progress.
                     self.trundles.retain(|tr| tr.node != target);
@@ -860,10 +906,11 @@ impl App {
                             tr.next_t = next + tr.per_cell;
                         }
                     }
-                    // V4: has this exact world-state been here before? Then
-                    // everything between repeats forever — close the loop.
-                    let fp = self.fingerprint();
-                    if let Some(&t_start) = self.seen.get(&fp) {
+                    // V4: has this world-state been here before — anywhere?
+                    // (V4.2: fingerprints are shape, anchors are place; a
+                    // match elsewhere is a glide.) Close the loop.
+                    let (fp, anchor) = self.fingerprint();
+                    if let Some(&(t_start, anchor_then)) = self.seen.get(&fp) {
                         let base_start = self
                             .history
                             .iter()
@@ -880,11 +927,16 @@ impl App {
                             t_start,
                             period: self.epoch_t0 - t_start,
                             per_period,
+                            shift: (
+                                anchor.0 - anchor_then.0,
+                                anchor.1 - anchor_then.1,
+                            ),
                         });
                         self.gen += 1; // clients refetch: the scene gains its cycle
                         break;
                     }
-                    self.seen.insert(fp, self.epoch_t0);
+                    let t0 = self.epoch_t0;
+                    self.seen.insert(fp, (t0, anchor));
                 }
                 Err(e) => {
                     // The step is unachievable: those walks end here.
@@ -1513,12 +1565,12 @@ fn node_json(
             BuildOp::Split => format!("\"kind\":\"split\",\"latency\":{latency}"),
             BuildOp::Belt => format!("\"kind\":\"belt\",\"latency\":{latency}"),
         },
-        DraftNode::Mover { token, done, target, stops, latency, .. } => {
+        DraftNode::Mover { token, done, target, stops, relative, latency, .. } => {
             let st: Vec<String> =
                 stops.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
             format!(
                 "\"kind\":\"mover\",\"token\":{},\"done\":{},\"target\":{target},\
-                 \"stops\":[{}],\"latency\":{latency}",
+                 \"stops\":[{}],\"relative\":{relative},\"latency\":{latency}",
                 token.0,
                 done.0,
                 st.join(",")
@@ -1612,8 +1664,8 @@ fn scene_json(app: &App) -> String {
     // it exactly as the server does.
     let cycle = match &app.cycle {
         Some(cy) => format!(
-            ",\"cycle\":{{\"t0\":{},\"period\":{}}}",
-            cy.t_start, cy.period
+            ",\"cycle\":{{\"t0\":{},\"period\":{},\"shift\":[{},{}]}}",
+            cy.t_start, cy.period, cy.shift.0, cy.shift.1
         ),
         None => String::new(),
     };
@@ -2133,6 +2185,7 @@ fn parse_draft_value(v: &Json, structs: &StructLib, depth: usize) -> Result<Draf
                         Some((a.first()?.i64()? as i32, a.get(1)?.i64()? as i32))
                     })
                     .collect(),
+                relative: matches!(node.get("relative"), Some(Json::Bool(true))),
                 latency: node.get("latency").and_then(|x| x.u64()).unwrap_or(1),
             }),
             _ => return Err(format!("node {n}: unknown kind")),
@@ -2769,6 +2822,54 @@ mod tests {
         // The scene tells the client how to fold time too.
         let (_, _, scene) = route(&mut app, "GET", "/api/scene", "");
         assert!(scene.contains("\"cycle\""), "the closed loop is served");
+    }
+
+    /// V4.2: THE CRAB. A mover whose done-pulse feeds its own token port
+    /// is its own clock; a relative gait makes its walk unbounded; it
+    /// needs no inputs, no outputs, no anchor to the world at all — the
+    /// engine rides onboard. The fingerprint, quotiented by translation,
+    /// closes the loop with a nonzero displacement: recurrence modulo
+    /// translation. The glider. One node, one wire, one marking.
+    #[test]
+    fn the_crab_glides_forever() {
+        let mut app = test_app();
+        let d = r#"{"inputs":[],"outputs":[],
+            "nodes":[{"kind":"mover","label":"crab","token":4,"done":4,
+                      "target":0,"stops":[[1,0]],"relative":true,"latency":2}],
+            "wires":[{"from":["node",0,0],"to":["node",0,0]}],
+            "markings":[{"to":["node",0,0],"n":1}],
+            "pos":{"inputs":[],"nodes":[[8,4]],"outputs":[]}}"#;
+        let (_, _, body) = route(&mut app, "POST", "/api/live", d);
+        assert!(body.contains("\"ok\":true"), "{body}");
+
+        route(&mut app, "GET", "/api/frames?from=0&n=100", "");
+        let Some(cy) = app.cycle.as_ref() else {
+            panic!(
+                "no glide found in {} epochs (t0s={:?}, pos={:?}, stall={:?})",
+                app.history.len(),
+                app.history.iter().map(|e| e.t0).collect::<Vec<_>>(),
+                app.current.draft.node_pos,
+                app.stall
+            );
+        };
+        let (period, shift) = (cy.period, cy.shift);
+        assert!(
+            shift.0 > 0 && shift.1 == 0,
+            "it glides east: {shift:?} per {period}t"
+        );
+        assert!(period <= 8, "a brisk little gait: {period}t per stride");
+
+        // Five million ticks of skittering cost nothing at all.
+        let epochs = app.history.len();
+        let (_, _, f) = route(&mut app, "GET", "/api/frames?from=5000000&n=4", "");
+        assert!(json::parse(&f).is_ok(), "{f}");
+        assert_eq!(app.history.len(), epochs, "the glide is already known");
+        assert!(app.stall.is_none(), "{:?}", app.stall);
+
+        // The displacement is served so the client can render the crab
+        // wherever in eternity you scrub to.
+        let (_, _, scene) = route(&mut app, "GET", "/api/scene", "");
+        assert!(scene.contains("\"shift\""), "the glide vector is served");
     }
 
     /// V4.1: sealed-module worlds close their loops too. The prehistory
