@@ -1043,6 +1043,12 @@ function draftDelete(kind, idx) {
   d.markings = d.markings
     .filter(m => !touches(m.to))
     .map(m => ({ to: remapEp(m.to, kind, idx), n: m.n }));
+  if (kind === 'node' && d.moves) {
+    d.moves = d.moves
+      .filter(r => r.driver !== idx && r.target !== idx)
+      .map(r => ({ ...r, driver: r.driver > idx ? r.driver - 1 : r.driver,
+                   target: r.target > idx ? r.target - 1 : r.target }));
+  }
   if (kind === 'node') { d.nodes.splice(idx, 1); E.pos.nodes.splice(idx, 1); }
   if (kind === 'input') { d.inputs.splice(idx, 1); E.pos.inputs.splice(idx, 1); }
   if (kind === 'output') { d.outputs.splice(idx, 1); E.pos.outputs.splice(idx, 1); }
@@ -1100,6 +1106,7 @@ function convertSub(d) {
     nodes: d.nodes.map(convertNode),
     wires: d.wires.map(w => ({ from:w.from.slice(), to:w.to.slice() })),
     markings: d.markings.map(m => ({ to:m.to.slice(), n:m.n })),
+    moves: (d.moves || []).map(r => ({ ...r, stops: r.stops.map(s => s.slice()) })),
     pos: d.pos ? JSON.parse(JSON.stringify(d.pos)) : undefined,
   };
 }
@@ -1111,6 +1118,7 @@ function sceneToDraft() {
     nodes: sc.nodes.map(convertNode),
     wires: sc.edges.map(e => ({ from:e.from.slice(), to:e.to.slice() })),
     markings: [],
+    moves: (sc.moves || []).map(r => ({ ...r, stops: r.stops.map(s => s.slice()) })),
   };
   sc.nodes.forEach((n, i) => n.markings.forEach((m, l) => {
     if (m > 0) E.draft.markings.push({ to:['node', i, l], n:m });
@@ -1777,15 +1785,31 @@ function drawEditInner() {
     if (node.kind === 'recipe') drawRecipeStrip(node, p.x + 9, p.y + p.h - 12);
   });
 
-  // Crane choreography: for a selected/hovered mover, the dashed route its
-  // target will dance — numbered ghost posts, one advance per token.
-  d.nodes.forEach((node, n) => {
-    if (node.kind !== 'mover') return;
-    const shown = E.sel.has(n)
-      || (hovE && hovE.kind === 'node' && hovE.idx === n);
-    if (!shown || !d.nodes[node.target]) return;
-    const tp = E.pos.nodes[node.target];
-    const tSize = nodeSize(d.nodes[node.target]);
+  // Choreography: motion is an annotation (a move rule), and any machine
+  // can drive one. When a rule's driver is selected/hovered, draw the
+  // dashed route its target will dance — numbered ghost posts (absolute)
+  // or an arrow-chain of offsets (relative gait).
+  const choreography = [];
+  (d.moves || []).forEach(r => choreography.push({ drv: r.driver, r }));
+  d.nodes.forEach((node, n) => { // client-side sugar cranes, pre-desugar
+    if (node.kind === 'mover')
+      choreography.push({ drv: n, r: { target: node.target, stops: node.stops,
+        relative: !!node.relative, pace: node.latency } });
+  });
+  choreography.forEach(({ drv, r }) => {
+    const shown = E.sel.has(drv)
+      || (hovE && hovE.kind === 'node' && hovE.idx === drv);
+    if (!shown || !d.nodes[r.target]) return;
+    const tp = E.pos.nodes[r.target];
+    const tSize = nodeSize(d.nodes[r.target]);
+    // Relative gaits chain offsets from where the target stands.
+    let walk = [];
+    if (r.relative) {
+      let g = toGrid(tp);
+      r.stops.forEach(off => { g = [g[0] + off[0], g[1] + off[1]]; walk.push(g); });
+    } else {
+      walk = r.stops;
+    }
     const at = g => ({ x: g[0] * GRID + tSize.w / 2, y: g[1] * GRID + tSize.h / 2 });
     ctx.save();
     ctx.setLineDash([5, 5]);
@@ -1793,9 +1817,9 @@ function drawEditInner() {
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(tp.x + tSize.w / 2, tp.y + tSize.h / 2);
-    node.stops.forEach(g => { const q = at(g); ctx.lineTo(q.x, q.y); });
+    walk.forEach(g => { const q = at(g); ctx.lineTo(q.x, q.y); });
     ctx.stroke();
-    node.stops.forEach((g, si) => {
+    walk.forEach((g, si) => {
       ctx.strokeStyle = '#f4b942';
       ctx.strokeRect(g[0] * GRID + 1, g[1] * GRID + 1, tSize.w - 2, tSize.h - 2);
       ctx.fillStyle = '#f4b942';

@@ -56,25 +56,27 @@ pub enum DraftNode {
         op: BuildOp,
         latency: u64,
     },
-    /// A machine that moves a machine (G2, DESIGN-motion.md). To the
-    /// kernel this is an ordinary recipe `1·token → 1·done @ latency`; the
-    /// world layer reads its firing map and relocates `target` one stop
-    /// per firing (cyclic cursor). The reflection is fenced: destinations
-    /// are static draft data — only the *timing* is token-driven. A mover
-    /// may target any node, itself included (the walking machine).
-    Mover {
-        label: String,
-        token: ItemType,
-        done: ItemType,
-        target: usize,
-        stops: Vec<(i32, i32)>,
-        /// V4.2: a relative gait — stops are *offsets* applied to the
-        /// target's current position at each firing, so the walk is
-        /// unbounded. A mover with a relative gait, targeting itself, with
-        /// its done-pulse looped into its own token port, is a glider.
-        relative: bool,
-        latency: u64,
-    },
+}
+
+/// Motion is an *annotation*, not a machine (the final minimality
+/// collapse of the motion arc): any node's firings can drive a move.
+/// The kernel never hears about it — the world layer reads the driver's
+/// firing map and walks the target, one stop per firing. A machine may
+/// drive its own walk (the press that trundles as it works); a machine
+/// whose output loops into its own input is its own clock (the crab).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoveRule {
+    /// Whose firings command the moves (any node with a firing map).
+    pub driver: usize,
+    /// Which node gets moved (any node, the driver itself included).
+    pub target: usize,
+    /// The stop list, cycled one per firing.
+    pub stops: Vec<(i32, i32)>,
+    /// Relative gait: stops are *offsets* from where the target stands,
+    /// so the walk is unbounded — the glider's mode.
+    pub relative: bool,
+    /// Trundle pace, ticks per cell (Zeno-guarded ≥ 1).
+    pub pace: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +117,6 @@ pub fn kind_str(node: &DraftNode) -> &'static str {
         DraftNode::Builder { op: BuildOp::Rot, .. } => "rot",
         DraftNode::Builder { op: BuildOp::Split, .. } => "split",
         DraftNode::Builder { op: BuildOp::Belt, .. } => "belt",
-        DraftNode::Mover { .. } => "mover",
     }
 }
 
@@ -134,8 +135,7 @@ impl DraftNode {
             DraftNode::Recipe { label, .. }
             | DraftNode::Priority { label, .. }
             | DraftNode::Module { label, .. }
-            | DraftNode::Builder { label, .. }
-            | DraftNode::Mover { label, .. } => label,
+            | DraftNode::Builder { label, .. } => label,
         }
     }
 
@@ -146,7 +146,6 @@ impl DraftNode {
             DraftNode::Priority { item, token, .. } => vec![*item, *token],
             DraftNode::Module { draft, .. } => draft.inputs.iter().map(|i| i.ty).collect(),
             DraftNode::Builder { op, .. } => vec![ANY; op.in_arity()],
-            DraftNode::Mover { token, .. } => vec![*token],
         }
     }
 
@@ -157,7 +156,6 @@ impl DraftNode {
             DraftNode::Priority { item, .. } => vec![*item, *item],
             DraftNode::Module { draft, .. } => draft.outputs.iter().map(|o| o.ty).collect(),
             DraftNode::Builder { op, .. } => vec![ANY; op.out_arity()],
-            DraftNode::Mover { done, .. } => vec![*done],
         }
     }
 }
@@ -186,6 +184,8 @@ pub struct Draft {
     pub nodes: Vec<DraftNode>,
     pub wires: Vec<(DraftFrom, DraftTo)>,
     pub markings: Vec<(DraftTo, u64)>,
+    /// Motion annotations: firings of `driver` walk `target` (G2/G3/V4.2).
+    pub moves: Vec<MoveRule>,
     /// Factory-space: grid positions, parallel to the lists above. Empty
     /// means "abstract mode" (no geometry: wires instant, no footprints).
     /// When present, geometry is *semantic*: wire latency = distance /
@@ -229,18 +229,27 @@ impl Draft {
                     ));
                 }
             }
-            if let DraftNode::Mover { label, target, stops, .. } = node {
-                if *target >= self.nodes.len() {
-                    return Err(format!(
-                        "mover '{label}' targets a machine that no longer exists"
-                    ));
-                }
-                if stops.is_empty() {
-                    return Err(format!(
-                        "mover '{label}' has no stops — give it somewhere to move '{}'",
-                        self.nodes[*target].label()
-                    ));
-                }
+        }
+        for (r, rule) in self.moves.iter().enumerate() {
+            if rule.driver >= self.nodes.len() || rule.target >= self.nodes.len() {
+                return Err(format!(
+                    "move rule {} points at a machine that no longer exists",
+                    r + 1
+                ));
+            }
+            if matches!(self.nodes[rule.driver], DraftNode::Module { .. }) {
+                return Err(format!(
+                    "move rule {}: a sealed module can't drive moves — its \
+                     firings are interior; drive from a machine instead",
+                    r + 1
+                ));
+            }
+            if rule.stops.is_empty() {
+                return Err(format!(
+                    "move rule {} has no stops — give it somewhere to move '{}'",
+                    r + 1,
+                    self.nodes[rule.target].label()
+                ));
             }
         }
         let from_ok = |f: &DraftFrom| match *f {
@@ -396,18 +405,19 @@ impl Draft {
             let p = self.output_pos[o];
             claim(vec![p, (p.0, p.1 + 1)], &out.label)?;
         }
-        // Mover destinations must fit among the *drafted* placements.
-        // (Interactions with other movers' evolved placements are checked
-        // at materialization instead and stall gracefully — see G2.)
-        for m in 0..self.nodes.len() {
-            let DraftNode::Mover { label, target, stops, relative, .. } = &self.nodes[m]
-            else {
-                continue;
-            };
-            if *relative {
+        // Move destinations must fit among the *drafted* placements.
+        // (Interactions with evolved placements are checked at
+        // materialization instead and stall gracefully — see G2.)
+        for m in 0..self.moves.len() {
+            let rule = &self.moves[m];
+            if rule.relative {
                 continue; // offsets can't be pre-validated; walks stall live
             }
-            let (label, target, stops) = (label.clone(), *target, stops.clone());
+            let (label, target, stops) = (
+                format!("move rule {}", m + 1),
+                rule.target,
+                rule.stops.clone(),
+            );
             let mut occ = std::collections::HashSet::new();
             for (i, _) in self.inputs.iter().enumerate() {
                 occ.insert(self.input_pos[i]);
@@ -433,7 +443,7 @@ impl Draft {
             for (si, stop) in stops.iter().enumerate() {
                 if tcells.iter().any(|(x, y)| occ.contains(&(stop.0 + x, stop.1 + y))) {
                     return Err(format!(
-                        "mover '{label}': stop {} at ({}, {}) would land '{}' on \
+                        "{label}: stop {} at ({}, {}) would land '{}' on \
                          another machine",
                         si + 1,
                         stop.0,
@@ -658,11 +668,6 @@ impl Draft {
                         BuildOp::Split => Recipe::new(vec![2], vec![1, 1], *latency),
                     };
                     b.recipe(recipe, in_tys, out_tys)
-                }
-                // To the kernel a mover is a plain recipe: token in, done
-                // pulse out. The world layer reads its firing map (G2).
-                DraftNode::Mover { token, done, latency, .. } => {
-                    b.recipe(Recipe::new(vec![1], vec![1], *latency), &[*token], &[*done])
                 }
             });
         }

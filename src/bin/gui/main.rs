@@ -20,7 +20,8 @@ use std::net::{TcpListener, TcpStream};
 use hashtorio::counting::Counting;
 use hashtorio::demo;
 use hashtorio::draft::{
-    BuildOp, Draft, DraftFrom, DraftInput, DraftNode, DraftOutput, DraftTo, SeamPlan, BELT_SPEED,
+    BuildOp, Draft, DraftFrom, DraftInput, DraftNode, DraftOutput, DraftTo, MoveRule, SeamPlan,
+    BELT_SPEED,
 };
 use hashtorio::eval::{EvalError, Evaluator};
 use hashtorio::net::{ItemType, Library, NetId};
@@ -233,8 +234,7 @@ fn interior_state_fp(
     for (n, node) in c.draft.nodes.iter().enumerate() {
         let lat = match node {
             DraftNode::Recipe { latency, .. }
-            | DraftNode::Builder { latency, .. }
-            | DraftNode::Mover { latency, .. } => *latency,
+            | DraftNode::Builder { latency, .. } => *latency,
             _ => 0,
         };
         let mut v = Vec::new();
@@ -353,8 +353,8 @@ impl App {
             seen: std::collections::HashMap::new(),
             cycle: None,
         };
-        app.mover_cursors = vec![0; app.current.draft.nodes.len()];
-        app.mover_consumed = vec![0; app.current.draft.nodes.len()];
+        app.mover_cursors = vec![0; app.current.draft.moves.len()];
+        app.mover_consumed = vec![0; app.current.draft.moves.len()];
         app.reset_recurrence();
         // The pre-deployed demo consumed its preloads like any compile.
         let demo_draft = app.current.draft.clone();
@@ -411,7 +411,7 @@ impl App {
             inventory.insert(ty, n);
         }
         let outs = current.draft.outputs.len();
-        let nodes = current.draft.nodes.len();
+        let moves = current.draft.moves.len();
         let mut app = App {
             lib,
             structs,
@@ -430,8 +430,8 @@ impl App {
             history: Vec::new(),
             epoch_t0: 0,
             out_base: vec![0; outs],
-            mover_cursors: vec![0; nodes],
-            mover_consumed: vec![0; nodes],
+            mover_cursors: vec![0; moves],
+            mover_consumed: vec![0; moves],
             trundles: Vec::new(),
             gen: 0,
             stall: None,
@@ -610,8 +610,8 @@ impl App {
         self.history.clear();
         self.epoch_t0 = 0;
         self.out_base = vec![0; self.current.draft.outputs.len()];
-        self.mover_cursors = vec![0; self.current.draft.nodes.len()];
-        self.mover_consumed = vec![0; self.current.draft.nodes.len()];
+        self.mover_cursors = vec![0; self.current.draft.moves.len()];
+        self.mover_consumed = vec![0; self.current.draft.moves.len()];
         self.trundles.clear();
         self.gen += 1;
         self.stall = None;
@@ -653,7 +653,7 @@ impl App {
         // Mover cursors survive a player move; the epoch's firing ledger
         // restarts with the epoch. Walks in progress continue (re-pathed
         // per step), their next steps clamped past the new seam.
-        self.mover_consumed = vec![0; self.current.draft.nodes.len()];
+        self.mover_consumed = vec![0; self.current.draft.moves.len()];
         for tr in &mut self.trundles {
             tr.next_t = tr.next_t.max(self.epoch_t0 + 1);
         }
@@ -760,15 +760,12 @@ impl App {
                 break;
             }
             let horizon = t_target - self.epoch_t0;
-            // Earliest untranslated mover firing (global time). (k(τ) >
+            // Earliest untranslated driver firing (global time). (k(τ) >
             // consumed from τ=1: a boundary-instant firing lands next tick.)
             let mut fire_t: Option<u64> = None;
-            for (n, node) in self.current.draft.nodes.iter().enumerate() {
-                if !matches!(node, DraftNode::Mover { .. }) {
-                    continue;
-                }
-                let Some(k) = self.current.firings[n].as_ref() else { continue };
-                let seen = self.mover_consumed[n];
+            for (r, rule) in self.current.draft.moves.iter().enumerate() {
+                let Some(k) = self.current.firings[rule.driver].as_ref() else { continue };
+                let seen = self.mover_consumed[r];
                 if let Some(tf) = (1..=horizon).find(|&tau| k.eval(tau) > seen) {
                     let g = self.epoch_t0 + tf;
                     fire_t = Some(fire_t.map_or(g, |b: u64| b.min(g)));
@@ -788,40 +785,36 @@ impl App {
             // Firings first at equal times: they only schedule walks.
             if fire_t == Some(next) {
                 let tau = next - self.epoch_t0;
-                for n in 0..self.current.draft.nodes.len() {
-                    let DraftNode::Mover { target, stops, relative, latency, .. } =
-                        &self.current.draft.nodes[n]
-                    else {
+                for r in 0..self.current.draft.moves.len() {
+                    let rule = self.current.draft.moves[r].clone();
+                    let Some(k) = self.current.firings[rule.driver].as_ref() else {
                         continue;
                     };
-                    let (target, stops, relative, latency) =
-                        (*target, stops.clone(), *relative, *latency);
-                    let Some(k) = self.current.firings[n].as_ref() else { continue };
                     let fired = k.eval(tau);
-                    let delta = fired.saturating_sub(self.mover_consumed[n]);
+                    let delta = fired.saturating_sub(self.mover_consumed[r]);
                     if delta == 0 {
                         continue;
                     }
-                    self.mover_consumed[n] = fired;
-                    let cur = self.mover_cursors[n];
-                    let dest = if relative {
+                    self.mover_consumed[r] = fired;
+                    let cur = self.mover_cursors[r];
+                    let dest = if rule.relative {
                         // A gait: offsets compound from where it stands.
-                        let mut p = self.current.draft.node_pos[target];
+                        let mut p = self.current.draft.node_pos[rule.target];
                         for j in 0..delta as usize {
-                            let off = stops[(cur + j) % stops.len()];
+                            let off = rule.stops[(cur + j) % rule.stops.len()];
                             p = (p.0 + off.0, p.1 + off.1);
                         }
                         p
                     } else {
-                        stops[(cur + delta as usize - 1) % stops.len()]
+                        rule.stops[(cur + delta as usize - 1) % rule.stops.len()]
                     };
-                    self.mover_cursors[n] = (cur + delta as usize) % stops.len();
+                    self.mover_cursors[r] = (cur + delta as usize) % rule.stops.len();
                     // A fresh order replaces any walk in progress.
-                    self.trundles.retain(|tr| tr.node != target);
-                    if self.current.draft.node_pos[target] != dest {
-                        let per_cell = latency.max(1); // Zeno guard
+                    self.trundles.retain(|tr| tr.node != rule.target);
+                    if self.current.draft.node_pos[rule.target] != dest {
+                        let per_cell = rule.pace.max(1); // Zeno guard
                         self.trundles.push(Trundle {
-                            node: target,
+                            node: rule.target,
                             dest,
                             per_cell,
                             next_t: next + per_cell,
@@ -890,7 +883,7 @@ impl App {
                         compiled: old,
                     });
                     self.epoch_t0 = next;
-                    self.mover_consumed = vec![0; self.current.draft.nodes.len()];
+                    self.mover_consumed = vec![0; self.current.draft.moves.len()];
                     self.subview = None;
                     self.gen += 1;
                     materialized = true;
@@ -1265,10 +1258,6 @@ fn compile_with_flows(
                 let per = if matches!(op, BuildOp::Split) { 2 } else { 1 };
                 (0..legs).map(|_| Some(k.scale_floor(per, 1))).collect()
             }
-            DraftNode::Mover { .. } => {
-                let k = detail.firings[n].as_ref().expect("movers compile to recipes");
-                vec![Some(k.scale_floor(1, 1))]
-            }
         };
         supplies.push(sup);
         consumed.push(cons);
@@ -1516,7 +1505,6 @@ fn kind_of(node: &DraftNode) -> &'static str {
         DraftNode::Builder { op: BuildOp::Rot, .. } => "rot",
         DraftNode::Builder { op: BuildOp::Split, .. } => "split",
         DraftNode::Builder { op: BuildOp::Belt, .. } => "belt",
-        DraftNode::Mover { .. } => "mover",
     }
 }
 
@@ -1565,17 +1553,6 @@ fn node_json(
             BuildOp::Split => format!("\"kind\":\"split\",\"latency\":{latency}"),
             BuildOp::Belt => format!("\"kind\":\"belt\",\"latency\":{latency}"),
         },
-        DraftNode::Mover { token, done, target, stops, relative, latency, .. } => {
-            let st: Vec<String> =
-                stops.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
-            format!(
-                "\"kind\":\"mover\",\"token\":{},\"done\":{},\"target\":{target},\
-                 \"stops\":[{}],\"relative\":{relative},\"latency\":{latency}",
-                token.0,
-                done.0,
-                st.join(",")
-            )
-        }
     };
     format!(
         "{{{core},\"label\":\"{}\",\"legs\":[{}],\"outs\":[{}],\"markings\":[{}]}}",
@@ -1631,21 +1608,35 @@ fn draft_json(d: &Draft) -> String {
         .iter()
         .map(|(t, m)| format!("{{\"to\":{},\"n\":{m}}}", to_json(t)))
         .collect();
+    let moves: Vec<String> = d.moves.iter().map(move_rule_json).collect();
     let pos_list = |ps: &[(i32, i32)]| -> String {
         let items: Vec<String> = ps.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
         format!("[{}]", items.join(","))
     };
     format!(
         "{{\"inputs\":[{}],\"outputs\":[{}],\"nodes\":[{}],\"wires\":[{}],\"markings\":[{}],\
-         \"pos\":{{\"inputs\":{},\"nodes\":{},\"outputs\":{}}}}}",
+         \"moves\":[{}],\"pos\":{{\"inputs\":{},\"nodes\":{},\"outputs\":{}}}}}",
         inputs.join(","),
         outputs.join(","),
         nodes.join(","),
         wires.join(","),
         markings.join(","),
+        moves.join(","),
         pos_list(&d.input_pos),
         pos_list(&d.node_pos),
         pos_list(&d.output_pos)
+    )
+}
+
+fn move_rule_json(r: &MoveRule) -> String {
+    let stops: Vec<String> = r.stops.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
+    format!(
+        "{{\"driver\":{},\"target\":{},\"stops\":[{}],\"relative\":{},\"pace\":{}}}",
+        r.driver,
+        r.target,
+        stops.join(","),
+        r.relative,
+        r.pace
     )
 }
 
@@ -1660,6 +1651,8 @@ fn scene_json(app: &App) -> String {
         .map(|e| placement_json(e.t0, &e.compiled.draft.node_pos))
         .collect();
     placements.push(placement_json(app.epoch_t0, &app.current.draft.node_pos));
+    let moves: Vec<String> = app.current.draft.moves.iter().map(move_rule_json).collect();
+    let moves = format!(",\"moves\":[{}]", moves.join(","));
     // V4: when the loop is closed, the client folds late view times into
     // it exactly as the server does.
     let cycle = match &app.cycle {
@@ -1670,7 +1663,7 @@ fn scene_json(app: &App) -> String {
         None => String::new(),
     };
     format!(
-        "{},\"placements\":[{}]{cycle}}}",
+        "{},\"placements\":[{}]{moves}{cycle}}}",
         &scene[..scene.len() - 1],
         placements.join(",")
     )
@@ -2161,33 +2154,44 @@ fn parse_draft_value(v: &Json, structs: &StructLib, depth: usize) -> Result<Draf
                 };
                 d.nodes.push(DraftNode::Builder { label, op, latency });
             }
-            Some("mover") => d.nodes.push(DraftNode::Mover {
-                label,
-                token: ItemType(
+            Some("mover") => {
+                // Sugar (M9 precedent): a "mover" is a recipe whose
+                // firings drive a move rule. token -> done @latency.
+                let token = ItemType(
                     node.get("token").and_then(|x| x.u64()).ok_or("mover missing token type")?
                         as u32,
-                ),
-                done: ItemType(
+                );
+                let done = ItemType(
                     node.get("done").and_then(|x| x.u64()).ok_or("mover missing done type")?
                         as u32,
-                ),
-                target: node
-                    .get("target")
-                    .and_then(|x| x.u64())
-                    .ok_or("mover missing target")? as usize,
-                stops: node
-                    .get("stops")
-                    .and_then(|x| x.arr())
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|p| {
-                        let a = p.arr()?;
-                        Some((a.first()?.i64()? as i32, a.get(1)?.i64()? as i32))
-                    })
-                    .collect(),
-                relative: matches!(node.get("relative"), Some(Json::Bool(true))),
-                latency: node.get("latency").and_then(|x| x.u64()).unwrap_or(1),
-            }),
+                );
+                let latency = node.get("latency").and_then(|x| x.u64()).unwrap_or(1);
+                d.moves.push(MoveRule {
+                    driver: d.nodes.len(),
+                    target: node
+                        .get("target")
+                        .and_then(|x| x.u64())
+                        .ok_or("mover missing target")? as usize,
+                    stops: node
+                        .get("stops")
+                        .and_then(|x| x.arr())
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter_map(|p| {
+                            let a = p.arr()?;
+                            Some((a.first()?.i64()? as i32, a.get(1)?.i64()? as i32))
+                        })
+                        .collect(),
+                    relative: matches!(node.get("relative"), Some(Json::Bool(true))),
+                    pace: latency,
+                });
+                d.nodes.push(DraftNode::Recipe {
+                    label,
+                    consume: vec![(token, 1)],
+                    produce: vec![(done, 1)],
+                    latency,
+                });
+            }
             _ => return Err(format!("node {n}: unknown kind")),
         }
     }
@@ -2201,6 +2205,26 @@ fn parse_draft_value(v: &Json, structs: &StructLib, depth: usize) -> Result<Draf
         let to = parse_endpoint_to(m.get("to").ok_or("marking missing port")?)?;
         let n = m.get("n").and_then(|x| x.u64()).ok_or("marking missing count")?;
         d.markings.push((to, n));
+    }
+    for mv in v.get("moves").and_then(|x| x.arr()).unwrap_or(&[]) {
+        d.moves.push(MoveRule {
+            driver: mv.get("driver").and_then(|x| x.u64()).ok_or("move missing driver")?
+                as usize,
+            target: mv.get("target").and_then(|x| x.u64()).ok_or("move missing target")?
+                as usize,
+            stops: mv
+                .get("stops")
+                .and_then(|x| x.arr())
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|p| {
+                    let a = p.arr()?;
+                    Some((a.first()?.i64()? as i32, a.get(1)?.i64()? as i32))
+                })
+                .collect(),
+            relative: matches!(mv.get("relative"), Some(Json::Bool(true))),
+            pace: mv.get("pace").and_then(|x| x.u64()).unwrap_or(1),
+        });
     }
     if let Some(pos) = v.get("pos") {
         let read = |key: &str| -> Vec<(i32, i32)> {
@@ -2299,8 +2323,8 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
                     app.history.clear(); // cold retool: one fresh epoch
                     app.epoch_t0 = 0;
                     app.out_base = vec![0; app.current.draft.outputs.len()];
-                    app.mover_cursors = vec![0; app.current.draft.nodes.len()];
-                    app.mover_consumed = vec![0; app.current.draft.nodes.len()];
+                    app.mover_cursors = vec![0; app.current.draft.moves.len()];
+                    app.mover_consumed = vec![0; app.current.draft.moves.len()];
                     app.trundles.clear();
                     app.gen += 1;
                     app.stall = None;
