@@ -68,6 +68,11 @@ pub enum DraftNode {
         done: ItemType,
         target: usize,
         stops: Vec<(i32, i32)>,
+        /// V4.2: a relative gait — stops are *offsets* applied to the
+        /// target's current position at each firing, so the walk is
+        /// unbounded. A mover with a relative gait, targeting itself, with
+        /// its done-pulse looped into its own token port, is a glider.
+        relative: bool,
         latency: u64,
     },
 }
@@ -395,9 +400,13 @@ impl Draft {
         // (Interactions with other movers' evolved placements are checked
         // at materialization instead and stall gracefully — see G2.)
         for m in 0..self.nodes.len() {
-            let DraftNode::Mover { label, target, stops, .. } = &self.nodes[m] else {
+            let DraftNode::Mover { label, target, stops, relative, .. } = &self.nodes[m]
+            else {
                 continue;
             };
+            if *relative {
+                continue; // offsets can't be pre-validated; walks stall live
+            }
             let (label, target, stops) = (label.clone(), *target, stops.clone());
             let mut occ = std::collections::HashSet::new();
             for (i, _) in self.inputs.iter().enumerate() {
