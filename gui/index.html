@@ -82,6 +82,7 @@
     <button id="a-rot">+ rot</button>
     <button id="a-split">+ split</button>
     <button id="a-belt">+ belt</button>
+    <button id="a-mover">+ crane</button>
     <button id="a-out">+ output</button>
     <span class="sep"></span>
     <button id="a-seal">&#9723; seal</button>
@@ -266,16 +267,18 @@ function wireLatencyPreview(from, to) {
 const legsIn = n => n.kind === 'recipe' ? n.consume.map(c => c[0])
   : n.kind === 'priority' ? [n.item, n.token]
   : n.kind === 'module' ? n.draft.inputs.map(i => i.ty)
+  : n.kind === 'mover' ? [n.token]
   : n.kind === 'weld' ? [ANY_TY, ANY_TY]
   : [ANY_TY]; // rot, split, belt
 const legsOut = n => n.kind === 'recipe' ? n.produce.map(c => c[0])
   : n.kind === 'priority' ? [n.item, n.item]
   : n.kind === 'module' ? n.draft.outputs.map(o => o.ty)
+  : n.kind === 'mover' ? [n.done]
   : n.kind === 'split' ? [ANY_TY, ANY_TY]
   : [ANY_TY];
 const kindTag = n => ({ priority:'else-gate', module:'sealed module',
   recipe:'recipe', weld:'welder', rot:'rotator', split:'splitter',
-  belt:'belt' })[n.kind] || n.kind;
+  belt:'belt', mover:'crane' })[n.kind] || n.kind;
 const nodeH = n =>
   36 + Math.max(legsIn(n).length, legsOut(n).length, 1) * 14 + 4
      + (n.kind === 'recipe' ? 22 : 0);   // room for the recipe strip
@@ -431,6 +434,12 @@ async function ensure(t) {
       S.fetching.add(key);
       try {
         const r = await (await fetch(`/api/frames?from=${k}&n=64`)).json();
+        // Movers rearrange the world server-side; gen says when.
+        if (r.gen !== undefined && r.gen !== S.gen) {
+          const first = S.gen === undefined;
+          S.gen = r.gen;
+          if (!first) { refreshWorld(); return; }
+        }
         r.frames.forEach((f, i) => S.frames.set(r.from + i, f));
         if (S.frames.size > 4096) {
           const keep = new Set();
@@ -1078,6 +1087,10 @@ function convertNode(n) {
     return { kind:'weld', label:n.label, dx:n.dx, dy:n.dy, latency:n.latency };
   if (n.kind === 'rot' || n.kind === 'split' || n.kind === 'belt')
     return { kind:n.kind, label:n.label, latency:n.latency };
+  if (n.kind === 'mover')
+    return { kind:'mover', label:n.label, token:n.token, done:n.done,
+             target:n.target, stops:n.stops.map(s => s.slice()),
+             latency:n.latency };
   return { kind:'module', label:n.label, draft: convertSub(n.draft) };
 }
 function convertSub(d) {
@@ -1289,6 +1302,9 @@ function parseGate(text) {
 // ---- compile ---------------------------------------------------------------
 function applyState(st) {
   S.state = st;
+  // A mover couldn't land a move (or the epoch cap was hit): say so once.
+  if (st.stall && st.stall !== S.lastStall) { S.lastStall = st.stall; toast(st.stall, true); }
+  if (!st.stall) S.lastStall = null;
   document.getElementById('budget').innerHTML =
     `tick budget: <b>${st.budget.toLocaleString()}</b> · line clock: ${st.clock.toLocaleString()}`;
   document.getElementById('inv').innerHTML =
@@ -1337,6 +1353,30 @@ function applyScene(scene, customPos) {
 // the animation hot-swaps and keeps playing at the same tick; a refusal
 // leaves the last good line running and just says why.
 let liveTimer = null, liveInFlight = false, livePending = false, liveErrAt = 0;
+
+// A mover materialized a seam server-side: the world's blueprint evolved.
+// Refetch the scene and, when the editor is aligned and idle, walk the
+// evolved positions back into the draft (movers are a player-hand made of
+// tokens — their edits merge like anyone's).
+let refreshingWorld = false;
+async function refreshWorld() {
+  if (refreshingWorld) return;
+  refreshingWorld = true;
+  try {
+    const t = S.t; // hotSwap resets frame caches but we keep the view time
+    const sc = await (await fetch('/api/scene')).json();
+    hotSwap(sc);
+    S.t = t;
+    if (!E.drag && !E.path.length && sc.pos
+        && S.appliedSig && alignSig(E.draft) === S.appliedSig) {
+      E.draft.pos = { inputs: sc.pos.inputs.map(p => p.slice()),
+                      nodes: sc.pos.nodes.map(p => p.slice()),
+                      outputs: sc.pos.outputs.map(p => p.slice()) };
+      loadPos();
+      saveDraft();
+    }
+  } finally { refreshingWorld = false; }
+}
 
 function hotSwap(scene) {
   S.scene = scene; mergeTypes(scene.types); harvestChassis(scene.nodes);
@@ -1701,6 +1741,34 @@ function drawEdit() {
                     q.y, 11, 3);
     });
     if (node.kind === 'recipe') drawRecipeStrip(node, p.x + 9, p.y + p.h - 12);
+  });
+
+  // Crane choreography: for a selected/hovered mover, the dashed route its
+  // target will dance — numbered ghost posts, one advance per token.
+  d.nodes.forEach((node, n) => {
+    if (node.kind !== 'mover') return;
+    const shown = E.sel.has(n)
+      || (hovE && hovE.kind === 'node' && hovE.idx === n);
+    if (!shown || !d.nodes[node.target]) return;
+    const tp = E.pos.nodes[node.target];
+    const tSize = nodeSize(d.nodes[node.target]);
+    const at = g => ({ x: g[0] * GRID + tSize.w / 2, y: g[1] * GRID + tSize.h / 2 });
+    ctx.save();
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = '#f4b942aa';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(tp.x + tSize.w / 2, tp.y + tSize.h / 2);
+    node.stops.forEach(g => { const q = at(g); ctx.lineTo(q.x, q.y); });
+    ctx.stroke();
+    node.stops.forEach((g, si) => {
+      ctx.strokeStyle = '#f4b942';
+      ctx.strokeRect(g[0] * GRID + 1, g[1] * GRID + 1, tSize.w - 2, tSize.h - 2);
+      ctx.fillStyle = '#f4b942';
+      ctx.font = 'bold 10px system-ui';
+      ctx.fillText(String(si + 1), g[0] * GRID + 4, g[1] * GRID + 12);
+    });
+    ctx.restore();
   });
 
   d.outputs.forEach((out, o) => {
@@ -2072,6 +2140,35 @@ document.getElementById('a-weld').onclick = () => {
   const v = prompt('weld — attach offset dx,dy @latency:', '1,0 @2');
   if (v === null) return;
   try { draftAddNode(parseWeld(v)); } catch (err) { toast(err.message, true); }
+};
+// G2: a crane moves a machine — one stop per token it swallows, cycling.
+// "0 tok -> 8,9; 8,4 @1" = move machine #0 between two posts on tok pulses.
+function parseMover(text) {
+  const m = text.trim().match(/^(\d+)\s+(\S+?)(\s*->\s*([-\d,;\s]+?))?(\s*@\s*(\d+))?$/);
+  if (!m) throw Error('write e.g. "0 tok -> 8,9; 8,4 @1" — machine#, token, stops');
+  const target = parseInt(m[1]);
+  if (!D().nodes[target]) throw Error(`no machine #${target} to move`);
+  const token = tyByName(m[2]);
+  if (token === null) throw Error(`unknown token type "${m[2]}"`);
+  let stops = [];
+  if (m[4]) {
+    stops = m[4].split(';').map(s => {
+      const p = s.trim().split(',').map(x => parseInt(x, 10));
+      if (p.length !== 2 || p.some(isNaN)) throw Error('stops are "x,y; x,y; ..."');
+      return p;
+    });
+  }
+  if (!stops.length) stops = [toGrid(E.pos.nodes[target])]; // a no-op post
+  const done = tyByName('pulse');
+  return { kind:'mover', token, done: done === null ? token : done, target,
+           stops, latency: m[6] ? parseInt(m[6]) : 1,
+           label: `crane → ${D().nodes[target].label}` };
+}
+document.getElementById('a-mover').onclick = () => {
+  const v = prompt('crane — machine# token -> stops (cycled per token):',
+                   '0 tok -> 8,9; 8,4 @1');
+  if (v === null) return;
+  try { draftAddNode(parseMover(v)); } catch (err) { toast(err.message, true); }
 };
 document.getElementById('a-rot').onclick = () =>
   draftAddNode({ kind:'rot', latency:1, label:'rotate 90°' });
