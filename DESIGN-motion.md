@@ -201,9 +201,18 @@ Relocation rungs (meet the V-ladder at V4):
   phantom schedules, invisible to per-wire transit for a few ticks
   (cosmetic); interior drill views are epoch-local; the timeline is
   session-lived (restore begins a fresh epoch).
-- **G2**: **movers** — machines that move machines. The one genuinely new
-  interface in the whole motion design: a kernel token firing triggers a
-  world-layer move (reflection, carefully fenced). Design pinned:
+- **G2** ✅: **movers** — machines that move machines (`DraftNode::Mover`,
+  the crane). Proofs: `a_mover_moves_a_machine_on_schedule` (the iron
+  ledger closes across an *autonomous* seam; no-op firings open no
+  epochs), `mover_unrolling_is_request_order_independent` (identical
+  stitched totals and epoch counts however frames are requested — this
+  test caught a real bug: an epoch's phantom flows leaked into the next
+  seam's input vector, and not-yet-arrived phantom cohorts now re-carry
+  across rapid successive seams), and `a_machine_that_walks` (a
+  self-targeting mover walks three stops east on a token drip, footsteps
+  at t=1, 35, 68 — not 1, 32, 62 — because its own fuel line stretches
+  behind it: Doppler, predicted above, measured by the test). Design as
+  pinned:
 
   - **To the kernel, a mover is an ordinary recipe** `1·token → 1·done @
     latency`. It never learns that firing means motion. The reflection is
