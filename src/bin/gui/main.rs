@@ -96,6 +96,20 @@ struct App {
     epoch_t0: u64,
     /// Delivered totals at the current epoch's start, per output.
     out_base: Vec<u64>,
+    /// G2 movers: per-node stop cursor (meaningful for mover nodes only).
+    /// Advances one stop per firing, success or not — blocked stops are
+    /// skipped next cycle. Survives player move-seams; resets on retools.
+    mover_cursors: Vec<usize>,
+    /// Mover firings already translated into cursor advances *within the
+    /// current epoch* (so no-op and failed moves can't retrigger). Resets
+    /// to zeros whenever an epoch opens.
+    mover_consumed: Vec<u64>,
+    /// Bumped whenever the draft or timeline changes server-side (mover
+    /// materialization included); clients watch it and refetch.
+    gen: u64,
+    /// A mover materialization note (failed move, epoch cap). Life
+    /// continues; the note surfaces in /api/state until the next edit.
+    stall: Option<String>,
 }
 
 /// One stretch of factory history between relocation seams.
@@ -105,7 +119,9 @@ struct Epoch {
     compiled: Compiled,
 }
 
-const KINDS: [&str; 7] = ["weld", "rot", "split", "belt", "recipe", "priority", "module"];
+// Append-only: chassis intern in this order, so ids stay save-stable.
+const KINDS: [&str; 8] =
+    ["weld", "rot", "split", "belt", "recipe", "priority", "module", "mover"];
 
 impl App {
     fn new(save_path: Option<std::path::PathBuf>) -> App {
@@ -171,7 +187,13 @@ impl App {
             history: Vec::new(),
             epoch_t0: 0,
             out_base: vec![0; outs],
+            mover_cursors: Vec::new(),
+            mover_consumed: Vec::new(),
+            gen: 0,
+            stall: None,
         };
+        app.mover_cursors = vec![0; app.current.draft.nodes.len()];
+        app.mover_consumed = vec![0; app.current.draft.nodes.len()];
         // The pre-deployed demo consumed its preloads like any compile.
         let demo_draft = app.current.draft.clone();
         app.pay_markings(&demo_draft);
@@ -227,6 +249,7 @@ impl App {
             inventory.insert(ty, n);
         }
         let outs = current.draft.outputs.len();
+        let nodes = current.draft.nodes.len();
         Ok(App {
             lib,
             structs,
@@ -245,6 +268,10 @@ impl App {
             history: Vec::new(),
             epoch_t0: 0,
             out_base: vec![0; outs],
+            mover_cursors: vec![0; nodes],
+            mover_consumed: vec![0; nodes],
+            gen: 0,
+            stall: None,
         })
     }
 
@@ -416,6 +443,10 @@ impl App {
         self.history.clear();
         self.epoch_t0 = 0;
         self.out_base = vec![0; self.current.draft.outputs.len()];
+        self.mover_cursors = vec![0; self.current.draft.nodes.len()];
+        self.mover_consumed = vec![0; self.current.draft.nodes.len()];
+        self.gen += 1;
+        self.stall = None;
         let grant = self.maybe_goal_grant();
         self.save();
         Ok(format!(
@@ -450,6 +481,11 @@ impl App {
         self.history.push(Epoch { t0: self.epoch_t0, out_base: old_base, compiled: old });
         self.epoch_t0 = ts_global;
         self.subview = None;
+        // Mover cursors survive a player move; the epoch's firing ledger
+        // restarts with the epoch.
+        self.mover_consumed = vec![0; self.current.draft.nodes.len()];
+        self.gen += 1;
+        self.stall = None;
         let grant = self.maybe_goal_grant();
         self.save();
         Ok(format!(
@@ -457,6 +493,109 @@ impl App {
             scene_json(self),
             state_json(self)
         ))
+    }
+
+    /// G2 reflection, carefully fenced: materialize mover-driven epochs up
+    /// to absolute tick `t_target`. Counting maps are total functions, so
+    /// each epoch already knows every future mover firing; we find the
+    /// earliest one, advance that mover's target to its next stop, and open
+    /// an ordinary G1 seam there. Deterministic and request-order
+    /// independent: the seam decisions depend only on per-epoch firing
+    /// maps, never on how far each call happens to look.
+    fn unroll_to(&mut self, t_target: u64) {
+        const EPOCH_CAP: usize = 512;
+        let mut materialized = false;
+        'epochs: loop {
+            if t_target <= self.epoch_t0 {
+                break;
+            }
+            let horizon = t_target - self.epoch_t0;
+            // Earliest untranslated mover firing in the current epoch.
+            // (k(0) > consumed counts as τ=1: a boundary-instant firing
+            // takes effect one tick later.)
+            let mut best: Option<u64> = None;
+            for (n, node) in self.current.draft.nodes.iter().enumerate() {
+                if !matches!(node, DraftNode::Mover { .. }) {
+                    continue;
+                }
+                let Some(k) = self.current.firings[n].as_ref() else { continue };
+                let seen = self.mover_consumed[n];
+                let tf = (1..=horizon).find(|&tau| k.eval(tau) > seen);
+                if let Some(tf) = tf {
+                    best = Some(best.map_or(tf, |b: u64| b.min(tf)));
+                }
+            }
+            let Some(tf) = best else { break };
+            // Translate every firing at tf into cursor advances; land the
+            // target on the last stop of a coalesced multi-fire.
+            let mut new_pos = self.current.draft.node_pos.clone();
+            let mut moved_any = false;
+            for n in 0..self.current.draft.nodes.len() {
+                let DraftNode::Mover { target, stops, .. } = &self.current.draft.nodes[n]
+                else {
+                    continue;
+                };
+                let Some(k) = self.current.firings[n].as_ref() else { continue };
+                let fired = k.eval(tf);
+                let delta = fired.saturating_sub(self.mover_consumed[n]);
+                if delta == 0 {
+                    continue;
+                }
+                self.mover_consumed[n] = fired;
+                let cur = self.mover_cursors[n];
+                let stop = stops[(cur + delta as usize - 1) % stops.len()];
+                self.mover_cursors[n] = (cur + delta as usize) % stops.len();
+                if new_pos[*target] != stop {
+                    new_pos[*target] = stop;
+                    moved_any = true;
+                }
+            }
+            if !moved_any {
+                continue 'epochs; // no-op firing: consumed, no seam
+            }
+            if self.history.len() >= EPOCH_CAP {
+                self.stall = Some(format!(
+                    "mover timeline hit the {EPOCH_CAP}-epoch cap at t={} — \
+                     placements frozen from here (recurrence summarization is \
+                     V4's work)",
+                    self.epoch_t0 + tf
+                ));
+                break;
+            }
+            let mut draft = self.current.draft.clone();
+            draft.node_pos = new_pos;
+            match compile_seamed(&mut self.lib, &mut self.structs, draft, &self.current, tf) {
+                Ok(compiled) => {
+                    let ts_global = self.epoch_t0 + tf;
+                    let new_base: Vec<u64> = (0..self.current.outputs.len())
+                        .map(|o| self.out_base[o] + self.current.outputs[o].eval(tf))
+                        .collect();
+                    let old = std::mem::replace(&mut self.current, compiled);
+                    let old_base = std::mem::replace(&mut self.out_base, new_base);
+                    self.history.push(Epoch {
+                        t0: self.epoch_t0,
+                        out_base: old_base,
+                        compiled: old,
+                    });
+                    self.epoch_t0 = ts_global;
+                    self.mover_consumed = vec![0; self.current.draft.nodes.len()];
+                    self.subview = None;
+                    self.gen += 1;
+                    materialized = true;
+                }
+                Err(e) => {
+                    // The firing is consumed and the cursor advanced; the
+                    // placement stays. Life continues, the note surfaces.
+                    self.stall = Some(format!(
+                        "a mover couldn't move its target at t={}: {e}",
+                        self.epoch_t0 + tf
+                    ));
+                }
+            }
+        }
+        if materialized {
+            self.save();
+        }
     }
 
     /// The epoch containing absolute tick `t`: (compiled, epoch-local tick,
@@ -712,6 +851,10 @@ fn compile_with_flows(
                 let per = if matches!(op, BuildOp::Split) { 2 } else { 1 };
                 (0..legs).map(|_| Some(k.scale_floor(per, 1))).collect()
             }
+            DraftNode::Mover { .. } => {
+                let k = detail.firings[n].as_ref().expect("movers compile to recipes");
+                vec![Some(k.scale_floor(1, 1))]
+            }
         };
         supplies.push(sup);
         consumed.push(cons);
@@ -936,6 +1079,7 @@ fn kind_of(node: &DraftNode) -> &'static str {
         DraftNode::Builder { op: BuildOp::Rot, .. } => "rot",
         DraftNode::Builder { op: BuildOp::Split, .. } => "split",
         DraftNode::Builder { op: BuildOp::Belt, .. } => "belt",
+        DraftNode::Mover { .. } => "mover",
     }
 }
 
@@ -984,6 +1128,17 @@ fn node_json(
             BuildOp::Split => format!("\"kind\":\"split\",\"latency\":{latency}"),
             BuildOp::Belt => format!("\"kind\":\"belt\",\"latency\":{latency}"),
         },
+        DraftNode::Mover { token, done, target, stops, latency, .. } => {
+            let st: Vec<String> =
+                stops.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
+            format!(
+                "\"kind\":\"mover\",\"token\":{},\"done\":{},\"target\":{target},\
+                 \"stops\":[{}],\"latency\":{latency}",
+                token.0,
+                done.0,
+                st.join(",")
+            )
+        }
     };
     format!(
         "{{{core},\"label\":\"{}\",\"legs\":[{}],\"outs\":[{}],\"markings\":[{}]}}",
@@ -1305,6 +1460,7 @@ fn frames_json(c: &Compiled, from: u64, n: u64, t0: u64) -> String {
 
 /// Frames stitched across the seam timeline: each absolute tick reads from
 /// the epoch that owns it, with delivered totals accumulated across seams.
+/// Carries `gen` so clients notice when movers rearranged the world.
 fn frames_json_stitched(app: &App, from: u64, n: u64) -> String {
     let n = n.clamp(1, MAX_BATCH);
     let frames: Vec<String> = (from..from + n)
@@ -1313,7 +1469,11 @@ fn frames_json_stitched(app: &App, from: u64, n: u64) -> String {
             frame_json(c, tau, base)
         })
         .collect();
-    format!("{{\"from\":{from},\"frames\":[{}]}}", frames.join(","))
+    format!(
+        "{{\"from\":{from},\"gen\":{},\"frames\":[{}]}}",
+        app.gen,
+        frames.join(",")
+    )
 }
 
 fn state_json(app: &App) -> String {
@@ -1333,11 +1493,17 @@ fn state_json(app: &App) -> String {
         })
         .collect();
     format!(
-        "{{\"inventory\":[{}],\"budget\":{},\"clock\":{},\"goalAchieved\":{}}}",
+        "{{\"inventory\":[{}],\"budget\":{},\"clock\":{},\"goalAchieved\":{},\
+         \"gen\":{},\"stall\":{}}}",
         inv.join(","),
         app.budget,
         app.clock,
-        app.goal_achieved
+        app.goal_achieved,
+        app.gen,
+        match &app.stall {
+            Some(s) => format!("\"{}\"", esc(s)),
+            None => "null".into(),
+        }
     )
 }
 
@@ -1356,6 +1522,7 @@ fn harvest(app: &mut App, ticks: u64) -> Result<String, String> {
     }
     let from = app.clock;
     let to = from + ticks;
+    app.unroll_to(to); // movers scheduled before the horizon must land first
     // Stitched ledger: exact across relocation seams.
     let mut gains: Vec<(ItemType, u64)> = Vec::new();
     for o in 0..app.current.outputs.len() {
@@ -1529,6 +1696,32 @@ fn parse_draft_value(v: &Json, structs: &StructLib, depth: usize) -> Result<Draf
                 };
                 d.nodes.push(DraftNode::Builder { label, op, latency });
             }
+            Some("mover") => d.nodes.push(DraftNode::Mover {
+                label,
+                token: ItemType(
+                    node.get("token").and_then(|x| x.u64()).ok_or("mover missing token type")?
+                        as u32,
+                ),
+                done: ItemType(
+                    node.get("done").and_then(|x| x.u64()).ok_or("mover missing done type")?
+                        as u32,
+                ),
+                target: node
+                    .get("target")
+                    .and_then(|x| x.u64())
+                    .ok_or("mover missing target")? as usize,
+                stops: node
+                    .get("stops")
+                    .and_then(|x| x.arr())
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|p| {
+                        let a = p.arr()?;
+                        Some((a.first()?.i64()? as i32, a.get(1)?.i64()? as i32))
+                    })
+                    .collect(),
+                latency: node.get("latency").and_then(|x| x.u64()).unwrap_or(1),
+            }),
             _ => return Err(format!("node {n}: unknown kind")),
         }
     }
@@ -1596,6 +1789,7 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
         ("GET", "/api/frames") => {
             let from = param("from").unwrap_or(0);
             let n = param("n").unwrap_or(32);
+            app.unroll_to(from + n.clamp(1, MAX_BATCH)); // movers materialize lazily
             ("200 OK".into(), "application/json", frames_json_stitched(app, from, n))
         }
         // Interior of the sealed module at ?path=i,j,… — animated from the
@@ -1604,6 +1798,7 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
             let path = parse_path(query);
             let from = param("from").unwrap_or(0);
             let n = param("n").unwrap_or(32);
+            app.unroll_to(from + n.clamp(1, MAX_BATCH));
             ("200 OK".into(), "application/json", app.subframes(&path, from, n))
         }
         ("GET", "/api/subscene") => {
@@ -1638,6 +1833,10 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
                     app.history.clear(); // cold retool: one fresh epoch
                     app.epoch_t0 = 0;
                     app.out_base = vec![0; app.current.draft.outputs.len()];
+                    app.mover_cursors = vec![0; app.current.draft.nodes.len()];
+                    app.mover_consumed = vec![0; app.current.draft.nodes.len()];
+                    app.gen += 1;
+                    app.stall = None;
                     let paid = app.current.draft.clone();
                     app.pay_markings(&paid); // preloads are real items
                     let grant = app.maybe_goal_grant();
