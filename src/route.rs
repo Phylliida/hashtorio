@@ -25,12 +25,32 @@ const MAX_POPS: usize = 20_000;
 const DX: [i32; 4] = [1, 0, -1, 0];
 const DY: [i32; 4] = [0, 1, 0, -1];
 
+/// Route from `a` to `b` around `blocked` cells, starting eastbound (the
+/// direction out-ports face — belts leave a machine heading east). See
+/// [`route_free`] for direction-free starts.
+pub fn route(a: (i32, i32), b: (i32, i32), blocked: &HashSet<(i32, i32)>) -> Vec<(i32, i32)> {
+    route_from(a, b, blocked, Some(0))
+}
+
+/// Route with no initial heading — a trundling machine may step any way
+/// first. (With an eastbound seed and the no-U-turn rule, a walker could
+/// never take its first step west: it would spiral at its own doorstep.
+/// The commuting-workshop test caught exactly that.)
+pub fn route_free(a: (i32, i32), b: (i32, i32), blocked: &HashSet<(i32, i32)>) -> Vec<(i32, i32)> {
+    route_from(a, b, blocked, None)
+}
+
 /// Route from `a` to `b` around `blocked` cells. Returns the full cell
 /// path including both endpoints (`a == b` gives a single cell). The
 /// endpoints themselves are never treated as blocked; if no clear path
 /// exists within budget, the Manhattan L-path is returned — same length
 /// the old latency rule assumed, so hemmed wires degrade gracefully.
-pub fn route(a: (i32, i32), b: (i32, i32), blocked: &HashSet<(i32, i32)>) -> Vec<(i32, i32)> {
+fn route_from(
+    a: (i32, i32),
+    b: (i32, i32),
+    blocked: &HashSet<(i32, i32)>,
+    start_dir: Option<u8>,
+) -> Vec<(i32, i32)> {
     if a == b {
         return vec![a];
     }
@@ -61,8 +81,18 @@ pub fn route(a: (i32, i32), b: (i32, i32), blocked: &HashSet<(i32, i32)>) -> Vec
     let mut heap: BinaryHeap<Reverse<(u64, i32, i32, u8)>> = BinaryHeap::new();
     let mut g: HashMap<(i32, i32, u8), u64> = HashMap::new();
     let mut par: HashMap<(i32, i32, u8), (i32, i32, u8)> = HashMap::new();
-    g.insert((0, 0, 0), 0); // out-ports face east: start heading 0
-    heap.push(Reverse((h(0, 0), 0, 0, 0)));
+    match start_dir {
+        Some(d) => {
+            g.insert((0, 0, d), 0);
+            heap.push(Reverse((h(0, 0), 0, 0, d)));
+        }
+        None => {
+            for d in 0..4u8 {
+                g.insert((0, 0, d), 0);
+                heap.push(Reverse((h(0, 0), 0, 0, d)));
+            }
+        }
+    }
     let mut goal: Option<(i32, i32, u8)> = None;
     let mut pops = 0;
     while let Some(Reverse((f, x, y, d))) = heap.pop() {
@@ -174,6 +204,13 @@ mod tests {
         let q = route((7, -13), (16, -12), &shifted);
         let back: Vec<(i32, i32)> = q.iter().map(|&(x, y)| (x - 7, y + 13)).collect();
         assert_eq!(p, back, "translated world, translated route");
+    }
+
+    #[test]
+    fn free_start_walks_west_in_a_straight_line() {
+        let p = route_free((10, 0), (2, 0), &HashSet::new());
+        assert_eq!(steps(&p), 8, "westbound is 8 straight steps: {p:?}");
+        assert!(p.iter().all(|&(_, y)| y == 0), "no doorstep spiral: {p:?}");
     }
 
     #[test]
