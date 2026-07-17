@@ -316,10 +316,29 @@ as it handles aperiodic flows. The caching-tier motto extends cleanly:
 - **V2**: mobile factories — soul/body idiom (module + clock-windowed ports),
   plus GUI rendering of the body token as the module's chassis moving along
   its track.
-- **V3**: shuttle/piston idiom via time-multiplexing; revisit evaluator-native
-  time-varying latency only if the derivation's k× cost hurts in practice.
-- **V4**: the motion-summary cache rule — scheduled retools + recurrence
-  detection modulo translation; a crawler as the demo (same net, displacement
-  v, period p).
+- **V3** ✅: shuttle/piston idiom via time-multiplexing — pinned by
+  `draft::tests::a_shuttle_multiplexes_two_roads` (a clocked else-gate
+  deals items between a short road and a long one; both roads used,
+  nothing lost, zero new primitives). Evaluator-native time-varying
+  latency stays unadmitted, as the rule requires.
+- **V4** ✅ *(identity-translation case)*: the motion-summary cache rule.
+  Epoch unrolling is deterministic, so the world-state fingerprint at an
+  epoch's birth — placement, NetId, input flows, mover cursors, walks in
+  progress, module prehistory — recurring means the stretch between
+  repeats *forever*. `unroll_to` detects the recurrence, closes the loop
+  (`Cycle { t_start, period, per_period }`), stops materializing, and
+  every later query folds in by modular arithmetic: `epoch_at` credits
+  whole periods' deliveries, the scene serves the cycle so the client
+  folds rendering time the same way. Pinned by
+  `a_patrol_becomes_eternal`: the module-free rover's loop closes within
+  a few laps; a warp to t=1,000,000 materializes nothing and totals
+  exactly ~t/2; the ledger delivers identically every period, forever.
+  Player edits clear the cycle (the trajectory changed); it re-detects.
+  Honest scope: *exact-representation* recurrence — factories with sealed
+  modules never match (prehistory grows monotonically; canonicalizing
+  module state = V4.1), and recurrence *modulo translation* awaits
+  movable sources (nothing can currently move an input, so a pure
+  translate of the whole world cannot arise). The crawler-as-glider demo
+  belongs to that future rung.
 - **V5** (research): cell-lattice ground, lazy space, HashLife-with-economy;
   placement as slow flow.
