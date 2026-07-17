@@ -23,7 +23,7 @@ use hashtorio::draft::{
     BuildOp, Draft, DraftFrom, DraftInput, DraftNode, DraftOutput, DraftTo, SeamPlan, BELT_SPEED,
 };
 use hashtorio::eval::{EvalError, Evaluator};
-use hashtorio::net::{ItemType, Library};
+use hashtorio::net::{ItemType, Library, NetId};
 use hashtorio::structure::{chassis, StructLib, ANY};
 use hashtorio::report::{Audit, Summary};
 use json::Json;
@@ -50,6 +50,9 @@ struct Compiled {
     node_types: Vec<(Vec<ItemType>, Vec<ItemType>)>,
     /// Geometric latency per wire; arrivals = departures shifted by it.
     wire_lats: Vec<u64>,
+    /// The interned net this epoch runs (content-addressed; part of the
+    /// V4 recurrence fingerprint).
+    id: NetId,
     /// Routed belt path per wire — the placed cells the latency measures.
     wire_routes: Vec<Vec<(i32, i32)>>,
     /// Module prehistory this epoch was compiled with (relocation seams):
@@ -121,6 +124,11 @@ struct App {
     /// A mover materialization note (failed move, epoch cap). Life
     /// continues; the note surfaces in /api/state until the next edit.
     stall: Option<String>,
+    /// V4: fingerprints of every epoch birth since the last player edit.
+    seen: std::collections::HashMap<Fp, u64>,
+    /// V4: the detected recurrence, if any. Set ⇒ no more materialization;
+    /// all later time folds into the loop. Cleared by any player edit.
+    cycle: Option<Cycle>,
 }
 
 /// One stretch of factory history between relocation seams.
@@ -138,6 +146,35 @@ struct Trundle {
     dest: (i32, i32),
     per_cell: u64,
     next_t: u64,
+}
+
+/// V4: a world-state fingerprint at an epoch's birth. Epoch unrolling is
+/// deterministic, so if this whole tuple ever recurs, the stretch between
+/// the two occurrences repeats *forever* — the motion-summary cache rule.
+/// Exact-representation equality: sound by construction (module prehistory
+/// grows monotonically, so factories with sealed modules simply never
+/// match — canonicalizing module state is V4.1's work).
+#[derive(PartialEq, Eq, Hash)]
+struct Fp {
+    node_pos: Vec<(i32, i32)>,
+    net: NetId,
+    flows: Vec<Counting>,
+    cursors: Vec<usize>,
+    /// (node, dest, pace, due − epoch_t0), sorted.
+    trundles: Vec<(usize, (i32, i32), u64, u64)>,
+    /// Sorted (node, histories, replay); present so a match is a *true*
+    /// state match even when modules are in play.
+    module_pre: Vec<(usize, Vec<Counting>, u64)>,
+}
+
+/// V4: a closed loop. From `t_start`, the world repeats with `period`;
+/// each period delivers `per_period[o]` more of output `o`. Every query
+/// beyond the materialized stretch folds into it by modular arithmetic —
+/// eternal patrols, O(1) warps.
+struct Cycle {
+    t_start: u64,
+    period: u64,
+    per_period: Vec<u64>,
 }
 
 // Append-only: chassis intern in this order, so ids stay save-stable.
@@ -213,9 +250,12 @@ impl App {
             trundles: Vec::new(),
             gen: 0,
             stall: None,
+            seen: std::collections::HashMap::new(),
+            cycle: None,
         };
         app.mover_cursors = vec![0; app.current.draft.nodes.len()];
         app.mover_consumed = vec![0; app.current.draft.nodes.len()];
+        app.reset_recurrence();
         // The pre-deployed demo consumed its preloads like any compile.
         let demo_draft = app.current.draft.clone();
         app.pay_markings(&demo_draft);
@@ -272,7 +312,7 @@ impl App {
         }
         let outs = current.draft.outputs.len();
         let nodes = current.draft.nodes.len();
-        Ok(App {
+        let mut app = App {
             lib,
             structs,
             chassis: chassis_map,
@@ -295,7 +335,11 @@ impl App {
             trundles: Vec::new(),
             gen: 0,
             stall: None,
-        })
+            seen: std::collections::HashMap::new(),
+            cycle: None,
+        };
+        app.reset_recurrence();
+        Ok(app)
     }
 
     /// Persist the economy (atomic: temp file + rename).
@@ -471,6 +515,7 @@ impl App {
         self.trundles.clear();
         self.gen += 1;
         self.stall = None;
+        self.reset_recurrence();
         let grant = self.maybe_goal_grant();
         self.save();
         Ok(format!(
@@ -514,6 +559,7 @@ impl App {
         }
         self.gen += 1;
         self.stall = None;
+        self.reset_recurrence();
         let grant = self.maybe_goal_grant();
         self.save();
         Ok(format!(
@@ -530,8 +576,45 @@ impl App {
     /// an ordinary G1 seam there. Deterministic and request-order
     /// independent: the seam decisions depend only on per-epoch firing
     /// maps, never on how far each call happens to look.
+    /// V4: the world's full frontier state, canonically ordered.
+    fn fingerprint(&self) -> Fp {
+        let mut trundles: Vec<(usize, (i32, i32), u64, u64)> = self
+            .trundles
+            .iter()
+            .map(|tr| (tr.node, tr.dest, tr.per_cell, tr.next_t - self.epoch_t0))
+            .collect();
+        trundles.sort();
+        let mut module_pre: Vec<(usize, Vec<Counting>, u64)> = self
+            .current
+            .module_pre
+            .iter()
+            .map(|(n, (h, s))| (*n, h.clone(), *s))
+            .collect();
+        module_pre.sort_by_key(|e| e.0);
+        Fp {
+            node_pos: self.current.draft.node_pos.clone(),
+            net: self.current.id,
+            flows: self.current.input_flows.clone(),
+            cursors: self.mover_cursors.clone(),
+            trundles,
+            module_pre,
+        }
+    }
+
+    /// V4: forget recurrence bookkeeping (any player edit perturbs the
+    /// trajectory), then remember where we stand now.
+    fn reset_recurrence(&mut self) {
+        self.seen.clear();
+        self.cycle = None;
+        let fp = self.fingerprint();
+        self.seen.insert(fp, self.epoch_t0);
+    }
+
     fn unroll_to(&mut self, t_target: u64) {
         const EPOCH_CAP: usize = 512;
+        if self.cycle.is_some() {
+            return; // the loop is closed; all of time is already known
+        }
         let mut materialized = false;
         loop {
             if t_target <= self.epoch_t0 {
@@ -673,6 +756,31 @@ impl App {
                             tr.next_t = next + tr.per_cell;
                         }
                     }
+                    // V4: has this exact world-state been here before? Then
+                    // everything between repeats forever — close the loop.
+                    let fp = self.fingerprint();
+                    if let Some(&t_start) = self.seen.get(&fp) {
+                        let base_start = self
+                            .history
+                            .iter()
+                            .find(|e| e.t0 == t_start)
+                            .map(|e| e.out_base.clone())
+                            .unwrap_or_else(|| vec![0; self.out_base.len()]);
+                        let per_period: Vec<u64> = self
+                            .out_base
+                            .iter()
+                            .zip(&base_start)
+                            .map(|(now, then)| now - then)
+                            .collect();
+                        self.cycle = Some(Cycle {
+                            t_start,
+                            period: self.epoch_t0 - t_start,
+                            per_period,
+                        });
+                        self.gen += 1; // clients refetch: the scene gains its cycle
+                        break;
+                    }
+                    self.seen.insert(fp, self.epoch_t0);
                 }
                 Err(e) => {
                     // The step is unachievable: those walks end here.
@@ -738,17 +846,32 @@ impl App {
     /// *strictly after* `t0`: the seam extraction samples state through the
     /// seam tick itself, so that tick's events belong to the old epoch, and
     /// the new epoch's local τ=0 is a zero-tick at the seam instant.
-    fn epoch_at(&self, t: u64) -> (&Compiled, u64, &[u64]) {
+    fn epoch_at(&self, t: u64) -> (&Compiled, u64, Vec<u64>) {
+        // V4: fold late times into the closed loop, crediting the whole
+        // periods skipped over.
+        let (t, bonus) = match &self.cycle {
+            Some(cy) if t > cy.t_start => {
+                let k = (t - cy.t_start - 1) / cy.period;
+                (
+                    t - k * cy.period,
+                    cy.per_period.iter().map(|d| d * k).collect(),
+                )
+            }
+            _ => (t, vec![0; self.out_base.len()]),
+        };
+        let add = |base: &[u64]| -> Vec<u64> {
+            base.iter().zip(&bonus).map(|(b, x)| b + x).collect()
+        };
         if t > self.epoch_t0 || self.history.is_empty() {
-            return (&self.current, t.saturating_sub(self.epoch_t0), &self.out_base);
+            return (&self.current, t.saturating_sub(self.epoch_t0), add(&self.out_base));
         }
         for e in self.history.iter().rev() {
             if t > e.t0 {
-                return (&e.compiled, t - e.t0, &e.out_base);
+                return (&e.compiled, t - e.t0, add(&e.out_base));
             }
         }
         let e = &self.history[0];
-        (&e.compiled, t.saturating_sub(e.t0), &e.out_base)
+        (&e.compiled, t.saturating_sub(e.t0), add(&e.out_base))
     }
 
     /// Delivered total at output `o` by absolute tick `t`, stitched across
@@ -1004,6 +1127,7 @@ fn compile_with_flows(
         consumed,
         node_types,
         wire_lats,
+        id,
         wire_routes,
         phantom_flows: seam
             .as_ref()
@@ -1380,8 +1504,17 @@ fn scene_json(app: &App) -> String {
         .map(|e| placement_json(e.t0, &e.compiled.draft.node_pos))
         .collect();
     placements.push(placement_json(app.epoch_t0, &app.current.draft.node_pos));
+    // V4: when the loop is closed, the client folds late view times into
+    // it exactly as the server does.
+    let cycle = match &app.cycle {
+        Some(cy) => format!(
+            ",\"cycle\":{{\"t0\":{},\"period\":{}}}",
+            cy.t_start, cy.period
+        ),
+        None => String::new(),
+    };
     format!(
-        "{},\"placements\":[{}]}}",
+        "{},\"placements\":[{}]{cycle}}}",
         &scene[..scene.len() - 1],
         placements.join(",")
     )
@@ -1642,7 +1775,7 @@ fn frames_json_stitched(app: &App, from: u64, n: u64) -> String {
     let frames: Vec<String> = (from..from + n)
         .map(|t| {
             let (c, tau, base) = app.epoch_at(t);
-            frame_json(c, tau, base)
+            frame_json(c, tau, &base)
         })
         .collect();
     format!(
@@ -2014,6 +2147,7 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
                     app.trundles.clear();
                     app.gen += 1;
                     app.stall = None;
+                    app.reset_recurrence();
                     let paid = app.current.draft.clone();
                     app.pay_markings(&paid); // preloads are real items
                     let grant = app.maybe_goal_grant();
@@ -2469,6 +2603,68 @@ mod tests {
         assert_eq!(app.epoch_t0, 74, "last footfall");
         assert_eq!(app.current.draft.node_pos[0], (26, 2), "it walked east");
         assert!(app.stall.is_none(), "{:?}", app.stall);
+    }
+
+    /// V4: the motion-summary cache rule. Epoch unrolling is deterministic,
+    /// so when the world-state fingerprint recurs — placement, net, flows,
+    /// cursors, walks — the timeline closes into a loop: the patrol becomes
+    /// ETERNAL, materialization stops forever, and any view time — a
+    /// million ticks out — folds into the cycle by modular arithmetic.
+    #[test]
+    fn a_patrol_becomes_eternal() {
+        let mut app = test_app();
+        // The module-free rover: a press carried between two posts.
+        let d = r#"{"inputs":[{"ty":0,"label":"mine","rate":[1,1]},
+                              {"ty":4,"label":"patrol","rate":[1,60]}],
+            "outputs":[{"ty":2,"label":"gears"}],
+            "nodes":[{"kind":"recipe","label":"press","consume":[[0,2]],
+                      "produce":[[2,1]],"latency":3},
+                     {"kind":"mover","label":"carrier","token":4,"done":5,
+                      "target":0,"stops":[[18,4],[10,4]],"latency":1}],
+            "wires":[{"from":["in",0],"to":["node",0,0]},
+                     {"from":["node",0,0],"to":["out",0]},
+                     {"from":["in",1],"to":["node",1,0]}],
+            "markings":[],
+            "pos":{"inputs":[[2,4],[2,14]],"nodes":[[10,4],[10,14]],
+                   "outputs":[[30,4]]}}"#;
+        let (_, _, body) = route(&mut app, "POST", "/api/live", d);
+        assert!(body.contains("\"ok\":true"), "{body}");
+
+        // A few laps of patrol: the recurrence must be found.
+        for b in 0..6u64 {
+            route(&mut app, "GET", &format!("/api/frames?from={}&n=120", b * 120), "");
+        }
+        let Some(cy_period) = app.cycle.as_ref().map(|c| c.period) else {
+            panic!(
+                "no cycle found in {} epochs (t0s={:?})",
+                app.history.len(),
+                app.history.iter().map(|e| e.t0).collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(cy_period % 120, 0, "whole patrol laps: {cy_period}");
+        let epochs = app.history.len();
+        assert!(epochs < 60, "the loop closed early: {epochs}");
+
+        // Warp a million ticks: no further materialization, ever.
+        let (_, _, f) = route(&mut app, "GET", "/api/frames?from=1000000&n=4", "");
+        assert!(json::parse(&f).is_ok(), "{f}");
+        assert_eq!(app.history.len(), epochs, "the timeline is finished");
+        assert!(app.stall.is_none(), "{:?}", app.stall);
+
+        // The eternal ledger: the same delivery every period, forever.
+        let near = app.output_total(0, 10_000 + cy_period) - app.output_total(0, 10_000);
+        let far = app.output_total(0, 1_000_000 + cy_period) - app.output_total(0, 1_000_000);
+        assert_eq!(near, far, "the loop delivers the same, forever");
+        assert!(near > 0, "and it delivers");
+        let million = app.output_total(0, 1_000_000);
+        assert!(
+            (499_000..=500_001).contains(&million),
+            "a million ticks of gears at ~1/2: {million}"
+        );
+
+        // The scene tells the client how to fold time too.
+        let (_, _, scene) = route(&mut app, "GET", "/api/scene", "");
+        assert!(scene.contains("\"cycle\""), "the closed loop is served");
     }
 
     /// V2, realized the relocation way: a mobile factory is a sealed
