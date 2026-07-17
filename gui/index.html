@@ -1425,7 +1425,30 @@ async function runLive() {
 // ---------------------------------------------------------------------------
 // edit mode: hit testing & interaction
 // ---------------------------------------------------------------------------
-function editorHit(x, y) {
+// G3: machines render (and hit-test) where they STOOD at the view tick.
+// The scene's placements timeline gives per-epoch positions; we swap them
+// into E.pos.nodes for the duration of a draw or hit, so every consumer —
+// boxes, ports, wires (which re-route via the local A* when the server
+// route's endpoints no longer match), obstacles — sees one consistent
+// moment in time. Editing truth stays in E.pos; drags see the present.
+function placementNodesAt(t) {
+  const pl = S.scene && S.scene.placements;
+  if (!pl || pl.length < 2 || S.view !== 'world' || E.drag || E.path.length) return null;
+  if (!(S.appliedSig && alignSig(E.draft) === S.appliedSig)) return null;
+  let cur = pl[0];
+  for (const e of pl) { if (e.t0 < t) cur = e; else break; }
+  if (cur === pl[pl.length - 1]) return null; // the present: no override
+  return cur.nodes.map(g => ({ x: g[0] * GRID, y: g[1] * GRID }));
+}
+function inPlacement(fn) {
+  const plc = placementNodesAt(Math.floor(S.t));
+  if (!plc || plc.length !== E.pos.nodes.length) return fn();
+  const saved = E.pos.nodes;
+  E.pos.nodes = plc;
+  try { return fn(); } finally { E.pos.nodes = saved; }
+}
+const editorHit = (x, y) => inPlacement(() => editorHitInner(x, y));
+function editorHitInner(x, y) {
   const d = D();
   const world = S.view === 'world';
   const pr = world ? 11 : 8;   // port hit radius: docks are chunkier
@@ -1494,7 +1517,8 @@ const editWirePath = (w, i) => {
   return wirePath(pos, D().nodes, w.from, w.to);
 };
 // Hover in the editor: everything editorHit sees, plus whole belts.
-function editHover(x, y) {
+const editHover = (x, y) => inPlacement(() => editHoverInner(x, y));
+function editHoverInner(x, y) {
   const hit = editorHit(x, y);
   if (hit) return hit;
   const d = D();
@@ -1595,7 +1619,8 @@ cv.addEventListener('wheel', e => {
 // ---------------------------------------------------------------------------
 // edit mode: drawing
 // ---------------------------------------------------------------------------
-function drawEdit() {
+function drawEdit() { inPlacement(drawEditInner); }
+function drawEditInner() {
   const d = D();
   const W = cv.getBoundingClientRect().width, H = cv.getBoundingClientRect().height;
   ctx.clearRect(0, 0, W, H);

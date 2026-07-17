@@ -109,6 +109,12 @@ struct App {
     /// current epoch* (so no-op and failed moves can't retrigger). Resets
     /// to zeros whenever an epoch opens.
     mover_consumed: Vec<u64>,
+    /// G3 trundles: machines mid-walk. A mover firing no longer teleports
+    /// its target — it schedules a walk, one cell per `per_cell` ticks,
+    /// each step an ordinary one-cell seam, re-pathed by the router every
+    /// step (so it flows around whatever has moved meanwhile). Session-
+    /// lived, like the timeline.
+    trundles: Vec<Trundle>,
     /// Bumped whenever the draft or timeline changes server-side (mover
     /// materialization included); clients watch it and refetch.
     gen: u64,
@@ -122,6 +128,16 @@ struct Epoch {
     t0: u64,
     out_base: Vec<u64>,
     compiled: Compiled,
+}
+
+/// A machine mid-walk (G3): where it's headed, how fast, and when its next
+/// one-cell step falls due (absolute view ticks).
+#[derive(Debug, Clone)]
+struct Trundle {
+    node: usize,
+    dest: (i32, i32),
+    per_cell: u64,
+    next_t: u64,
 }
 
 // Append-only: chassis intern in this order, so ids stay save-stable.
@@ -194,6 +210,7 @@ impl App {
             out_base: vec![0; outs],
             mover_cursors: Vec::new(),
             mover_consumed: Vec::new(),
+            trundles: Vec::new(),
             gen: 0,
             stall: None,
         };
@@ -275,6 +292,7 @@ impl App {
             out_base: vec![0; outs],
             mover_cursors: vec![0; nodes],
             mover_consumed: vec![0; nodes],
+            trundles: Vec::new(),
             gen: 0,
             stall: None,
         })
@@ -450,6 +468,7 @@ impl App {
         self.out_base = vec![0; self.current.draft.outputs.len()];
         self.mover_cursors = vec![0; self.current.draft.nodes.len()];
         self.mover_consumed = vec![0; self.current.draft.nodes.len()];
+        self.trundles.clear();
         self.gen += 1;
         self.stall = None;
         let grant = self.maybe_goal_grant();
@@ -487,8 +506,12 @@ impl App {
         self.epoch_t0 = ts_global;
         self.subview = None;
         // Mover cursors survive a player move; the epoch's firing ledger
-        // restarts with the epoch.
+        // restarts with the epoch. Walks in progress continue (re-pathed
+        // per step), their next steps clamped past the new seam.
         self.mover_consumed = vec![0; self.current.draft.nodes.len()];
+        for tr in &mut self.trundles {
+            tr.next_t = tr.next_t.max(self.epoch_t0 + 1);
+        }
         self.gen += 1;
         self.stall = None;
         let grant = self.maybe_goal_grant();
@@ -510,68 +533,119 @@ impl App {
     fn unroll_to(&mut self, t_target: u64) {
         const EPOCH_CAP: usize = 512;
         let mut materialized = false;
-        'epochs: loop {
+        loop {
             if t_target <= self.epoch_t0 {
                 break;
             }
             let horizon = t_target - self.epoch_t0;
-            // Earliest untranslated mover firing in the current epoch.
-            // (k(0) > consumed counts as τ=1: a boundary-instant firing
-            // takes effect one tick later.)
-            let mut best: Option<u64> = None;
+            // Earliest untranslated mover firing (global time). (k(τ) >
+            // consumed from τ=1: a boundary-instant firing lands next tick.)
+            let mut fire_t: Option<u64> = None;
             for (n, node) in self.current.draft.nodes.iter().enumerate() {
                 if !matches!(node, DraftNode::Mover { .. }) {
                     continue;
                 }
                 let Some(k) = self.current.firings[n].as_ref() else { continue };
                 let seen = self.mover_consumed[n];
-                let tf = (1..=horizon).find(|&tau| k.eval(tau) > seen);
-                if let Some(tf) = tf {
-                    best = Some(best.map_or(tf, |b: u64| b.min(tf)));
+                if let Some(tf) = (1..=horizon).find(|&tau| k.eval(tau) > seen) {
+                    let g = self.epoch_t0 + tf;
+                    fire_t = Some(fire_t.map_or(g, |b: u64| b.min(g)));
                 }
             }
-            let Some(tf) = best else { break };
-            // Translate every firing at tf into cursor advances; land the
-            // target on the last stop of a coalesced multi-fire.
+            let step_t = self.trundles.iter().map(|tr| tr.next_t).min();
+            let next = match (fire_t, step_t) {
+                (Some(f), Some(s)) => f.min(s),
+                (Some(f), None) => f,
+                (None, Some(s)) => s,
+                (None, None) => break,
+            };
+            if next > t_target {
+                break; // pending events stay pending, lazily
+            }
+
+            // Firings first at equal times: they only schedule walks.
+            if fire_t == Some(next) {
+                let tau = next - self.epoch_t0;
+                for n in 0..self.current.draft.nodes.len() {
+                    let DraftNode::Mover { target, stops, latency, .. } =
+                        &self.current.draft.nodes[n]
+                    else {
+                        continue;
+                    };
+                    let (target, stops, latency) = (*target, stops.clone(), *latency);
+                    let Some(k) = self.current.firings[n].as_ref() else { continue };
+                    let fired = k.eval(tau);
+                    let delta = fired.saturating_sub(self.mover_consumed[n]);
+                    if delta == 0 {
+                        continue;
+                    }
+                    self.mover_consumed[n] = fired;
+                    let cur = self.mover_cursors[n];
+                    let dest = stops[(cur + delta as usize - 1) % stops.len()];
+                    self.mover_cursors[n] = (cur + delta as usize) % stops.len();
+                    // A fresh order replaces any walk in progress.
+                    self.trundles.retain(|tr| tr.node != target);
+                    if self.current.draft.node_pos[target] != dest {
+                        let per_cell = latency.max(1); // Zeno guard
+                        self.trundles.push(Trundle {
+                            node: target,
+                            dest,
+                            per_cell,
+                            next_t: next + per_cell,
+                        });
+                    }
+                }
+                continue;
+            }
+
+            // Trundle steps due now: one cell each, re-pathed around
+            // whatever stands there today, all coalesced into ONE seam.
             let mut new_pos = self.current.draft.node_pos.clone();
-            let mut moved_any = false;
-            for n in 0..self.current.draft.nodes.len() {
-                let DraftNode::Mover { target, stops, .. } = &self.current.draft.nodes[n]
-                else {
-                    continue;
-                };
-                let Some(k) = self.current.firings[n].as_ref() else { continue };
-                let fired = k.eval(tf);
-                let delta = fired.saturating_sub(self.mover_consumed[n]);
-                if delta == 0 {
+            let mut stepped: Vec<usize> = Vec::new();
+            let mut blocked: Vec<usize> = Vec::new();
+            for i in 0..self.trundles.len() {
+                if self.trundles[i].next_t != next {
                     continue;
                 }
-                self.mover_consumed[n] = fired;
-                let cur = self.mover_cursors[n];
-                let stop = stops[(cur + delta as usize - 1) % stops.len()];
-                self.mover_cursors[n] = (cur + delta as usize) % stops.len();
-                if new_pos[*target] != stop {
-                    new_pos[*target] = stop;
-                    moved_any = true;
+                let tr = self.trundles[i].clone();
+                let cur = new_pos[tr.node];
+                let obs = self.dilated_obstacles(tr.node);
+                let path = hashtorio::route::route(cur, tr.dest, &obs);
+                if path.len() < 2 || obs.contains(&path[1]) {
+                    blocked.push(i); // hemmed in (L-fallback collides)
+                    continue;
                 }
+                new_pos[tr.node] = path[1];
+                stepped.push(i);
             }
-            if !moved_any {
-                continue 'epochs; // no-op firing: consumed, no seam
+            for &i in blocked.iter().rev() {
+                let tr = self.trundles.remove(i);
+                self.stall = Some(format!(
+                    "'{}' is boxed in at ({}, {}) — its walk to ({}, {}) is off",
+                    self.current.draft.nodes[tr.node].label(),
+                    self.current.draft.node_pos[tr.node].0,
+                    self.current.draft.node_pos[tr.node].1,
+                    tr.dest.0,
+                    tr.dest.1
+                ));
+            }
+            if stepped.is_empty() {
+                continue;
             }
             if self.history.len() >= EPOCH_CAP {
                 self.stall = Some(format!(
-                    "mover timeline hit the {EPOCH_CAP}-epoch cap at t={} — \
+                    "mover timeline hit the {EPOCH_CAP}-epoch cap at t={next} — \
                      placements frozen from here (recurrence summarization is \
-                     V4's work)",
-                    self.epoch_t0 + tf
+                     V4's work)"
                 ));
+                self.trundles.clear();
                 break;
             }
+            let tf = next - self.epoch_t0;
             let mut draft = self.current.draft.clone();
             draft.node_pos = new_pos;
             match compile_seamed(&mut self.lib, &mut self.structs, draft, &self.current, tf) {
                 Ok(compiled) => {
-                    let ts_global = self.epoch_t0 + tf;
                     let new_base: Vec<u64> = (0..self.current.outputs.len())
                         .map(|o| self.out_base[o] + self.current.outputs[o].eval(tf))
                         .collect();
@@ -582,25 +656,81 @@ impl App {
                         out_base: old_base,
                         compiled: old,
                     });
-                    self.epoch_t0 = ts_global;
+                    self.epoch_t0 = next;
                     self.mover_consumed = vec![0; self.current.draft.nodes.len()];
                     self.subview = None;
                     self.gen += 1;
                     materialized = true;
+                    // Advance the walkers that stepped; retire arrivals.
+                    for &i in stepped.iter().rev() {
+                        let arrived =
+                            self.current.draft.node_pos[self.trundles[i].node]
+                                == self.trundles[i].dest;
+                        if arrived {
+                            self.trundles.remove(i);
+                        } else {
+                            let tr = &mut self.trundles[i];
+                            tr.next_t = next + tr.per_cell;
+                        }
+                    }
                 }
                 Err(e) => {
-                    // The firing is consumed and the cursor advanced; the
-                    // placement stays. Life continues, the note surfaces.
-                    self.stall = Some(format!(
-                        "a mover couldn't move its target at t={}: {e}",
-                        self.epoch_t0 + tf
-                    ));
+                    // The step is unachievable: those walks end here.
+                    for &i in stepped.iter().rev() {
+                        self.trundles.remove(i);
+                    }
+                    self.stall =
+                        Some(format!("a walk failed at t={next}: {e}"));
                 }
             }
         }
         if materialized {
             self.save();
         }
+    }
+
+    /// The anchor cells a machine of `moving`'s footprint may NOT occupy:
+    /// every other claim, dilated by the machine's own bounding box, so the
+    /// router walks its whole body around things (conservative for
+    /// non-rectangular chassis).
+    fn dilated_obstacles(&mut self, moving: usize) -> std::collections::HashSet<(i32, i32)> {
+        let d = &self.current.draft;
+        let ch = chassis(&mut self.structs, hashtorio::draft::kind_str(&d.nodes[moving]));
+        let cells: Vec<(i32, i32)> =
+            self.structs.cells(ch).iter().map(|&(x, y, _)| (x, y)).collect();
+        let w = cells.iter().map(|c| c.0).max().unwrap_or(0) + 1;
+        let h = cells.iter().map(|c| c.1).max().unwrap_or(0) + 1;
+        let mut occ = std::collections::HashSet::new();
+        let mut block = |occ: &mut std::collections::HashSet<(i32, i32)>, cx: i32, cy: i32| {
+            for ax in (cx - w + 1)..=cx {
+                for ay in (cy - h + 1)..=cy {
+                    occ.insert((ax, ay));
+                }
+            }
+        };
+        let d = &self.current.draft;
+        for (i, _) in d.inputs.iter().enumerate() {
+            block(&mut occ, d.input_pos[i].0, d.input_pos[i].1);
+        }
+        for (o, _) in d.outputs.iter().enumerate() {
+            let p = d.output_pos[o];
+            block(&mut occ, p.0, p.1);
+            block(&mut occ, p.0, p.1 + 1);
+        }
+        for n2 in 0..d.nodes.len() {
+            if n2 == moving {
+                continue;
+            }
+            let ch2 =
+                chassis(&mut self.structs, hashtorio::draft::kind_str(&self.current.draft.nodes[n2]));
+            let cells2: Vec<(i32, i32)> =
+                self.structs.cells(ch2).iter().map(|&(x, y, _)| (x, y)).collect();
+            let p = self.current.draft.node_pos[n2];
+            for (x, y) in cells2 {
+                block(&mut occ, p.0 + x, p.1 + y);
+            }
+        }
+        occ
     }
 
     /// The epoch containing absolute tick `t`: (compiled, epoch-local tick,
@@ -1240,7 +1370,26 @@ fn draft_json(d: &Draft) -> String {
 }
 
 fn scene_json(app: &App) -> String {
-    scene_json_for(app, &app.current)
+    let scene = scene_json_for(app, &app.current);
+    // G3: the placements timeline — per-epoch machine positions, so the
+    // client can render machines where they *stood* at any view tick (the
+    // trundle is visible in time, not just in the latest snapshot).
+    let mut placements: Vec<String> = app
+        .history
+        .iter()
+        .map(|e| placement_json(e.t0, &e.compiled.draft.node_pos))
+        .collect();
+    placements.push(placement_json(app.epoch_t0, &app.current.draft.node_pos));
+    format!(
+        "{},\"placements\":[{}]}}",
+        &scene[..scene.len() - 1],
+        placements.join(",")
+    )
+}
+
+fn placement_json(t0: u64, pos: &[(i32, i32)]) -> String {
+    let cells: Vec<String> = pos.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
+    format!("{{\"t0\":{t0},\"nodes\":[{}]}}", cells.join(","))
 }
 
 /// Render any [`Compiled`] as a scene (topology + spec + audit + types).
@@ -1862,6 +2011,7 @@ fn route(app: &mut App, method: &str, path: &str, body: &str) -> (String, &'stat
                     app.out_base = vec![0; app.current.draft.outputs.len()];
                     app.mover_cursors = vec![0; app.current.draft.nodes.len()];
                     app.mover_consumed = vec![0; app.current.draft.nodes.len()];
+                    app.trundles.clear();
                     app.gen += 1;
                     app.stall = None;
                     let paid = app.current.draft.clone();
@@ -2138,17 +2288,19 @@ mod tests {
         assert_eq!(app.history.len(), 0, "nothing has fired yet");
 
         // Frames drive lazy materialization: the token lands at t=42
-        // (emitted 40, two ticks of wire), the crane fires, the press moves.
+        // (emitted 40, two ticks of wire), the crane fires, and the press
+        // TRUNDLES (G3): five one-cell seams at t=43..47, not one jump.
         let (_, _, frames) = route(&mut app, "GET", "/api/frames?from=0&n=100", "");
-        assert_eq!(app.history.len(), 1, "the crane's firing opened a seam");
-        assert_eq!(app.epoch_t0, 42);
-        assert_eq!(app.current.draft.node_pos[0], (8, 9), "the press moved itself? no — was moved");
+        assert_eq!(app.history.len(), 5, "a five-cell walk is five seams");
+        assert_eq!(app.epoch_t0, 47, "last step lands at 47");
+        assert_eq!(app.current.draft.node_pos[0], (8, 9), "the press was walked to its post");
+        assert!(app.trundles.is_empty(), "the walk is over");
         assert!(app.stall.is_none(), "{:?}", app.stall);
 
         // Second firing (t=82) cycles to the same single stop: a no-op,
-        // no epoch churn.
+        // no walk, no epoch churn.
         let (_, _, _f2) = route(&mut app, "GET", "/api/frames?from=100&n=28", "");
-        assert_eq!(app.history.len(), 1, "no-op moves open no epochs");
+        assert_eq!(app.history.len(), 5, "no-op moves spawn no walks");
 
         // The iron ledger, from stitched frames alone, across an
         // autonomous seam (carried cohorts ride phantoms briefly ~42..52).
@@ -2181,6 +2333,48 @@ mod tests {
             }
         }
         assert!(last_total > 50, "the line produced across the mover's seam");
+    }
+
+    /// G3: the walk is visible in TIME. The crane's latency is its pace
+    /// (ticks per cell), each step is a seam, and the scene serves the
+    /// placements timeline so any view tick can render machines where they
+    /// stood — not just where they ended up.
+    #[test]
+    fn a_trundle_paces_itself_and_history_shows_it() {
+        let mut app = test_app();
+        let d = r#"{"inputs":[{"ty":0,"label":"mine","rate":[1,1]},
+                              {"ty":4,"label":"clock","rate":[1,40]}],
+            "outputs":[{"ty":2,"label":"gears"}],
+            "nodes":[{"kind":"recipe","label":"press","consume":[[0,1]],
+                      "produce":[[2,1]],"latency":1},
+                     {"kind":"mover","label":"slow crane","token":4,"done":5,
+                      "target":0,"stops":[[14,4]],"latency":2}],
+            "wires":[{"from":["in",0],"to":["node",0,0]},
+                     {"from":["node",0,0],"to":["out",0]},
+                     {"from":["in",1],"to":["node",1,0]}],
+            "markings":[],
+            "pos":{"inputs":[[2,4],[2,12]],"nodes":[[8,4],[8,12]],
+                   "outputs":[[22,4]]}}"#;
+        let (_, _, body) = route(&mut app, "POST", "/api/live", d);
+        assert!(body.contains("\"ok\":true"), "{body}");
+        route(&mut app, "GET", "/api/frames?from=0&n=100", "");
+        // Fires at 42; six cells east at one cell per TWO ticks.
+        let mut seams: Vec<u64> = app.history.iter().skip(1).map(|e| e.t0).collect();
+        seams.push(app.epoch_t0);
+        assert_eq!(seams, vec![44, 46, 48, 50, 52, 54], "a measured pace");
+        assert_eq!(app.current.draft.node_pos[0], (14, 4));
+        // The scene carries where everything stood, per epoch.
+        let (_, _, scene) = route(&mut app, "GET", "/api/scene", "");
+        let v = json::parse(&scene).unwrap();
+        let pl = v.get("placements").and_then(|x| x.arr()).unwrap();
+        assert_eq!(pl.len(), 7, "initial placement + six footfalls");
+        let node0 = |e: &json::Json| {
+            let g = e.get("nodes").and_then(|x| x.arr()).unwrap()[0].arr().unwrap();
+            (g[0].i64().unwrap(), g[1].i64().unwrap())
+        };
+        assert_eq!(node0(&pl[0]), (8, 4), "it began at home");
+        assert_eq!(node0(&pl[3]), (11, 4), "mid-walk, three cells along");
+        assert_eq!(node0(&pl[6]), (14, 4), "and ended at its post");
     }
 
     /// Unrolling is deterministic and request-order independent: the seam
@@ -2240,9 +2434,10 @@ mod tests {
     }
 
     /// The crawler seed: a mover may target ITSELF. This one walks three
-    /// stops east on a token drip — and because its own fuel line stretches
-    /// behind it, each footstep lands later than naive arithmetic says
-    /// (Doppler on its own supply): seams at t=1, 35, 68 — not 1, 32, 62.
+    /// stops east on a token drip, cell by cell now (G3) — and because its
+    /// own fuel line stretches behind it, each walk begins later than naive
+    /// arithmetic says (Doppler on its own supply): walk-starts at t=2, 36,
+    /// 69 — not 2, 33, 63.
     #[test]
     fn a_machine_that_walks() {
         let mut app = test_app();
@@ -2257,14 +2452,21 @@ mod tests {
         assert!(body.contains("\"ok\":true"), "{body}");
 
         route(&mut app, "GET", "/api/frames?from=0&n=80", "");
-        assert_eq!(app.history.len(), 3, "three footsteps");
+        assert_eq!(app.history.len(), 18, "three walks of six cells each");
         let mut seams: Vec<u64> = app.history.iter().skip(1).map(|e| e.t0).collect();
         seams.push(app.epoch_t0);
+        // A walk-start is a seam not preceded by a seam one tick earlier.
+        let starts: Vec<u64> = seams
+            .iter()
+            .copied()
+            .filter(|&t| !seams.contains(&(t - 1)))
+            .collect();
         assert_eq!(
-            seams,
-            vec![1, 35, 68],
-            "Doppler footsteps: the fuel line stretches as it walks"
+            starts,
+            vec![2, 36, 69],
+            "Doppler walk-starts: the fuel line stretches as it walks"
         );
+        assert_eq!(app.epoch_t0, 74, "last footfall");
         assert_eq!(app.current.draft.node_pos[0], (26, 2), "it walked east");
         assert!(app.stall.is_none(), "{:?}", app.stall);
     }
