@@ -172,6 +172,8 @@ pub fn chassis(structs: &mut StructLib, kind: &str) -> ItemType {
         "belt" => vec![(0, 0, PL), (1, 0, PL)],
         "recipe" => vec![(0, 0, FE), (1, 0, GR), (0, 1, FE), (1, 1, FE)],
         "priority" => vec![(1, 0, CU), (0, 1, CU), (1, 1, GR), (2, 1, CU), (1, 2, CU)],
+        // The crane: a gear base under a copper jib.
+        "mover" => vec![(0, 0, GR), (1, 0, GR), (0, 1, CU), (1, 1, CU)],
         "module" => vec![
             (0, 0, PL), (1, 0, PL), (2, 0, PL), (0, 1, PL), (2, 1, PL),
             (0, 2, PL), (1, 2, PL), (2, 2, PL),

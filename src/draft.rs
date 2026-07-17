@@ -56,6 +56,20 @@ pub enum DraftNode {
         op: BuildOp,
         latency: u64,
     },
+    /// A machine that moves a machine (G2, DESIGN-motion.md). To the
+    /// kernel this is an ordinary recipe `1·token → 1·done @ latency`; the
+    /// world layer reads its firing map and relocates `target` one stop
+    /// per firing (cyclic cursor). The reflection is fenced: destinations
+    /// are static draft data — only the *timing* is token-driven. A mover
+    /// may target any node, itself included (the walking machine).
+    Mover {
+        label: String,
+        token: ItemType,
+        done: ItemType,
+        target: usize,
+        stops: Vec<(i32, i32)>,
+        latency: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +110,7 @@ pub fn kind_str(node: &DraftNode) -> &'static str {
         DraftNode::Builder { op: BuildOp::Rot, .. } => "rot",
         DraftNode::Builder { op: BuildOp::Split, .. } => "split",
         DraftNode::Builder { op: BuildOp::Belt, .. } => "belt",
+        DraftNode::Mover { .. } => "mover",
     }
 }
 
@@ -114,7 +129,8 @@ impl DraftNode {
             DraftNode::Recipe { label, .. }
             | DraftNode::Priority { label, .. }
             | DraftNode::Module { label, .. }
-            | DraftNode::Builder { label, .. } => label,
+            | DraftNode::Builder { label, .. }
+            | DraftNode::Mover { label, .. } => label,
         }
     }
 
@@ -125,6 +141,7 @@ impl DraftNode {
             DraftNode::Priority { item, token, .. } => vec![*item, *token],
             DraftNode::Module { draft, .. } => draft.inputs.iter().map(|i| i.ty).collect(),
             DraftNode::Builder { op, .. } => vec![ANY; op.in_arity()],
+            DraftNode::Mover { token, .. } => vec![*token],
         }
     }
 
@@ -135,6 +152,7 @@ impl DraftNode {
             DraftNode::Priority { item, .. } => vec![*item, *item],
             DraftNode::Module { draft, .. } => draft.outputs.iter().map(|o| o.ty).collect(),
             DraftNode::Builder { op, .. } => vec![ANY; op.out_arity()],
+            DraftNode::Mover { done, .. } => vec![*done],
         }
     }
 }
@@ -203,6 +221,19 @@ impl Draft {
                     return Err(format!(
                         "machine {i} ({}) has a zero amount in its recipe",
                         node.label()
+                    ));
+                }
+            }
+            if let DraftNode::Mover { label, target, stops, .. } = node {
+                if *target >= self.nodes.len() {
+                    return Err(format!(
+                        "mover '{label}' targets a machine that no longer exists"
+                    ));
+                }
+                if stops.is_empty() {
+                    return Err(format!(
+                        "mover '{label}' has no stops — give it somewhere to move '{}'",
+                        self.nodes[*target].label()
                     ));
                 }
             }
@@ -359,6 +390,49 @@ impl Draft {
         for (o, out) in self.outputs.iter().enumerate() {
             let p = self.output_pos[o];
             claim(vec![p, (p.0, p.1 + 1)], &out.label)?;
+        }
+        // Mover destinations must fit among the *drafted* placements.
+        // (Interactions with other movers' evolved placements are checked
+        // at materialization instead and stall gracefully — see G2.)
+        for m in 0..self.nodes.len() {
+            let DraftNode::Mover { label, target, stops, .. } = &self.nodes[m] else {
+                continue;
+            };
+            let (label, target, stops) = (label.clone(), *target, stops.clone());
+            let mut occ = std::collections::HashSet::new();
+            for (i, _) in self.inputs.iter().enumerate() {
+                occ.insert(self.input_pos[i]);
+            }
+            for (o, _) in self.outputs.iter().enumerate() {
+                let p = self.output_pos[o];
+                occ.insert(p);
+                occ.insert((p.0, p.1 + 1));
+            }
+            for (n2, other) in self.nodes.iter().enumerate() {
+                if n2 == target {
+                    continue;
+                }
+                let p = self.node_pos[n2];
+                let ch = crate::structure::chassis(structs, kind_str(other));
+                for &(x, y, _) in structs.cells(ch).clone().iter() {
+                    occ.insert((p.0 + x, p.1 + y));
+                }
+            }
+            let tch = crate::structure::chassis(structs, kind_str(&self.nodes[target]));
+            let tcells: Vec<(i32, i32)> =
+                structs.cells(tch).iter().map(|&(x, y, _)| (x, y)).collect();
+            for (si, stop) in stops.iter().enumerate() {
+                if tcells.iter().any(|(x, y)| occ.contains(&(stop.0 + x, stop.1 + y))) {
+                    return Err(format!(
+                        "mover '{label}': stop {} at ({}, {}) would land '{}' on \
+                         another machine",
+                        si + 1,
+                        stop.0,
+                        stop.1,
+                        self.nodes[target].label()
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -575,6 +649,11 @@ impl Draft {
                         BuildOp::Split => Recipe::new(vec![2], vec![1, 1], *latency),
                     };
                     b.recipe(recipe, in_tys, out_tys)
+                }
+                // To the kernel a mover is a plain recipe: token in, done
+                // pulse out. The world layer reads its firing map (G2).
+                DraftNode::Mover { token, done, latency, .. } => {
+                    b.recipe(Recipe::new(vec![1], vec![1], *latency), &[*token], &[*done])
                 }
             });
         }

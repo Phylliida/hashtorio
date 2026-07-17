@@ -203,10 +203,45 @@ Relocation rungs (meet the V-ladder at V4):
   session-lived (restore begins a fresh epoch).
 - **G2**: **movers** — machines that move machines. The one genuinely new
   interface in the whole motion design: a kernel token firing triggers a
-  world-layer move (reflection, carefully fenced). Scheduled movers +
-  recurrence detection = cachable self-rearrangement; since distance is
-  latency is semantics, a factory that defragments its own layout literally
-  improves its own throughput.
+  world-layer move (reflection, carefully fenced). Design pinned:
+
+  - **To the kernel, a mover is an ordinary recipe** `1·token → 1·done @
+    latency`. It never learns that firing means motion. The reflection is
+    entirely the world layer *reading the mover's firing map* — and since
+    counting maps are total functions, the world knows every future move
+    at compile time. Reflection here is not a runtime callback; it is
+    **lazy epoch unrolling**: find the earliest mover firing in the
+    current epoch, advance that mover's target to its next stop, open an
+    ordinary G1 seam there (state crosses exactly), recompile, repeat —
+    on demand, as frames/harvest reach for later ticks. Deterministic and
+    request-order independent (test-pinned).
+  - **A mover is a player-hand made of tokens.** Its firing edits the
+    draft's `node_pos` exactly as a drag does; the draft is the world's
+    living blueprint and *evolves*. The client watches a `gen` counter
+    and refetches when the factory rearranged itself.
+  - **Configuration is static, timing is data.** `target` (any node —
+    itself included) + `stops` (a cyclic list of placements; a per-mover
+    cursor advances one stop per firing; simultaneous multi-fires
+    coalesce, advancing the cursor by the count). Destinations chosen
+    *by data* would be else-power beyond tier 1 — refused by
+    construction, same boundary as ever.
+  - **Self-targeting is legal and is the crawler seed**: a machine that
+    moves itself walks, and its own fuel line stretches behind it
+    (Doppler on its own supply).
+  - **The done-pulse chains**: wire a mover's output to another mover's
+    token port and you have choreography — rearrangement sequences.
+  - **Failure = stall, life continues.** If a move can't compile
+    (footprint overlap from interacting movers, no steady state), the
+    firing is still consumed, the cursor still advances (self-healing:
+    blocked stops get skipped next cycle), placement stays, and a status
+    note surfaces. No wedged timelines. No-op moves (stop == current
+    placement) open no epoch at all.
+  - **Honest bounds (v1):** epoch cap with a visible note (recurrence
+    summarization is V4's job); belt *capital* under mover-evolved
+    layouts may transiently exceed owned stock — visible in the UI, not
+    gated (deploy-time gating checks the drafted placement; worst-case
+    reserve across stop combinations is future polish); the timeline
+    remains session-lived.
 - **G3**: gradual motion — cell-by-cell trundling as a chain of small seams,
   rendered as a smooth slide, Doppler and all.
 
