@@ -801,6 +801,69 @@ mod tests {
         ItemType(2)
     }
 
+    /// V3 (DESIGN-motion.md): the shuttle/piston idiom — time-varying
+    /// latency by time-multiplexing over fixed roads, zero new primitives.
+    /// A clocked else-gate deals items between a short road and a long
+    /// one: the merged flow keeps the full rate while individual items see
+    /// different travel times, exactly as the derivation table promised.
+    #[test]
+    fn a_shuttle_multiplexes_two_roads() {
+        let mut d = Draft::default();
+        d.inputs.push(DraftInput { ty: iron(), label: "mine".into(), rate: (1, 1) });
+        // The shuttle clock: one token circulating a latency-4 self-loop,
+        // shedding a pulse each lap.
+        d.nodes.push(DraftNode::Recipe {
+            label: "shuttle clock".into(),
+            consume: vec![(ItemType(4), 1)],
+            produce: vec![(ItemType(4), 1), (ItemType(7), 1)],
+            latency: 4,
+        });
+        d.nodes.push(DraftNode::Priority {
+            label: "switch".into(),
+            item: iron(),
+            token: ItemType(7),
+        });
+        // The long road: a belt machine well out of the way.
+        d.nodes.push(DraftNode::Builder {
+            label: "long road".into(),
+            op: BuildOp::Belt,
+            latency: 1,
+        });
+        d.outputs.push(DraftOutput { ty: iron(), label: "arrivals".into() });
+        use DraftFrom as F;
+        use DraftTo as T;
+        d.wires = vec![
+            (F::Node(0, 0), T::Node(0, 0)), // clock loop
+            (F::Node(0, 1), T::Node(1, 1)), // pulses arm the switch
+            (F::Input(0), T::Node(1, 0)),   // iron into the switch
+            (F::Node(1, 0), T::Output(0)),  // granted: the short road
+            (F::Node(1, 1), T::Node(2, 0)), // else: the long road
+            (F::Node(2, 0), T::Output(0)),  // both roads merge
+        ];
+        d.markings = vec![(T::Node(0, 0), 1)];
+        d.input_pos = vec![(2, 4)];
+        d.node_pos = vec![(2, 10), (8, 4), (16, 10)];
+        d.output_pos = vec![(30, 4)];
+
+        let mut lib = Library::new();
+        let mut structs = crate::structure::StructLib::new();
+        let built = d.build(&mut lib, &mut structs).unwrap();
+        let mut ev = Evaluator::new(&lib);
+        let detail = ev.evaluate_detailed(built.id, &built.flows).unwrap();
+        // Both roads carry flow, and together they carry everything.
+        let (gn, gd) = detail.node_outs[1][0].rate(); // short (granted)
+        let (fn_, fd) = detail.node_outs[1][1].rate(); // long (fallback)
+        assert!(gn > 0, "the short road is used");
+        assert!(fn_ > 0, "the long road is used");
+        assert_eq!(
+            (gn * fd + fn_ * gd, gd * fd),
+            (gd * fd, gd * fd),
+            "granted {gn}/{gd} + fallback {fn_}/{fd} = the whole 1/1 flow"
+        );
+        let s = ev.summarize(built.id, &built.flows).unwrap();
+        assert_eq!(s.outputs[0].rate, (1, 1), "nothing lost in the shuttle");
+    }
+
     #[test]
     fn a_minimal_draft_compiles_and_summarizes() {
         let mut d = Draft {
